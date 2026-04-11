@@ -8,6 +8,12 @@ pub enum ParsedCommand {
     Background,
     ListSessions,
     KillSession { name: String },
+    /// Send a prompt to Claude Code via the SDK (structured output, no terminal scraping)
+    Claude { prompt: String },
+    /// Enter interactive Claude mode — plain text routes to Claude instead of tmux
+    ClaudeOn,
+    /// Exit interactive Claude mode — plain text routes back to tmux
+    ClaudeOff,
     ShellCommand { cmd: String },
     StdinInput { text: String },
 }
@@ -18,6 +24,18 @@ pub enum ParseError {
     EmptyShellCommand,
     #[error("Missing session name")]
     MissingName,
+    #[error("Session names can only contain letters, numbers, hyphens, and underscores")]
+    InvalidSessionName,
+}
+
+fn validate_session_name(name: &str) -> std::result::Result<(), ParseError> {
+    if name.is_empty() {
+        return Err(ParseError::MissingName);
+    }
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        return Err(ParseError::InvalidSessionName);
+    }
+    Ok(())
 }
 
 impl ParsedCommand {
@@ -35,9 +53,7 @@ impl ParsedCommand {
             }
             if let Some(name) = rest.strip_prefix("new ") {
                 let name = name.trim();
-                if name.is_empty() {
-                    return Err(ParseError::MissingName);
-                }
+                validate_session_name(name)?;
                 return Ok(ParsedCommand::NewSession {
                     name: name.to_string(),
                 });
@@ -48,9 +64,7 @@ impl ParsedCommand {
             }
             if let Some(name) = rest.strip_prefix("fg ") {
                 let name = name.trim();
-                if name.is_empty() {
-                    return Err(ParseError::MissingName);
-                }
+                validate_session_name(name)?;
                 return Ok(ParsedCommand::Foreground {
                     name: name.to_string(),
                 });
@@ -64,17 +78,37 @@ impl ParsedCommand {
                 return Ok(ParsedCommand::ListSessions);
             }
 
+            // `: claude on/off` — toggle interactive Claude mode
+            if rest == "claude on" || rest == "claude" {
+                return Ok(ParsedCommand::ClaudeOn);
+            }
+            if rest == "claude off" {
+                return Ok(ParsedCommand::ClaudeOff);
+            }
+            // `: claude <prompt>` — one-shot Claude prompt
+            if let Some(prompt) = rest.strip_prefix("claude ") {
+                let prompt = prompt.trim();
+                if !prompt.is_empty() {
+                    return Ok(ParsedCommand::Claude {
+                        prompt: prompt.to_string(),
+                    });
+                }
+            }
+
             if rest == "kill" {
                 return Err(ParseError::MissingName);
             }
             if let Some(name) = rest.strip_prefix("kill ") {
                 let name = name.trim();
-                if name.is_empty() {
-                    return Err(ParseError::MissingName);
-                }
+                validate_session_name(name)?;
                 return Ok(ParsedCommand::KillSession {
                     name: name.to_string(),
                 });
+            }
+
+            // Reject multi-line commands (newlines would execute as separate commands)
+            if rest.contains('\n') {
+                return Err(ParseError::EmptyShellCommand); // reuse error — multi-line not allowed
             }
 
             // Everything else after `: ` is a shell command
@@ -83,6 +117,10 @@ impl ParsedCommand {
             })
         } else {
             // No `: ` prefix — stdin input
+            // Reject newlines (each line would execute as a separate shell command in tmux)
+            if input.contains('\n') {
+                return Err(ParseError::EmptyShellCommand);
+            }
             Ok(ParsedCommand::StdinInput {
                 text: input.to_string(),
             })
@@ -189,6 +227,16 @@ mod tests {
             ParsedCommand::parse("hello world").unwrap(),
             ParsedCommand::StdinInput {
                 text: "hello world".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_prompt() {
+        assert_eq!(
+            ParsedCommand::parse(": claude explain this code").unwrap(),
+            ParsedCommand::Claude {
+                prompt: "explain this code".into()
             }
         );
     }

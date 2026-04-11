@@ -22,3 +22,5 @@ serde_json = "1"
 futures-util = "0.3"
 url = "2"
 thiserror = "1"
+claude-agent-sdk-rust = { version = "1", features = ["tracing-support"] }
+futures = "0.3"

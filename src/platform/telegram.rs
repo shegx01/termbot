@@ -17,12 +17,11 @@ pub struct TelegramAdapter {
     authorized_user_id: u64,
     connected: Arc<AtomicBool>,
     rate_limit_ms: u64,
+    last_edit: Arc<tokio::sync::Mutex<Option<Instant>>>,
 }
 
 impl TelegramAdapter {
     pub fn new(token: String, authorized_user_id: u64, rate_limit_ms: u64) -> Self {
-        // Build a reqwest client with a timeout longer than our polling timeout (30s)
-        // so the HTTP client doesn't cut the connection before the server responds.
         let client = default_reqwest_settings()
             .timeout(Duration::from_secs(45))
             .build()
@@ -33,6 +32,7 @@ impl TelegramAdapter {
             authorized_user_id,
             connected: Arc::new(AtomicBool::new(false)),
             rate_limit_ms,
+            last_edit: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -168,21 +168,21 @@ impl ChatPlatform for TelegramAdapter {
 
         let chat_id_i64 = Self::parse_chat_id(chat_id)?;
 
-        // Rate limiting
-        static LAST_EDIT: std::sync::OnceLock<tokio::sync::Mutex<Option<Instant>>> =
-            std::sync::OnceLock::new();
-        let mutex = LAST_EDIT.get_or_init(|| tokio::sync::Mutex::new(None));
-
-        {
-            let mut last = mutex.lock().await;
-            if let Some(last_instant) = *last {
-                let elapsed = last_instant.elapsed();
+        // Rate limiting — release lock before sleeping to avoid blocking concurrent calls
+        let sleep_dur = {
+            let mut last = self.last_edit.lock().await;
+            let dur = if let Some(t) = *last {
+                let elapsed = t.elapsed();
                 let min_gap = Duration::from_millis(self.rate_limit_ms);
-                if elapsed < min_gap {
-                    tokio::time::sleep(min_gap - elapsed).await;
-                }
-            }
+                if elapsed < min_gap { Some(min_gap - elapsed) } else { None }
+            } else {
+                None
+            };
             *last = Some(Instant::now());
+            dur
+        };
+        if let Some(d) = sleep_dur {
+            tokio::time::sleep(d).await;
         }
 
         self.bot

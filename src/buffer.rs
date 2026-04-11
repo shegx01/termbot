@@ -44,7 +44,8 @@ pub struct OutputBuffer {
     offline_buffer: String,
     offline_buffer_max_bytes: usize,
     connected: bool,
-    waiting_for_output: bool,    // true after snapshot_before_command, false after first output
+    waiting_for_output: bool,    // true after snapshot_before_command
+    idle_polls: u32,              // consecutive polls with no new output
 }
 
 impl OutputBuffer {
@@ -57,6 +58,7 @@ impl OutputBuffer {
             offline_buffer_max_bytes,
             connected: true,
             waiting_for_output: false,
+            idle_polls: 0,
         }
     }
 
@@ -77,6 +79,7 @@ impl OutputBuffer {
         }
         self.last_command = command.map(|s| s.to_string());
         self.waiting_for_output = true;
+        self.idle_polls = 0;
     }
 
     /// Initialize the line offset to the current scrollback (call on session creation/reconnect).
@@ -103,8 +106,14 @@ impl OutputBuffer {
         let meaningful_count = count_meaningful_lines(&scrollback);
 
         if meaningful_count <= self.lines_seen {
-            return events; // no new lines
+            // No new output — increment idle counter, stop polling after ~5s of no activity
+            self.idle_polls += 1;
+            if self.idle_polls > 20 {
+                self.waiting_for_output = false;
+            }
+            return events;
         }
+        self.idle_polls = 0; // reset on new output
 
         // Extract only the new lines (past our offset)
         // Take from the end of the meaningful lines
@@ -150,8 +159,7 @@ impl OutputBuffer {
             return events;
         }
 
-        // Always send as a new message — no edit-in-place accumulation.
-        // This gives a clean per-poll output chunk on Telegram.
+        // Send as a new message — clean per-poll output chunk for Telegram.
         events.push(StreamEvent::NewMessage {
             session: self.session_name.clone(),
             content,
@@ -175,8 +183,14 @@ impl OutputBuffer {
     fn truncate_offline_buffer(&mut self) {
         if self.offline_buffer.len() > self.offline_buffer_max_bytes {
             let excess = self.offline_buffer.len() - self.offline_buffer_max_bytes;
-            let truncated_msg = format!("[... {} bytes truncated ...]\n", excess);
-            self.offline_buffer = format!("{}{}", truncated_msg, &self.offline_buffer[excess..]);
+            // Find a safe char boundary at or after `excess`
+            let safe_start = self.offline_buffer[excess..]
+                .char_indices()
+                .next()
+                .map(|(i, _)| excess + i)
+                .unwrap_or(self.offline_buffer.len());
+            let truncated_msg = format!("[... {} bytes truncated ...]\n", safe_start);
+            self.offline_buffer = format!("{}{}", truncated_msg, &self.offline_buffer[safe_start..]);
         }
     }
 }
@@ -225,8 +239,9 @@ fn is_noise_line(line: &str, command: Option<&str>) -> bool {
         return true;
     }
 
-    // Starship / oh-my-zsh prompt patterns
-    if t.contains(" on ") && (t.contains(" main") || t.contains(" master")) {
+    // Starship prompt: contains git branch icon () followed by branch name
+    // More specific than just "on main" to avoid filtering git command output
+    if t.contains(" on ") && (t.contains("\u{e0a0}") || t.contains("")) {
         return true;
     }
     if t.contains("📦 v") || t.contains("🦀 v") || t.contains("☁️") {

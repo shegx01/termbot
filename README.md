@@ -216,8 +216,11 @@ All commands use the `: ` (colon + space) prefix:
 | `: bg` | Background the current session |
 | `: list` | Show all sessions with status |
 | `: kill <name>` | Destroy a session |
+| `: claude <prompt>` | One-shot Claude Code prompt (structured, no terminal scraping) |
+| `: claude on` | Enter interactive Claude mode (plain text goes to Claude) |
+| `: claude off` | Exit Claude mode (plain text goes back to terminal) |
 | `: <command>` | Run a shell command in the foreground session |
-| *(plain text)* | Send as stdin to the foreground session |
+| *(plain text)* | Send as stdin to the foreground session (or to Claude in Claude mode) |
 
 ### Example: Run a build
 
@@ -227,6 +230,35 @@ All commands use the `: ` (colon + space) prefix:
 ```
 
 Output streams into chat as it happens.
+
+### Example: One-shot Claude prompt
+
+```
+: claude explain the main.rs file
+: claude what are the open TODOs in this project?
+```
+
+Clean structured response delivered directly — no terminal scraping.
+
+### Example: Interactive Claude mode
+
+```
+: claude on
+```
+
+Now just type naturally:
+
+```
+What does the buffer module do?
+Can you refactor it for clarity?
+Show me the test coverage gaps.
+```
+
+Each message continues the same Claude conversation (multi-turn via session resume). Switch back to terminal mode:
+
+```
+: claude off
+```
 
 ### Example: Use Claude Code interactively
 

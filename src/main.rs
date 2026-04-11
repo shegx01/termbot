@@ -1,4 +1,5 @@
 mod buffer;
+mod claude;
 mod command;
 mod config;
 mod platform;
@@ -14,6 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing;
 
 use buffer::{OutputBuffer, StreamEvent};
+use claude::{ClaudeEvent, ClaudeManager, format_tool_event};
 use command::{CommandBlocklist, ParsedCommand};
 use config::Config;
 use platform::slack::SlackPlatform;
@@ -33,6 +35,11 @@ async fn main() -> Result<()> {
     let blocklist = CommandBlocklist::from_config(&config.blocklist.patterns)?;
     let mut session_mgr = SessionManager::new(TmuxClient::new());
     let mut buffers: HashMap<String, OutputBuffer> = HashMap::new();
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let claude_mgr = ClaudeManager::new(cwd);
+    let mut claude_mode = false; // when true, plain text routes to Claude SDK
 
     let chunk_size = config.streaming.chunk_size;
     let offline_buffer_max = config.streaming.offline_buffer_max_bytes;
@@ -113,6 +120,8 @@ async fn main() -> Result<()> {
                             &blocklist,
                             &mut session_mgr,
                             &mut buffers,
+                            &claude_mgr,
+                            &mut claude_mode,
                             &stream_tx,
                             telegram.as_deref(),
                             slack.as_deref(),
@@ -165,6 +174,8 @@ async fn handle_command(
     blocklist: &CommandBlocklist,
     session_mgr: &mut SessionManager,
     buffers: &mut HashMap<String, OutputBuffer>,
+    claude_mgr: &ClaudeManager,
+    claude_mode: &mut bool,
     stream_tx: &broadcast::Sender<StreamEvent>,
     telegram: Option<&dyn ChatPlatform>,
     slack: Option<&dyn ChatPlatform>,
@@ -270,6 +281,25 @@ async fn handle_command(
                 }
             }
         }
+        ParsedCommand::ClaudeOn => {
+            *claude_mode = true;
+            send_reply(
+                &msg.reply_context,
+                "Claude mode ON. Plain text now goes to Claude Code. Use `: claude off` to switch back to terminal.",
+                telegram, slack,
+            ).await;
+        }
+        ParsedCommand::ClaudeOff => {
+            *claude_mode = false;
+            send_reply(
+                &msg.reply_context,
+                "Claude mode OFF. Plain text now goes to the terminal session.",
+                telegram, slack,
+            ).await;
+        }
+        ParsedCommand::Claude { prompt } => {
+            send_claude_prompt(&msg.reply_context, &prompt, session_mgr, claude_mgr, telegram, slack).await;
+        }
         ParsedCommand::ShellCommand { cmd } => {
             // Snapshot pane before command so we can diff afterward
             if let Some(fg) = session_mgr.foreground_session() {
@@ -282,17 +312,141 @@ async fn handle_command(
             }
         }
         ParsedCommand::StdinInput { text } => {
-            // Snapshot pane before stdin so we can diff afterward
-            if let Some(fg) = session_mgr.foreground_session() {
-                if let Some(buf) = buffers.get_mut(fg) {
-                    buf.snapshot_before_command(session_mgr.tmux(), Some(&text)).await;
+            if *claude_mode {
+                send_claude_prompt(&msg.reply_context, &text, session_mgr, claude_mgr, telegram, slack).await;
+            } else {
+                // Blocklist check on plain text too — it's sent to the shell as a command
+                if blocklist.is_blocked(&text) {
+                    send_error(&msg.reply_context, "Command blocked by security policy", telegram, slack).await;
+                    return;
                 }
-            }
-            if let Err(e) = session_mgr.send_stdin_to_foreground(&text).await {
-                send_error(&msg.reply_context, &e.to_string(), telegram, slack).await;
+                if let Some(fg) = session_mgr.foreground_session() {
+                    if let Some(buf) = buffers.get_mut(fg) {
+                        buf.snapshot_before_command(session_mgr.tmux(), Some(&text)).await;
+                    }
+                }
+                if let Err(e) = session_mgr.send_stdin_to_foreground(&text).await {
+                    send_error(&msg.reply_context, &e.to_string(), telegram, slack).await;
+                }
             }
         }
     }
+}
+
+/// Send a prompt to Claude Code via SDK with real-time streaming to chat.
+/// Shows tool activity (Read, Write, Edit, Bash) as it happens,
+/// then delivers the final response.
+async fn send_claude_prompt(
+    ctx: &ReplyContext,
+    prompt: &str,
+    session_mgr: &SessionManager,
+    claude_mgr: &ClaudeManager,
+    telegram: Option<&dyn ChatPlatform>,
+    slack: Option<&dyn ChatPlatform>,
+) {
+    let session_name = session_mgr
+        .foreground_session()
+        .unwrap_or("default")
+        .to_string();
+
+    let (event_tx, mut event_rx) = mpsc::channel::<ClaudeEvent>(64);
+
+    // Gather what we need for the spawned task (all owned types, no references)
+    let prompt_owned = prompt.to_string();
+    let cwd = claude_mgr.cwd.clone();
+    let resume_session = claude_mgr.get_session_id(&session_name).await;
+    let session_name_clone = session_name.clone();
+
+    // Spawn Claude in a background task
+    let prompt_handle = tokio::spawn(async move {
+        claude::run_claude_prompt(prompt_owned, cwd, resume_session, event_tx).await
+    });
+
+    // Consume events and deliver to chat in real-time
+    let mut tool_lines: Vec<String> = Vec::new();
+    let mut last_tool_flush = tokio::time::Instant::now();
+
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            ClaudeEvent::ToolUse { tool, description } => {
+                tool_lines.push(format_tool_event(&tool, &description));
+                // Batch: send every 3s or every 5 tools
+                if tool_lines.len() >= 5
+                    || last_tool_flush.elapsed() > std::time::Duration::from_secs(3)
+                {
+                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
+                    tool_lines.clear();
+                    last_tool_flush = tokio::time::Instant::now();
+                }
+            }
+            ClaudeEvent::Text(text) => {
+                if !tool_lines.is_empty() {
+                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
+                    tool_lines.clear();
+                }
+                if !text.is_empty() {
+                    for chunk in split_message(&text, 4000) {
+                        send_reply(ctx, &chunk, telegram, slack).await;
+                    }
+                }
+            }
+            ClaudeEvent::Done { .. } => {
+                if !tool_lines.is_empty() {
+                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
+                }
+                break;
+            }
+            ClaudeEvent::Error(e) => {
+                if !tool_lines.is_empty() {
+                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
+                }
+                send_error(ctx, &format!("Claude: {}", e), telegram, slack).await;
+                break;
+            }
+        }
+    }
+
+    // Store the session ID for future resume
+    if let Ok(Some(new_session_id)) = prompt_handle.await {
+        claude_mgr
+            .set_session_id(&session_name_clone, new_session_id)
+            .await;
+    }
+}
+
+/// Split a message into chunks of at most `max_len` characters,
+/// breaking at newline boundaries when possible.
+fn split_message(text: &str, max_len: usize) -> Vec<String> {
+    if text.len() <= max_len {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        if remaining.len() <= max_len {
+            chunks.push(remaining.to_string());
+            break;
+        }
+        // Find a safe byte boundary (don't split inside a multi-byte char)
+        let byte_limit = max_len.min(remaining.len());
+        let safe_limit = match remaining.get(..byte_limit) {
+            Some(_) => byte_limit,
+            None => remaining
+                .char_indices()
+                .take_while(|(i, _)| *i <= byte_limit)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(remaining.len()),
+        };
+        // Prefer splitting at a newline
+        let split_at = remaining[..safe_limit]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(safe_limit);
+        chunks.push(remaining[..split_at].to_string());
+        remaining = &remaining[split_at..];
+    }
+    chunks
 }
 
 async fn send_reply(
@@ -363,25 +517,17 @@ async fn handle_stream_event(
             session_chat_ids.insert(session.clone(), chat_id);
             session_thread_ts.insert(session, thread_ts);
         }
-        StreamEvent::NewMessage { session, content } => {
+        StreamEvent::NewMessage { session, content } | StreamEvent::EditMessage { session, content } => {
             let chat_id = match session_chat_ids.get(&session) {
                 Some(id) => id.clone(),
                 None => return,
             };
             let thread_ts = session_thread_ts.get(&session).and_then(|t| t.as_deref());
-            if let Err(e) = platform.send_message(&content, &chat_id, thread_ts).await {
-                tracing::error!("Failed to send message: {}", e);
-            }
-        }
-        StreamEvent::EditMessage { session, content } => {
-            // Fallback: treat as new message (simplified from edit-in-place)
-            let chat_id = match session_chat_ids.get(&session) {
-                Some(id) => id.clone(),
-                None => return,
-            };
-            let thread_ts = session_thread_ts.get(&session).and_then(|t| t.as_deref());
-            if let Err(e) = platform.send_message(&content, &chat_id, thread_ts).await {
-                tracing::error!("Failed to send message: {}", e);
+            // Split for Telegram's 4096-char limit
+            for chunk in split_message(&content, 4000) {
+                if let Err(e) = platform.send_message(&chunk, &chat_id, thread_ts).await {
+                    tracing::error!("Failed to send message: {}", e);
+                }
             }
         }
         StreamEvent::SessionExited { session, code } => {
