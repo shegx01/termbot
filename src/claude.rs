@@ -68,7 +68,9 @@ pub async fn run_claude_prompt(
     event_tx: mpsc::Sender<ClaudeEvent>,
 ) -> Option<String> {
     let mut options = ClaudeAgentOptions::default();
-    options.permission_mode = Some(PermissionMode::AcceptEdits);
+    // BypassPermissions is required for headless operation — there's no terminal
+    // to approve prompts. The user already authenticated via Telegram/Slack.
+    options.permission_mode = Some(PermissionMode::BypassPermissions);
     options.cwd = Some(cwd);
     options.allowed_tools = vec![
         "Read".to_string(),
