@@ -301,4 +301,36 @@ mod tests {
     fn noise_detection_forge_line() {
         assert!(is_noise_line("# claude -p \"hello\"", Some("claude -p \"hello\"")));
     }
+
+    #[test]
+    fn noise_bare_prompt_chars() {
+        assert!(is_noise_line("$", None));
+        assert!(is_noise_line("%", None));
+        assert!(is_noise_line("#", None));
+    }
+
+    #[test]
+    fn noise_emoji_prompt() {
+        assert!(is_noise_line("something 📦 v0.1.0 via 🦀 v1.76.0", None));
+    }
+
+    #[test]
+    fn git_output_not_noise() {
+        // "on main" in git output should NOT be filtered (only starship icon triggers it)
+        assert!(!is_noise_line("On branch main", None));
+        assert!(!is_noise_line("Switched to branch 'main'", None));
+        assert!(!is_noise_line("Merge branch 'main' into feature", None));
+    }
+
+    #[test]
+    fn empty_line_not_noise() {
+        assert!(!is_noise_line("", None));
+        assert!(!is_noise_line("  ", None));
+    }
+
+    #[test]
+    fn multiline_count() {
+        let text = "hello\n\n\nworld\n\n";
+        assert_eq!(count_meaningful_lines(text), 2);
+    }
 }

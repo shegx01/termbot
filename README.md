@@ -184,9 +184,45 @@ Session names can contain letters, numbers, hyphens, and underscores.
 
 In Claude mode, plain text goes to Claude instead of the terminal. Multi-turn -- each message continues the same conversation.
 
-Claude Code slash commands work too: `: claude /commit`, `: claude /review-pr 42`.
-
 Uses your **Claude subscription** (Pro/Max), not API credits.
+
+### Two ways to use Claude
+
+**SDK mode** (`: claude`) -- structured output, real-time tool activity, multi-turn. Best for prompts and Q&A:
+
+```
+: claude explain the auth module
+: claude on
+What are the open bugs?
+: claude off
+```
+
+**tmux mode** -- run Claude Code as a full interactive CLI session. Supports slash commands, skills, plugins, and interactive prompts that the SDK can't handle:
+
+```
+: new ai                         # create a tmux session
+: claude                         # launches Claude Code CLI
+```
+
+Now Claude Code is running in the terminal. Use plain text to talk to it:
+
+```
+explore this project
+/commit                          # Claude Code slash commands
+/review-pr 42                    # works because it's a real terminal
+```
+
+Switch between Claude and other sessions:
+
+```
+: bg                             # background Claude session
+: new build
+: cargo test                     # run tests in a different session
+: fg ai                          # back to Claude
+continue where we left off
+```
+
+Use tmux mode when you need Claude Code's full interactive features (slash commands, permission prompts, multi-file editing workflows). Use SDK mode when you want quick, clean answers.
 
 ---
 

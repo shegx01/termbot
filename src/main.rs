@@ -611,3 +611,53 @@ async fn reconcile_startup(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_short_message() {
+        let chunks = split_message("hello", 4000);
+        assert_eq!(chunks, vec!["hello"]);
+    }
+
+    #[test]
+    fn split_at_newline_boundary() {
+        let text = "line1\nline2\nline3";
+        let chunks = split_message(text, 10);
+        // "line1\n" = 6 chars, fits. "line2\n" would make 12, too long.
+        // So first chunk is "line1\n", second is "line2\nline3"
+        assert!(chunks.len() >= 2);
+        assert!(chunks[0].contains("line1"));
+        assert!(chunks.last().unwrap().contains("line3"));
+    }
+
+    #[test]
+    fn split_unicode_safe() {
+        // Create a string with multi-byte emoji that would panic if sliced at byte boundary
+        let text = "a]b".repeat(2000); // ~6000 chars, each emoji is 4 bytes
+        let chunks = split_message(&text, 4000);
+        assert!(chunks.len() >= 2);
+        // Verify no panic and each chunk is valid UTF-8
+        for chunk in &chunks {
+            assert!(chunk.len() <= 4100); // some slack for boundary finding
+        }
+    }
+
+    #[test]
+    fn split_exact_limit() {
+        let text = "a".repeat(4000);
+        let chunks = split_message(&text, 4000);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn split_just_over_limit() {
+        let text = "a".repeat(4001);
+        let chunks = split_message(&text, 4000);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 4000);
+        assert_eq!(chunks[1].len(), 1);
+    }
+}

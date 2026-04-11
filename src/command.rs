@@ -276,4 +276,49 @@ mod tests {
         assert_eq!(bl.matching_pattern("rm -rf /"), Some(r"rm\s+-rf\s+/"));
         assert_eq!(bl.matching_pattern("ls"), None);
     }
+
+    #[test]
+    fn parse_claude_on() {
+        assert_eq!(ParsedCommand::parse(": claude on").unwrap(), ParsedCommand::ClaudeOn);
+        assert_eq!(ParsedCommand::parse(": claude").unwrap(), ParsedCommand::ClaudeOn);
+    }
+
+    #[test]
+    fn parse_claude_off() {
+        assert_eq!(ParsedCommand::parse(": claude off").unwrap(), ParsedCommand::ClaudeOff);
+    }
+
+    #[test]
+    fn reject_invalid_session_name() {
+        assert!(matches!(
+            ParsedCommand::parse(": new foo:bar"),
+            Err(ParseError::InvalidSessionName)
+        ));
+        assert!(matches!(
+            ParsedCommand::parse(": new foo.bar"),
+            Err(ParseError::InvalidSessionName)
+        ));
+        assert!(matches!(
+            ParsedCommand::parse(": fg ../etc"),
+            Err(ParseError::InvalidSessionName)
+        ));
+    }
+
+    #[test]
+    fn valid_session_names() {
+        assert_eq!(
+            ParsedCommand::parse(": new my-session_1").unwrap(),
+            ParsedCommand::NewSession { name: "my-session_1".into() }
+        );
+    }
+
+    #[test]
+    fn reject_multiline_shell_command() {
+        assert!(ParsedCommand::parse(": echo hello\nrm -rf /").is_err());
+    }
+
+    #[test]
+    fn reject_multiline_stdin() {
+        assert!(ParsedCommand::parse("line1\nline2").is_err());
+    }
 }
