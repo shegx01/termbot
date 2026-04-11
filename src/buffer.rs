@@ -29,12 +29,12 @@ pub enum StreamEvent {
 /// entire session history into one message.
 pub struct OutputBuffer {
     session_name: String,
-    lines_seen: usize,           // scrollback lines already delivered
+    lines_seen: usize,            // scrollback lines already delivered
     last_command: Option<String>, // command text to strip from echo
     offline_buffer: String,
     offline_buffer_max_bytes: usize,
     connected: bool,
-    waiting_for_output: bool,    // true after snapshot_before_command
+    waiting_for_output: bool, // true after snapshot_before_command
 }
 
 impl OutputBuffer {
@@ -174,17 +174,15 @@ impl OutputBuffer {
                 .map(|(i, _)| excess + i)
                 .unwrap_or(self.offline_buffer.len());
             let truncated_msg = format!("[... {} bytes truncated ...]\n", safe_start);
-            self.offline_buffer = format!("{}{}", truncated_msg, &self.offline_buffer[safe_start..]);
+            self.offline_buffer =
+                format!("{}{}", truncated_msg, &self.offline_buffer[safe_start..]);
         }
     }
 }
 
 /// Count non-empty lines in a scrollback capture.
 fn count_meaningful_lines(scrollback: &str) -> usize {
-    scrollback
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .count()
+    scrollback.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
 /// Check if a single line is terminal noise (prompt, command echo, eval errors).
@@ -258,12 +256,18 @@ mod tests {
 
     #[test]
     fn noise_detection_eval_error() {
-        assert!(is_noise_line("(eval):4605: command not found: compdef", None));
+        assert!(is_noise_line(
+            "(eval):4605: command not found: compdef",
+            None
+        ));
     }
 
     #[test]
     fn noise_detection_starship_prompt() {
-        assert!(is_noise_line("termbot on  main ()   [?] is 📦 v0.1.0 via 🦀 v1.76.0", None));
+        assert!(is_noise_line(
+            "termbot on  main ()   [?] is 📦 v0.1.0 via 🦀 v1.76.0",
+            None
+        ));
     }
 
     #[test]
@@ -278,12 +282,18 @@ mod tests {
         assert!(!is_noise_line("hello", None));
         assert!(!is_noise_line("total 42", None));
         assert!(!is_noise_line("Hello! How can I help you today?", None));
-        assert!(!is_noise_line("drwxr-xr-x  5 user staff  160 Apr 11 src", None));
+        assert!(!is_noise_line(
+            "drwxr-xr-x  5 user staff  160 Apr 11 src",
+            None
+        ));
     }
 
     #[test]
     fn noise_detection_forge_line() {
-        assert!(is_noise_line("# claude -p \"hello\"", Some("claude -p \"hello\"")));
+        assert!(is_noise_line(
+            "# claude -p \"hello\"",
+            Some("claude -p \"hello\"")
+        ));
     }
 
     #[test]

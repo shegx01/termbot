@@ -80,11 +80,21 @@ impl Default for StreamingConfig {
     }
 }
 
-fn default_edit_throttle_ms() -> u64 { 2000 }
-fn default_poll_interval_ms() -> u64 { 250 }
-fn default_chunk_size() -> usize { 4000 }
-fn default_offline_buffer_max_bytes() -> usize { 1_048_576 }
-fn default_max_sessions() -> usize { 10 }
+fn default_edit_throttle_ms() -> u64 {
+    2000
+}
+fn default_poll_interval_ms() -> u64 {
+    250
+}
+fn default_chunk_size() -> usize {
+    4000
+}
+fn default_offline_buffer_max_bytes() -> usize {
+    1_048_576
+}
+fn default_max_sessions() -> usize {
+    10
+}
 
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {

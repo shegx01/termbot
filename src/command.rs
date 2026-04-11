@@ -3,21 +3,33 @@ use regex::Regex;
 
 #[derive(Debug, PartialEq)]
 pub enum ParsedCommand {
-    NewSession { name: String },
-    Foreground { name: String },
+    NewSession {
+        name: String,
+    },
+    Foreground {
+        name: String,
+    },
     Background,
     ListSessions,
-    KillSession { name: String },
+    KillSession {
+        name: String,
+    },
     /// Send a prompt to Claude Code via the SDK (structured output, no terminal scraping)
-    Claude { prompt: String },
+    Claude {
+        prompt: String,
+    },
     /// Capture and send the current terminal screen
     Screen,
     /// Enter interactive Claude mode — plain text routes to Claude instead of tmux
     ClaudeOn,
     /// Exit interactive Claude mode — plain text routes back to tmux
     ClaudeOff,
-    ShellCommand { cmd: String },
-    StdinInput { text: String },
+    ShellCommand {
+        cmd: String,
+    },
+    StdinInput {
+        text: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -43,7 +55,10 @@ fn validate_session_name(name: &str) -> std::result::Result<(), ParseError> {
     if name.len() > MAX_SESSION_NAME_LEN {
         return Err(ParseError::SessionNameTooLong);
     }
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(ParseError::InvalidSessionName);
     }
     Ok(())
@@ -94,7 +109,8 @@ impl ParsedCommand {
             }
 
             // `: claude on/off` — toggle interactive Claude mode
-            if rest == "claude on" || rest == "claude" {
+            // Bare `: claude` falls through to ShellCommand → launches Claude CLI in tmux
+            if rest == "claude on" {
                 return Ok(ParsedCommand::ClaudeOn);
             }
             if rest == "claude off" {
@@ -162,7 +178,9 @@ impl CommandBlocklist {
     /// (path prefixes, backslash insertion) before matching.
     pub fn is_blocked(&self, command: &str) -> bool {
         let normalized = Self::normalize_command(command);
-        self.patterns.iter().any(|p| p.is_match(command) || p.is_match(&normalized))
+        self.patterns
+            .iter()
+            .any(|p| p.is_match(command) || p.is_match(&normalized))
     }
 
     /// Normalize common shell evasion patterns:
@@ -174,7 +192,13 @@ impl CommandBlocklist {
     fn normalize_command(command: &str) -> String {
         let mut s = command.to_string();
         // Strip path prefixes
-        for prefix in &["/usr/local/bin/", "/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/"] {
+        for prefix in &[
+            "/usr/local/bin/",
+            "/usr/bin/",
+            "/usr/sbin/",
+            "/bin/",
+            "/sbin/",
+        ] {
             s = s.replace(prefix, "");
         }
         // Remove backslashes before alphabetic characters (su\do -> sudo)
@@ -196,7 +220,9 @@ impl CommandBlocklist {
             .chars()
             .filter(|&c| {
                 if c == ' ' {
-                    if prev_space { return false; }
+                    if prev_space {
+                        return false;
+                    }
                     prev_space = true;
                 } else {
                     prev_space = false;
@@ -365,7 +391,8 @@ mod tests {
 
     #[test]
     fn blocklist_evasion_flag_reorder() {
-        let bl = CommandBlocklist::from_config(&[r"rm\s+-[a-z]*f[a-z]*r[a-z]*\s+/".into()]).unwrap();
+        let bl =
+            CommandBlocklist::from_config(&[r"rm\s+-[a-z]*f[a-z]*r[a-z]*\s+/".into()]).unwrap();
         // Reversed flag order
         assert!(bl.is_blocked("rm -fr /"));
         assert!(bl.is_blocked("rm -rf /"));
@@ -382,13 +409,29 @@ mod tests {
 
     #[test]
     fn parse_claude_on() {
-        assert_eq!(ParsedCommand::parse(": claude on").unwrap(), ParsedCommand::ClaudeOn);
-        assert_eq!(ParsedCommand::parse(": claude").unwrap(), ParsedCommand::ClaudeOn);
+        assert_eq!(
+            ParsedCommand::parse(": claude on").unwrap(),
+            ParsedCommand::ClaudeOn
+        );
+    }
+
+    #[test]
+    fn parse_bare_claude_is_shell_command() {
+        // Bare `: claude` launches Claude CLI in tmux, not interactive SDK mode
+        assert_eq!(
+            ParsedCommand::parse(": claude").unwrap(),
+            ParsedCommand::ShellCommand {
+                cmd: "claude".into()
+            }
+        );
     }
 
     #[test]
     fn parse_claude_off() {
-        assert_eq!(ParsedCommand::parse(": claude off").unwrap(), ParsedCommand::ClaudeOff);
+        assert_eq!(
+            ParsedCommand::parse(": claude off").unwrap(),
+            ParsedCommand::ClaudeOff
+        );
     }
 
     #[test]
@@ -411,7 +454,9 @@ mod tests {
     fn valid_session_names() {
         assert_eq!(
             ParsedCommand::parse(": new my-session_1").unwrap(),
-            ParsedCommand::NewSession { name: "my-session_1".into() }
+            ParsedCommand::NewSession {
+                name: "my-session_1".into()
+            }
         );
     }
 
@@ -455,6 +500,9 @@ mod tests {
 
     #[test]
     fn parse_screen() {
-        assert_eq!(ParsedCommand::parse(": screen").unwrap(), ParsedCommand::Screen);
+        assert_eq!(
+            ParsedCommand::parse(": screen").unwrap(),
+            ParsedCommand::Screen
+        );
     }
 }

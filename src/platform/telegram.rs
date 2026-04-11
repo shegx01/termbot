@@ -61,7 +61,10 @@ impl ChatPlatform for TelegramAdapter {
             }
 
             connected.store(true, Ordering::SeqCst);
-            tracing::info!("Telegram: polling for updates (authorized_user_id={})", authorized_user_id);
+            tracing::info!(
+                "Telegram: polling for updates (authorized_user_id={})",
+                authorized_user_id
+            );
 
             let mut offset: i32 = 0;
 
@@ -108,7 +111,11 @@ impl ChatPlatform for TelegramAdapter {
                     };
 
                     let chat_id = message.chat.id.0.to_string();
-                    tracing::debug!("Telegram: received message from chat {} ({} chars)", chat_id, text.len());
+                    tracing::debug!(
+                        "Telegram: received message from chat {} ({} chars)",
+                        chat_id,
+                        text.len()
+                    );
 
                     let incoming = IncomingMessage {
                         user_id: from_id.to_string(),
@@ -165,7 +172,11 @@ impl ChatPlatform for TelegramAdapter {
     ) -> Result<()> {
         let msg_id_i32 = match msg_id {
             PlatformMessageId::Telegram(id) => *id,
-            _ => return Err(anyhow!("edit_message called with non-Telegram PlatformMessageId")),
+            _ => {
+                return Err(anyhow!(
+                    "edit_message called with non-Telegram PlatformMessageId"
+                ))
+            }
         };
 
         let chat_id_i64 = Self::parse_chat_id(chat_id)?;
@@ -176,7 +187,11 @@ impl ChatPlatform for TelegramAdapter {
             let dur = if let Some(t) = *last {
                 let elapsed = t.elapsed();
                 let min_gap = Duration::from_millis(self.rate_limit_ms);
-                if elapsed < min_gap { Some(min_gap - elapsed) } else { None }
+                if elapsed < min_gap {
+                    Some(min_gap - elapsed)
+                } else {
+                    None
+                }
             } else {
                 None
             };

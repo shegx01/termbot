@@ -1,9 +1,5 @@
 use claude_agent_sdk_rust::{
-    query,
-    ClaudeAgentOptions,
-    Message,
-    PermissionMode,
-    types::content::ContentBlock,
+    query, types::content::ContentBlock, ClaudeAgentOptions, Message, PermissionMode,
 };
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -19,7 +15,10 @@ pub enum ClaudeEvent {
     /// Text from Claude's response
     Text(String),
     /// Claude session completed
-    Done { #[allow(dead_code)] session_id: String },
+    Done {
+        #[allow(dead_code)]
+        session_id: String,
+    },
     /// An error occurred
     Error(String),
 }
@@ -101,7 +100,9 @@ pub async fn run_claude_prompt(
         }
         Err(_) => {
             let _ = event_tx
-                .send(ClaudeEvent::Error("Claude request timed out (5 min limit)".to_string()))
+                .send(ClaudeEvent::Error(
+                    "Claude request timed out (5 min limit)".to_string(),
+                ))
                 .await;
             return None;
         }
