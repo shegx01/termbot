@@ -357,20 +357,26 @@ async fn send_claude_prompt(
     let resume_session = claude_mgr.get_session_id(&session_name).await;
     let session_name_clone = session_name.clone();
 
-    // Spawn Claude in a background task
+    // Spawn Claude in a background task — catch panics so user always gets feedback
     let prompt_handle = tokio::spawn(async move {
-        claude::run_claude_prompt(prompt_owned, cwd, resume_session, event_tx).await
+        let result = claude::run_claude_prompt(
+            prompt_owned, cwd, resume_session, event_tx.clone(),
+        ).await;
+        // If we got here without sending any events, send Done so the loop exits
+        // (event_tx drops after this block, closing the channel)
+        result
     });
 
     // Consume events and deliver to chat in real-time
     let mut tool_lines: Vec<String> = Vec::new();
     let mut last_tool_flush = tokio::time::Instant::now();
+    let mut got_any_output = false;
 
     while let Some(event) = event_rx.recv().await {
         match event {
             ClaudeEvent::ToolUse { tool, description } => {
+                got_any_output = true;
                 tool_lines.push(format_tool_event(&tool, &description));
-                // Batch: send every 3s or every 5 tools
                 if tool_lines.len() >= 5
                     || last_tool_flush.elapsed() > std::time::Duration::from_secs(3)
                 {
@@ -380,6 +386,7 @@ async fn send_claude_prompt(
                 }
             }
             ClaudeEvent::Text(text) => {
+                got_any_output = true;
                 if !tool_lines.is_empty() {
                     send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
                     tool_lines.clear();
@@ -394,6 +401,7 @@ async fn send_claude_prompt(
                 if !tool_lines.is_empty() {
                     send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
                 }
+                got_any_output = true;
                 break;
             }
             ClaudeEvent::Error(e) => {
@@ -401,16 +409,27 @@ async fn send_claude_prompt(
                     send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
                 }
                 send_error(ctx, &format!("Claude: {}", e), telegram, slack).await;
+                got_any_output = true;
                 break;
             }
         }
     }
 
-    // Store the session ID for future resume
-    if let Ok(Some(new_session_id)) = prompt_handle.await {
-        claude_mgr
-            .set_session_id(&session_name_clone, new_session_id)
-            .await;
+    // Handle case where the channel closed without any events
+    // (task panicked, SDK crashed, or stream returned nothing)
+    match prompt_handle.await {
+        Ok(Some(new_session_id)) => {
+            claude_mgr
+                .set_session_id(&session_name_clone, new_session_id)
+                .await;
+        }
+        Ok(None) if !got_any_output => {
+            send_error(ctx, "Claude: no response received. The command may not be supported in headless mode.", telegram, slack).await;
+        }
+        Err(e) => {
+            send_error(ctx, &format!("Claude: task failed: {}", e), telegram, slack).await;
+        }
+        _ => {}
     }
 }
 
