@@ -2103,7 +2103,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "claude-agent-sdk-rust",
- "futures",
  "futures-util",
  "regex",
  "reqwest 0.12.28",
@@ -2116,7 +2115,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "url",
 ]
 
 [[package]]

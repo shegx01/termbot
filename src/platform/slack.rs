@@ -77,7 +77,7 @@ impl SlackPlatform {
 
     async fn run_websocket_loop(&self, cmd_tx: mpsc::Sender<IncomingMessage>) -> Result<()> {
         let ws_url = self.get_websocket_url().await?;
-        info!("Connecting to Slack Socket Mode at {}", ws_url);
+        info!("Connecting to Slack Socket Mode (url redacted for security)");
 
         let (ws_stream, _) = connect_async(&ws_url)
             .await
@@ -99,7 +99,7 @@ impl SlackPlatform {
 
             match msg {
                 Message::Text(text) => {
-                    debug!("Received Slack WS message: {}", text);
+                    debug!("Received Slack WS message ({} bytes)", text.len());
                     let payload: serde_json::Value = match serde_json::from_str(&text) {
                         Ok(v) => v,
                         Err(e) => {
@@ -201,26 +201,34 @@ impl SlackPlatform {
 #[async_trait]
 impl ChatPlatform for SlackPlatform {
     async fn start(&self, cmd_tx: mpsc::Sender<IncomingMessage>) -> Result<()> {
-        const RECONNECT_DELAY_SECS: u64 = 5;
+        const INITIAL_DELAY_SECS: u64 = 5;
+        const MAX_DELAY_SECS: u64 = 300;
+
+        let mut delay_secs = INITIAL_DELAY_SECS;
 
         loop {
             match self.run_websocket_loop(cmd_tx.clone()).await {
                 Ok(()) => {
+                    // Clean disconnect — reset backoff
+                    delay_secs = INITIAL_DELAY_SECS;
                     info!(
                         "Slack WebSocket loop ended, reconnecting in {}s...",
-                        RECONNECT_DELAY_SECS
+                        delay_secs
                     );
                 }
                 Err(e) => {
                     error!(
                         "Slack WebSocket loop error: {}. Reconnecting in {}s...",
-                        e, RECONNECT_DELAY_SECS
+                        e, delay_secs
                     );
                 }
             }
 
             self.connected.store(false, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+
+            // Exponential backoff with cap
+            delay_secs = (delay_secs * 2).min(MAX_DELAY_SECS);
 
             // Stop reconnecting if the receiver has been dropped
             if cmd_tx.is_closed() {
@@ -291,17 +299,21 @@ impl ChatPlatform for SlackPlatform {
             }
         };
 
-        // Rate limiting: ensure at least rate_limit_ms between edits
-        {
+        // Rate limiting: release lock before sleeping to avoid blocking concurrent calls
+        let sleep_dur = {
             let mut last = self.last_edit.lock().await;
-            if let Some(t) = *last {
+            let dur = if let Some(t) = *last {
                 let elapsed = t.elapsed();
                 let min_gap = Duration::from_millis(self.rate_limit_ms);
-                if elapsed < min_gap {
-                    tokio::time::sleep(min_gap - elapsed).await;
-                }
-            }
+                if elapsed < min_gap { Some(min_gap - elapsed) } else { None }
+            } else {
+                None
+            };
             *last = Some(Instant::now());
+            dur
+        };
+        if let Some(d) = sleep_dur {
+            tokio::time::sleep(d).await;
         }
 
         let body = serde_json::json!({

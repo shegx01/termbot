@@ -32,11 +32,6 @@ pub struct ReplyContext {
     pub thread_ts: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct SessionContext {
-    pub session_name: String,
-}
-
 #[async_trait]
 pub trait ChatPlatform: Send + Sync {
     async fn start(&self, cmd_tx: mpsc::Sender<IncomingMessage>) -> Result<()>;

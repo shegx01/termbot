@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::fmt;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -8,6 +9,7 @@ pub struct Config {
     pub telegram: Option<TelegramConfig>,
     pub slack: Option<SlackConfig>,
     pub blocklist: BlocklistConfig,
+    #[serde(default)]
     pub streaming: StreamingConfig,
 }
 
@@ -17,16 +19,34 @@ pub struct AuthConfig {
     pub slack_user_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct TelegramConfig {
     pub bot_token: String,
 }
 
-#[derive(Debug, Deserialize)]
+impl fmt::Debug for TelegramConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TelegramConfig")
+            .field("bot_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 pub struct SlackConfig {
     pub bot_token: String,
     pub app_token: String,
     pub channel_id: String,
+}
+
+impl fmt::Debug for SlackConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlackConfig")
+            .field("bot_token", &"[REDACTED]")
+            .field("app_token", &"[REDACTED]")
+            .field("channel_id", &self.channel_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,11 +56,35 @@ pub struct BlocklistConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct StreamingConfig {
+    #[serde(default = "default_edit_throttle_ms")]
     pub edit_throttle_ms: u64,
+    #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
+    #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
+    #[serde(default = "default_offline_buffer_max_bytes")]
     pub offline_buffer_max_bytes: usize,
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
 }
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            edit_throttle_ms: default_edit_throttle_ms(),
+            poll_interval_ms: default_poll_interval_ms(),
+            chunk_size: default_chunk_size(),
+            offline_buffer_max_bytes: default_offline_buffer_max_bytes(),
+            max_sessions: default_max_sessions(),
+        }
+    }
+}
+
+fn default_edit_throttle_ms() -> u64 { 2000 }
+fn default_poll_interval_ms() -> u64 { 250 }
+fn default_chunk_size() -> usize { 4000 }
+fn default_offline_buffer_max_bytes() -> usize { 1_048_576 }
+fn default_max_sessions() -> usize { 10 }
 
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {

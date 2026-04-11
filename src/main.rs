@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
-use tracing;
 
 use buffer::{OutputBuffer, StreamEvent};
 use claude::{ClaudeEvent, ClaudeManager, format_tool_event};
@@ -29,11 +28,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("Starting termbot...");
 
-    let config = Config::load("termbot.toml")?;
+    let config_path = std::env::var("TERMBOT_CONFIG").unwrap_or_else(|_| "termbot.toml".to_string());
+    let config = Config::load(&config_path)?;
     tracing::info!("Config loaded successfully");
 
     let blocklist = CommandBlocklist::from_config(&config.blocklist.patterns)?;
-    let mut session_mgr = SessionManager::new(TmuxClient::new());
+    let mut session_mgr = SessionManager::new(TmuxClient::new(), config.streaming.max_sessions);
     let mut buffers: HashMap<String, OutputBuffer> = HashMap::new();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -41,11 +41,10 @@ async fn main() -> Result<()> {
     let claude_mgr = ClaudeManager::new(cwd);
     let mut claude_mode = false; // when true, plain text routes to Claude SDK
 
-    let chunk_size = config.streaming.chunk_size;
     let offline_buffer_max = config.streaming.offline_buffer_max_bytes;
 
     // Startup reconciliation — reconnect surviving sessions
-    reconcile_startup(&mut session_mgr, &mut buffers, chunk_size, offline_buffer_max).await;
+    reconcile_startup(&mut session_mgr, &mut buffers, offline_buffer_max).await;
 
     // Channels
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<IncomingMessage>(100);
@@ -112,6 +111,8 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::select! {
+            biased;
+
             msg = cmd_rx.recv() => {
                 match msg {
                     Some(msg) => {
@@ -125,7 +126,6 @@ async fn main() -> Result<()> {
                             &stream_tx,
                             telegram.as_deref(),
                             slack.as_deref(),
-                            chunk_size,
                             offline_buffer_max,
                         ).await;
                     }
@@ -182,7 +182,6 @@ async fn handle_command(
     stream_tx: &broadcast::Sender<StreamEvent>,
     telegram: Option<&dyn ChatPlatform>,
     slack: Option<&dyn ChatPlatform>,
-    chunk_size: usize,
     offline_buffer_max: usize,
 ) {
     let cmd = match ParsedCommand::parse(&msg.text) {
@@ -217,7 +216,7 @@ async fn handle_command(
         ParsedCommand::NewSession { name } => {
             match session_mgr.new_session(&name).await {
                 Ok(()) => {
-                    let mut buf = OutputBuffer::new(&name, chunk_size, offline_buffer_max);
+                    let mut buf = OutputBuffer::new(&name, offline_buffer_max);
                     buf.sync_offset(session_mgr.tmux()).await;
                     buffers.insert(name.clone(), buf);
                     let _ = stream_tx.send(StreamEvent::SessionStarted {
@@ -329,8 +328,18 @@ async fn handle_command(
                 telegram, slack,
             ).await;
         }
-        ParsedCommand::Claude { prompt } => {
-            send_claude_prompt(&msg.reply_context, &prompt, session_mgr, claude_mgr, telegram, slack).await;
+        ParsedCommand::Claude { ref prompt } => {
+            if blocklist.is_blocked(prompt) {
+                send_error(
+                    &msg.reply_context,
+                    "Claude prompt blocked by security policy",
+                    telegram,
+                    slack,
+                )
+                .await;
+            } else {
+                send_claude_prompt(&msg.reply_context, prompt, session_mgr, claude_mgr, telegram, slack).await;
+            }
         }
         ParsedCommand::ShellCommand { cmd } => {
             // Snapshot pane before command so we can diff afterward
@@ -345,7 +354,11 @@ async fn handle_command(
         }
         ParsedCommand::StdinInput { text } => {
             if *claude_mode {
-                send_claude_prompt(&msg.reply_context, &text, session_mgr, claude_mgr, telegram, slack).await;
+                if blocklist.is_blocked(&text) {
+                    send_error(&msg.reply_context, "Claude prompt blocked by security policy", telegram, slack).await;
+                } else {
+                    send_claude_prompt(&msg.reply_context, &text, session_mgr, claude_mgr, telegram, slack).await;
+                }
             } else {
                 // Blocklist check on plain text too — it's sent to the shell as a command
                 if blocklist.is_blocked(&text) {
@@ -399,19 +412,46 @@ async fn send_claude_prompt(
         result
     });
 
-    // Consume events and deliver to chat in real-time
+    // Consume events and deliver to chat in real-time.
+    // Deduplicate consecutive same-tool calls to reduce noise.
+    // e.g., 5 consecutive Reads become: "📖 Read src/main.rs (+4 more)"
     let mut tool_lines: Vec<String> = Vec::new();
     let mut last_tool_flush = tokio::time::Instant::now();
     let mut got_any_output = false;
+    let mut last_tool_name: Option<String> = None;
+    let mut consecutive_count: u32 = 0;
 
     while let Some(event) = event_rx.recv().await {
         match event {
             ClaudeEvent::ToolUse { tool, description } => {
                 got_any_output = true;
-                tool_lines.push(format_tool_event(&tool, &description));
+
+                if last_tool_name.as_deref() == Some(&tool) {
+                    // Same tool again — just count it
+                    consecutive_count += 1;
+                } else {
+                    // Different tool — flush the previous run's count
+                    if consecutive_count > 0 {
+                        if let Some(last) = tool_lines.last_mut() {
+                            *last = format!("{} (+{} more)", last, consecutive_count);
+                        }
+                    }
+                    consecutive_count = 0;
+                    last_tool_name = Some(tool.clone());
+                    tool_lines.push(format_tool_event(&tool, &description));
+                }
+
+                // Flush batch every 3s or every 5 distinct tool lines
                 if tool_lines.len() >= 5
                     || last_tool_flush.elapsed() > std::time::Duration::from_secs(3)
                 {
+                    // Append count for the current run before flushing
+                    if consecutive_count > 0 {
+                        if let Some(last) = tool_lines.last_mut() {
+                            *last = format!("{} (+{} more)", last, consecutive_count);
+                        }
+                        consecutive_count = 0;
+                    }
                     send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
                     tool_lines.clear();
                     last_tool_flush = tokio::time::Instant::now();
@@ -419,9 +459,17 @@ async fn send_claude_prompt(
             }
             ClaudeEvent::Text(text) => {
                 got_any_output = true;
+                // Flush tool lines with trailing count
                 if !tool_lines.is_empty() {
+                    if consecutive_count > 0 {
+                        if let Some(last) = tool_lines.last_mut() {
+                            *last = format!("{} (+{} more)", last, consecutive_count);
+                        }
+                        consecutive_count = 0;
+                    }
                     send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
                     tool_lines.clear();
+                    last_tool_name = None;
                 }
                 if !text.is_empty() {
                     for chunk in split_message(&text, 4000) {
@@ -431,6 +479,11 @@ async fn send_claude_prompt(
             }
             ClaudeEvent::Done { .. } => {
                 if !tool_lines.is_empty() {
+                    if consecutive_count > 0 {
+                        if let Some(last) = tool_lines.last_mut() {
+                            *last = format!("{} (+{} more)", last, consecutive_count);
+                        }
+                    }
                     send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
                 }
                 got_any_output = true;
@@ -438,6 +491,11 @@ async fn send_claude_prompt(
             }
             ClaudeEvent::Error(e) => {
                 if !tool_lines.is_empty() {
+                    if consecutive_count > 0 {
+                        if let Some(last) = tool_lines.last_mut() {
+                            *last = format!("{} (+{} more)", last, consecutive_count);
+                        }
+                    }
                     send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
                 }
                 send_error(ctx, &format!("Claude: {}", e), telegram, slack).await;
@@ -601,7 +659,6 @@ async fn handle_stream_event(
 async fn reconcile_startup(
     session_mgr: &mut SessionManager,
     buffers: &mut HashMap<String, OutputBuffer>,
-    chunk_size: usize,
     offline_buffer_max: usize,
 ) {
     // Clean stale pipe-pane output files (legacy)
@@ -624,7 +681,7 @@ async fn reconcile_startup(
             for name in sessions {
                 match session_mgr.reconnect_session(&name).await {
                     Ok(()) => {
-                        let mut buf = OutputBuffer::new(&name, chunk_size, offline_buffer_max);
+                        let mut buf = OutputBuffer::new(&name, offline_buffer_max);
                         buf.sync_offset(session_mgr.tmux()).await;
                         buffers.insert(name.clone(), buf);
                         tracing::info!("Reconnected session '{}'", name);

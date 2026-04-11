@@ -106,7 +106,7 @@ impl ChatPlatform for TelegramAdapter {
                     };
 
                     let chat_id = message.chat.id.0.to_string();
-                    tracing::info!("Telegram: received '{}' from chat {}", text, chat_id);
+                    tracing::debug!("Telegram: received message from chat {} ({} chars)", chat_id, text.len());
 
                     let incoming = IncomingMessage {
                         user_id: from_id.to_string(),

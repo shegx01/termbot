@@ -28,11 +28,20 @@ pub enum ParseError {
     MissingName,
     #[error("Session names can only contain letters, numbers, hyphens, and underscores")]
     InvalidSessionName,
+    #[error("Session name too long (max 64 characters)")]
+    SessionNameTooLong,
+    #[error("Multi-line input is not supported — send one command at a time")]
+    MultiLineNotAllowed,
 }
+
+const MAX_SESSION_NAME_LEN: usize = 64;
 
 fn validate_session_name(name: &str) -> std::result::Result<(), ParseError> {
     if name.is_empty() {
         return Err(ParseError::MissingName);
+    }
+    if name.len() > MAX_SESSION_NAME_LEN {
+        return Err(ParseError::SessionNameTooLong);
     }
     if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
         return Err(ParseError::InvalidSessionName);
@@ -114,7 +123,7 @@ impl ParsedCommand {
 
             // Reject multi-line commands (newlines would execute as separate commands)
             if rest.contains('\n') {
-                return Err(ParseError::EmptyShellCommand); // reuse error — multi-line not allowed
+                return Err(ParseError::MultiLineNotAllowed);
             }
 
             // Everything else after `: ` is a shell command
@@ -125,7 +134,7 @@ impl ParsedCommand {
             // No `: ` prefix — stdin input
             // Reject newlines (each line would execute as a separate shell command in tmux)
             if input.contains('\n') {
-                return Err(ParseError::EmptyShellCommand);
+                return Err(ParseError::MultiLineNotAllowed);
             }
             Ok(ParsedCommand::StdinInput {
                 text: input.to_string(),
@@ -136,7 +145,6 @@ impl ParsedCommand {
 
 pub struct CommandBlocklist {
     patterns: Vec<Regex>,
-    pattern_strings: Vec<String>,
 }
 
 impl CommandBlocklist {
@@ -147,23 +155,64 @@ impl CommandBlocklist {
                 .map_err(|e| anyhow::anyhow!("Invalid blocklist pattern '{}': {}", p, e))?;
             compiled.push(regex);
         }
-        Ok(Self {
-            patterns: compiled,
-            pattern_strings: patterns.to_vec(),
-        })
+        Ok(Self { patterns: compiled })
     }
 
+    /// Check if a command is blocked. Normalizes common evasion patterns
+    /// (path prefixes, backslash insertion) before matching.
     pub fn is_blocked(&self, command: &str) -> bool {
-        self.patterns.iter().any(|p| p.is_match(command))
+        let normalized = Self::normalize_command(command);
+        self.patterns.iter().any(|p| p.is_match(command) || p.is_match(&normalized))
     }
 
     pub fn matching_pattern(&self, command: &str) -> Option<&str> {
-        for (i, pattern) in self.patterns.iter().enumerate() {
-            if pattern.is_match(command) {
-                return Some(&self.pattern_strings[i]);
+        let normalized = Self::normalize_command(command);
+        for pattern in &self.patterns {
+            if pattern.is_match(command) || pattern.is_match(&normalized) {
+                return Some(pattern.as_str());
             }
         }
         None
+    }
+
+    /// Normalize common shell evasion patterns:
+    /// - Strip common binary path prefixes (/usr/bin/, /bin/, /usr/sbin/, /sbin/)
+    /// - Remove backslashes before non-special characters (su\do -> sudo)
+    /// - Collapse multiple spaces
+    fn normalize_command(command: &str) -> String {
+        let mut s = command.to_string();
+        // Strip path prefixes
+        for prefix in &["/usr/local/bin/", "/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/"] {
+            s = s.replace(prefix, "");
+        }
+        // Remove backslashes before alphabetic characters (su\do -> sudo)
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    if next.is_alphabetic() {
+                        continue; // skip the backslash
+                    }
+                }
+            }
+            result.push(c);
+        }
+        // Collapse multiple spaces
+        let mut prev_space = false;
+        let collapsed: String = result
+            .chars()
+            .filter(|&c| {
+                if c == ' ' {
+                    if prev_space { return false; }
+                    prev_space = true;
+                } else {
+                    prev_space = false;
+                }
+                true
+            })
+            .collect();
+        collapsed
     }
 }
 
@@ -320,12 +369,40 @@ mod tests {
 
     #[test]
     fn reject_multiline_shell_command() {
-        assert!(ParsedCommand::parse(": echo hello\nrm -rf /").is_err());
+        assert!(matches!(
+            ParsedCommand::parse(": echo hello\nrm -rf /"),
+            Err(ParseError::MultiLineNotAllowed)
+        ));
     }
 
     #[test]
     fn reject_multiline_stdin() {
-        assert!(ParsedCommand::parse("line1\nline2").is_err());
+        assert!(matches!(
+            ParsedCommand::parse("line1\nline2"),
+            Err(ParseError::MultiLineNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn reject_long_session_name() {
+        let long_name = "a".repeat(65);
+        assert!(matches!(
+            ParsedCommand::parse(&format!(": new {}", long_name)),
+            Err(ParseError::SessionNameTooLong)
+        ));
+    }
+
+    #[test]
+    fn blocklist_evasion_path_prefix() {
+        let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
+        assert!(bl.is_blocked("/usr/bin/sudo reboot"));
+        assert!(bl.is_blocked("/bin/sudo reboot"));
+    }
+
+    #[test]
+    fn blocklist_evasion_backslash() {
+        let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
+        assert!(bl.is_blocked(r"su\do reboot"));
     }
 
     #[test]

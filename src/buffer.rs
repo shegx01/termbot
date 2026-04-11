@@ -1,11 +1,5 @@
 use crate::tmux::TmuxClient;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum StreamMode {
-    Edit,
-    Chunk,
-}
-
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     EditMessage {
@@ -48,7 +42,7 @@ pub struct OutputBuffer {
 }
 
 impl OutputBuffer {
-    pub fn new(session_name: &str, _chunk_size: usize, offline_buffer_max_bytes: usize) -> Self {
+    pub fn new(session_name: &str, offline_buffer_max_bytes: usize) -> Self {
         Self {
             session_name: session_name.to_string(),
             lines_seen: 0,

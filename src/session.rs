@@ -21,14 +21,16 @@ pub struct SessionManager {
     tmux: TmuxClient,
     sessions: HashMap<String, SessionState>,
     foreground: Option<String>,
+    max_sessions: usize,
 }
 
 impl SessionManager {
-    pub fn new(tmux: TmuxClient) -> Self {
+    pub fn new(tmux: TmuxClient, max_sessions: usize) -> Self {
         Self {
             tmux,
             sessions: HashMap::new(),
             foreground: None,
+            max_sessions,
         }
     }
 
@@ -69,6 +71,13 @@ impl SessionManager {
     pub async fn new_session(&mut self, name: &str) -> Result<()> {
         if self.sessions.contains_key(name) {
             bail!("Session '{}' already exists", name);
+        }
+
+        if self.sessions.len() >= self.max_sessions {
+            bail!(
+                "Maximum session limit reached ({}). Kill an existing session first.",
+                self.max_sessions
+            );
         }
 
         if self.tmux.has_session(name).await? {
@@ -192,7 +201,10 @@ impl SessionManager {
         }
     }
 
+    /// Detach from all sessions without killing them.
+    /// Sessions survive restart and can be reconnected via `reconcile_startup`.
     pub async fn cleanup_all(&mut self) {
+        tracing::info!("Detaching from {} session(s) (sessions survive for reconnect)", self.sessions.len());
         self.sessions.clear();
         self.foreground = None;
     }

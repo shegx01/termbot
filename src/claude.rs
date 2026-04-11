@@ -6,7 +6,7 @@ use claude_agent_sdk_rust::{
     PermissionMode,
     types::content::ContentBlock,
 };
-use futures::StreamExt;
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::pin;
@@ -70,15 +70,37 @@ pub async fn run_claude_prompt(
     let mut options = ClaudeAgentOptions::default();
     options.permission_mode = Some(PermissionMode::AcceptEdits);
     options.cwd = Some(cwd);
+    options.allowed_tools = vec![
+        "Read".to_string(),
+        "Write".to_string(),
+        "Edit".to_string(),
+        "Bash".to_string(),
+        "Glob".to_string(),
+        "Grep".to_string(),
+        "Agent".to_string(),
+        "WebSearch".to_string(),
+        "WebFetch".to_string(),
+    ];
 
     if let Some(sid) = resume_session {
         options.resume = Some(sid);
     }
 
-    let stream = match query(&prompt, Some(options)).await {
-        Ok(s) => s,
-        Err(e) => {
+    let stream = match tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        query(&prompt, Some(options)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             let _ = event_tx.send(ClaudeEvent::Error(e.to_string())).await;
+            return None;
+        }
+        Err(_) => {
+            let _ = event_tx
+                .send(ClaudeEvent::Error("Claude request timed out (5 min limit)".to_string()))
+                .await;
             return None;
         }
     };
@@ -94,7 +116,7 @@ pub async fn run_claude_prompt(
                     match block {
                         ContentBlock::ToolUse(tool_use) => {
                             let tool_name = tool_use.name.clone();
-                            let input_desc = describe_tool_input(&tool_use.input);
+                            let input_desc = describe_tool_input(&tool_name, &tool_use.input);
                             let _ = event_tx
                                 .send(ClaudeEvent::ToolUse {
                                     tool: tool_name,
@@ -140,16 +162,33 @@ pub async fn run_claude_prompt(
 }
 
 /// Extract a human-readable description from a tool's input JSON.
-fn describe_tool_input(input: &serde_json::Value) -> String {
+fn describe_tool_input(tool: &str, input: &serde_json::Value) -> String {
+    // Agent tool: show description field, not the raw JSON blob
+    if tool == "Agent" {
+        if let Some(desc) = input.get("description").and_then(|d| d.as_str()) {
+            return desc.to_string();
+        }
+        if let Some(prompt) = input.get("prompt").and_then(|p| p.as_str()) {
+            return truncate(prompt, 60);
+        }
+    }
+    // Bash: show the command
     if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
         return truncate(cmd, 80);
     }
+    // Read/Write/Edit: show file path
     if let Some(path) = input.get("file_path").and_then(|p| p.as_str()) {
         return path.to_string();
     }
+    // Grep/Glob: show the pattern
     if let Some(pattern) = input.get("pattern").and_then(|p| p.as_str()) {
         return truncate(pattern, 80);
     }
+    // Glob: show the glob pattern
+    if let Some(pattern) = input.get("glob").and_then(|p| p.as_str()) {
+        return truncate(pattern, 80);
+    }
+    // Fallback: truncated JSON
     let s = input.to_string();
     truncate(&s, 100)
 }
