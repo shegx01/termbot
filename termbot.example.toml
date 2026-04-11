@@ -1,0 +1,26 @@
+[auth]
+telegram_user_id = 123456789
+slack_user_id = "U01ABCDEF"
+
+[telegram]
+bot_token = "YOUR_BOT_TOKEN_HERE"
+
+[slack]
+bot_token = "xoxb-YOUR-BOT-TOKEN"
+app_token = "xapp-YOUR-APP-TOKEN"
+channel_id = "C01ABCDEF"
+
+[blocklist]
+patterns = [
+  "rm\\s+-rf\\s+/",
+  "sudo\\s+",
+  ":\\(\\)\\{\\s*:\\|:\\&\\s*\\};:",
+  "mkfs\\.",
+  "dd\\s+if=",
+]
+
+[streaming]
+edit_throttle_ms = 2000
+poll_interval_ms = 250
+chunk_size = 4000
+offline_buffer_max_bytes = 1048576

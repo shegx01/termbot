@@ -1,0 +1,4 @@
+/target
+termbot.toml
+/tmp/termbot-*.out
+.omc/
