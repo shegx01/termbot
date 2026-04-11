@@ -12,7 +12,7 @@ channel_id = "C01ABCDEF"
 
 [blocklist]
 patterns = [
-  "rm\\s+-rf\\s+/",
+  "rm\\s+-[a-z]*f[a-z]*r[a-z]*\\s+/",
   "sudo\\s+",
   ":\\(\\)\\{\\s*:\\|:\\&\\s*\\};:",
   "mkfs\\.",

@@ -169,6 +169,8 @@ impl CommandBlocklist {
     /// - Strip common binary path prefixes (/usr/bin/, /bin/, /usr/sbin/, /sbin/)
     /// - Remove backslashes before non-special characters (su\do -> sudo)
     /// - Collapse multiple spaces
+    /// - Merge and sort short flags for commands like `rm` so that
+    ///   `rm -fr`, `rm -rf`, `rm -r -f` all normalize to `rm -fr`
     fn normalize_command(command: &str) -> String {
         let mut s = command.to_string();
         // Strip path prefixes
@@ -202,7 +204,52 @@ impl CommandBlocklist {
                 true
             })
             .collect();
-        collapsed
+        // Normalize short flags: merge consecutive flag groups and sort the
+        // letters so that flag ordering cannot be used to evade patterns.
+        // e.g. "rm -fr /" -> "rm -fr /", "rm -rf /" -> "rm -fr /",
+        //      "rm -r -f /" -> "rm -fr /"
+        Self::normalize_short_flags(&collapsed)
+    }
+
+    /// Merge consecutive short-flag arguments (tokens starting with `-` but
+    /// not `--`) into a single flag token with letters sorted.
+    ///
+    /// `rm -r -f /`  → `rm -fr /`
+    /// `rm -rf /`    → `rm -fr /`
+    /// `rm -fr /`    → `rm -fr /`
+    /// `rm --force --recursive /` → left as-is (long flags untouched)
+    fn normalize_short_flags(command: &str) -> String {
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        if tokens.is_empty() {
+            return command.to_string();
+        }
+
+        let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+        let mut flag_chars: Vec<char> = Vec::new();
+
+        for token in &tokens {
+            if token.starts_with('-') && !token.starts_with("--") && token.len() > 1 {
+                // Short flag group like -rf, -r, -f, -xvf …
+                flag_chars.extend(token[1..].chars());
+            } else {
+                // Flush any accumulated flags first
+                if !flag_chars.is_empty() {
+                    flag_chars.sort_unstable();
+                    flag_chars.dedup();
+                    out.push(format!("-{}", flag_chars.iter().collect::<String>()));
+                    flag_chars.clear();
+                }
+                out.push(token.to_string());
+            }
+        }
+        // Flush trailing flags (unlikely but safe)
+        if !flag_chars.is_empty() {
+            flag_chars.sort_unstable();
+            flag_chars.dedup();
+            out.push(format!("-{}", flag_chars.iter().collect::<String>()));
+        }
+
+        out.join(" ")
     }
 }
 
@@ -305,14 +352,32 @@ mod tests {
     #[test]
     fn blocklist_blocks_dangerous_commands() {
         let bl = CommandBlocklist::from_config(&[
-            r"rm\s+-rf\s+/".into(),
+            r"rm\s+-[a-z]*f[a-z]*r[a-z]*\s+/".into(),
             r"sudo\s+".into(),
         ])
         .unwrap();
         assert!(bl.is_blocked("rm -rf /"));
+        assert!(bl.is_blocked("rm -fr /"));
         assert!(bl.is_blocked("sudo reboot"));
         assert!(!bl.is_blocked("ls -la"));
         assert!(!bl.is_blocked("echo hello"));
+    }
+
+    #[test]
+    fn blocklist_evasion_flag_reorder() {
+        let bl = CommandBlocklist::from_config(&[r"rm\s+-[a-z]*f[a-z]*r[a-z]*\s+/".into()]).unwrap();
+        // Reversed flag order
+        assert!(bl.is_blocked("rm -fr /"));
+        assert!(bl.is_blocked("rm -rf /"));
+        // Separate flags
+        assert!(bl.is_blocked("rm -r -f /"));
+        assert!(bl.is_blocked("rm -f -r /"));
+        // Extra flags mixed in
+        assert!(bl.is_blocked("rm -rfv /"));
+        assert!(bl.is_blocked("rm -vfr /"));
+        // Should NOT block without both flags
+        assert!(!bl.is_blocked("rm -r /tmp/junk"));
+        assert!(!bl.is_blocked("rm -f /tmp/junk"));
     }
 
     #[test]
