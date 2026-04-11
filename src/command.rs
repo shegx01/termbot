@@ -1,6 +1,8 @@
 use anyhow::Result;
 use regex::Regex;
 
+use crate::harness::HarnessKind;
+
 #[derive(Debug, PartialEq)]
 pub enum ParsedCommand {
     NewSession {
@@ -14,16 +16,21 @@ pub enum ParsedCommand {
     KillSession {
         name: String,
     },
-    /// Send a prompt to Claude Code via the SDK (structured output, no terminal scraping)
-    Claude {
+    /// Send a prompt to a harness (Claude, Gemini, Codex) via SDK
+    HarnessPrompt {
+        harness: HarnessKind,
         prompt: String,
     },
     /// Capture and send the current terminal screen
     Screen,
-    /// Enter interactive Claude mode — plain text routes to Claude instead of tmux
-    ClaudeOn,
-    /// Exit interactive Claude mode — plain text routes back to tmux
-    ClaudeOff,
+    /// Enter interactive harness mode — plain text routes to the harness
+    HarnessOn {
+        harness: HarnessKind,
+    },
+    /// Exit interactive harness mode — plain text routes back to tmux
+    HarnessOff {
+        harness: HarnessKind,
+    },
     ShellCommand {
         cmd: String,
     },
@@ -108,22 +115,24 @@ impl ParsedCommand {
                 return Ok(ParsedCommand::Screen);
             }
 
-            // `: claude on/off` — toggle interactive Claude mode
-            // Bare `: claude` falls through to ShellCommand → launches Claude CLI in tmux
-            if rest == "claude on" {
-                return Ok(ParsedCommand::ClaudeOn);
-            }
-            if rest == "claude off" {
-                return Ok(ParsedCommand::ClaudeOff);
-            }
-            // `: claude <prompt>` — one-shot Claude prompt
-            if let Some(prompt) = rest.strip_prefix("claude ") {
-                let prompt = prompt.trim();
-                if !prompt.is_empty() {
-                    return Ok(ParsedCommand::Claude {
-                        prompt: prompt.to_string(),
+            // Harness commands: `: claude on/off`, `: gemini on/off`, `: codex <prompt>`, etc.
+            // Bare `: claude` (no on/off/prompt) falls through to ShellCommand
+            let first_word = rest.split_whitespace().next().unwrap_or("");
+            if let Some(kind) = HarnessKind::from_str(first_word) {
+                let after_harness = rest[first_word.len()..].trim();
+                if after_harness == "on" {
+                    return Ok(ParsedCommand::HarnessOn { harness: kind });
+                }
+                if after_harness == "off" {
+                    return Ok(ParsedCommand::HarnessOff { harness: kind });
+                }
+                if !after_harness.is_empty() {
+                    return Ok(ParsedCommand::HarnessPrompt {
+                        harness: kind,
+                        prompt: after_harness.to_string(),
                     });
                 }
+                // Bare `: claude` / `: gemini` falls through to ShellCommand
             }
 
             if rest == "kill" {
@@ -353,7 +362,8 @@ mod tests {
     fn parse_claude_prompt() {
         assert_eq!(
             ParsedCommand::parse(": claude explain this code").unwrap(),
-            ParsedCommand::Claude {
+            ParsedCommand::HarnessPrompt {
+                harness: HarnessKind::Claude,
                 prompt: "explain this code".into()
             }
         );
@@ -411,7 +421,9 @@ mod tests {
     fn parse_claude_on() {
         assert_eq!(
             ParsedCommand::parse(": claude on").unwrap(),
-            ParsedCommand::ClaudeOn
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+            }
         );
     }
 
@@ -430,7 +442,50 @@ mod tests {
     fn parse_claude_off() {
         assert_eq!(
             ParsedCommand::parse(": claude off").unwrap(),
-            ParsedCommand::ClaudeOff
+            ParsedCommand::HarnessOff {
+                harness: HarnessKind::Claude,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_gemini_on() {
+        assert_eq!(
+            ParsedCommand::parse(": gemini on").unwrap(),
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Gemini,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_gemini_off() {
+        assert_eq!(
+            ParsedCommand::parse(": gemini off").unwrap(),
+            ParsedCommand::HarnessOff {
+                harness: HarnessKind::Gemini,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_codex_prompt() {
+        assert_eq!(
+            ParsedCommand::parse(": codex explain this").unwrap(),
+            ParsedCommand::HarnessPrompt {
+                harness: HarnessKind::Codex,
+                prompt: "explain this".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bare_gemini_is_shell_command() {
+        assert_eq!(
+            ParsedCommand::parse(": gemini").unwrap(),
+            ParsedCommand::ShellCommand {
+                cmd: "gemini".into()
+            }
         );
     }
 

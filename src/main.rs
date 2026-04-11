@@ -1,7 +1,7 @@
 mod buffer;
-mod claude;
 mod command;
 mod config;
+mod harness;
 mod platform;
 mod session;
 mod tmux;
@@ -14,9 +14,10 @@ use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
 
 use buffer::{OutputBuffer, StreamEvent};
-use claude::{format_tool_event, ClaudeEvent, ClaudeManager};
 use command::{CommandBlocklist, ParsedCommand};
 use config::Config;
+use harness::claude::ClaudeHarness;
+use harness::{drive_harness, Harness, HarnessKind};
 use platform::slack::SlackPlatform;
 use platform::telegram::TelegramAdapter;
 use platform::{ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
@@ -39,8 +40,11 @@ async fn main() -> Result<()> {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
-    let claude_mgr = ClaudeManager::new(cwd);
-    let mut claude_mode = false; // when true, plain text routes to Claude SDK
+    let harnesses: HashMap<HarnessKind, Box<dyn Harness>> = {
+        let mut h: HashMap<HarnessKind, Box<dyn Harness>> = HashMap::new();
+        h.insert(HarnessKind::Claude, Box::new(ClaudeHarness::new(cwd)));
+        h
+    };
 
     let offline_buffer_max = config.streaming.offline_buffer_max_bytes;
 
@@ -131,8 +135,7 @@ async fn main() -> Result<()> {
                             &blocklist,
                             &mut session_mgr,
                             &mut buffers,
-                            &claude_mgr,
-                            &mut claude_mode,
+                            &harnesses,
                             &stream_tx,
                             telegram.as_deref(),
                             slack.as_deref(),
@@ -163,6 +166,9 @@ async fn main() -> Result<()> {
                     if let Some(buffer) = buffers.get_mut(fg) {
                         let tmux = session_mgr.tmux();
                         let events = buffer.poll(tmux).await;
+                        if !events.is_empty() {
+                            tracing::info!("[poll] {} event(s) from session '{}'", events.len(), fg);
+                        }
                         for event in events {
                             let _ = stream_tx.send(event);
                         }
@@ -187,8 +193,7 @@ async fn handle_command(
     blocklist: &CommandBlocklist,
     session_mgr: &mut SessionManager,
     buffers: &mut HashMap<String, OutputBuffer>,
-    claude_mgr: &ClaudeManager,
-    claude_mode: &mut bool,
+    harnesses: &HashMap<HarnessKind, Box<dyn Harness>>,
     stream_tx: &broadcast::Sender<StreamEvent>,
     telegram: Option<&dyn ChatPlatform>,
     slack: Option<&dyn ChatPlatform>,
@@ -201,6 +206,8 @@ async fn handle_command(
             return;
         }
     };
+
+    tracing::info!("handle_command: {:?} (fg={:?})", cmd, session_mgr.foreground_session());
 
     // Always bind the foreground session to the current chat context.
     // This ensures delivery tasks know where to send output — critical after
@@ -350,39 +357,138 @@ async fn handle_command(
                 send_error(&msg.reply_context, &e.to_string(), telegram, slack).await;
             }
         },
-        ParsedCommand::ClaudeOn => {
-            *claude_mode = true;
+        ParsedCommand::HarnessOn { harness: kind } => {
+            // Verify the harness is actually registered (stubs are not)
+            if !harnesses.contains_key(&kind) {
+                send_error(
+                    &msg.reply_context,
+                    &format!("{} harness is not available", kind.name()),
+                    telegram,
+                    slack,
+                )
+                .await;
+                return;
+            }
+            let fg = match session_mgr.foreground_session() {
+                Some(fg) => fg.to_string(),
+                None => {
+                    send_error(&msg.reply_context, "No active session", telegram, slack).await;
+                    return;
+                }
+            };
+            // Check if switching from another harness
+            if let Some(current) = session_mgr.foreground_harness() {
+                if current == kind {
+                    send_reply(
+                        &msg.reply_context,
+                        &format!("{} mode already active", kind.name()),
+                        telegram,
+                        slack,
+                    )
+                    .await;
+                    return;
+                }
+                // Check resume support of the CURRENT harness before switching away
+                if let Some(h) = harnesses.get(&current) {
+                    if !h.supports_resume() {
+                        send_error(
+                            &msg.reply_context,
+                            &format!(
+                                "{} is active but doesn't support resume. Run `: {} off` first to avoid losing context.",
+                                current.name(),
+                                current.name().to_lowercase()
+                            ),
+                            telegram,
+                            slack,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                send_reply(
+                    &msg.reply_context,
+                    &format!(
+                        "Switching from {} to {} ({} session preserved)",
+                        current.name(),
+                        kind.name(),
+                        current.name()
+                    ),
+                    telegram,
+                    slack,
+                )
+                .await;
+            }
+            session_mgr.set_harness(&fg, Some(kind));
             send_reply(
                 &msg.reply_context,
-                "Claude mode ON. Plain text now goes to Claude Code. Use `: claude off` to switch back to terminal.",
-                telegram, slack,
-            ).await;
-        }
-        ParsedCommand::ClaudeOff => {
-            *claude_mode = false;
-            send_reply(
-                &msg.reply_context,
-                "Claude mode OFF. Plain text now goes to the terminal session.",
+                &format!(
+                    "{} mode ON. Plain text now goes to {}. Use `: {} off` to switch back.",
+                    kind.name(),
+                    kind.name(),
+                    kind.name().to_lowercase()
+                ),
                 telegram,
                 slack,
             )
             .await;
         }
-        ParsedCommand::Claude { ref prompt } => {
+        ParsedCommand::HarnessOff { harness: kind } => {
+            let fg = match session_mgr.foreground_session() {
+                Some(fg) => fg.to_string(),
+                None => {
+                    send_error(&msg.reply_context, "No active session", telegram, slack).await;
+                    return;
+                }
+            };
+            // Verify the specified harness is actually the active one
+            let current = session_mgr.foreground_harness();
+            if current != Some(kind) {
+                send_error(
+                    &msg.reply_context,
+                    &format!(
+                        "{} is not active{}",
+                        kind.name(),
+                        current
+                            .map(|c| format!(" (current: {})", c.name()))
+                            .unwrap_or_default()
+                    ),
+                    telegram,
+                    slack,
+                )
+                .await;
+                return;
+            }
+            session_mgr.set_harness(&fg, None);
+            send_reply(
+                &msg.reply_context,
+                &format!(
+                    "{} mode OFF. Plain text now goes to the terminal session.",
+                    kind.name()
+                ),
+                telegram,
+                slack,
+            )
+            .await;
+        }
+        ParsedCommand::HarnessPrompt {
+            harness: kind,
+            ref prompt,
+        } => {
             if blocklist.is_blocked(prompt) {
                 send_error(
                     &msg.reply_context,
-                    "Claude prompt blocked by security policy",
+                    &format!("{} prompt blocked by security policy", kind.name()),
                     telegram,
                     slack,
                 )
                 .await;
             } else {
-                send_claude_prompt(
+                send_harness_prompt(
                     &msg.reply_context,
+                    &kind,
                     prompt,
                     session_mgr,
-                    claude_mgr,
+                    harnesses,
                     telegram,
                     slack,
                 )
@@ -391,10 +497,21 @@ async fn handle_command(
         }
         ParsedCommand::ShellCommand { cmd } => {
             // Snapshot pane before command so we can diff afterward
-            if let Some(fg) = session_mgr.foreground_session() {
-                if let Some(buf) = buffers.get_mut(fg) {
-                    buf.snapshot_before_command(session_mgr.tmux(), Some(&cmd))
-                        .await;
+            match session_mgr.foreground_session() {
+                None => {
+                    tracing::warn!("ShellCommand '{}': no foreground session", cmd);
+                }
+                Some(fg) => {
+                    if let Some(buf) = buffers.get_mut(fg) {
+                        buf.snapshot_before_command(session_mgr.tmux(), Some(&cmd))
+                            .await;
+                        tracing::debug!("ShellCommand '{}': snapshot taken", cmd);
+                    } else {
+                        tracing::warn!(
+                            "ShellCommand '{}': no buffer for session '{}', output won't be captured",
+                            cmd, fg
+                        );
+                    }
                 }
             }
             if let Err(e) = session_mgr.execute_in_foreground(&cmd).await {
@@ -402,38 +519,31 @@ async fn handle_command(
             }
         }
         ParsedCommand::StdinInput { text } => {
-            if *claude_mode {
-                if blocklist.is_blocked(&text) {
-                    send_error(
-                        &msg.reply_context,
-                        "Claude prompt blocked by security policy",
-                        telegram,
-                        slack,
-                    )
-                    .await;
-                } else {
-                    send_claude_prompt(
-                        &msg.reply_context,
-                        &text,
-                        session_mgr,
-                        claude_mgr,
-                        telegram,
-                        slack,
-                    )
-                    .await;
-                }
+            // Single blocklist check regardless of routing
+            if blocklist.is_blocked(&text) {
+                send_error(
+                    &msg.reply_context,
+                    "Command blocked by security policy",
+                    telegram,
+                    slack,
+                )
+                .await;
+                return;
+            }
+            if let Some(kind) = session_mgr.foreground_harness() {
+                // Route to active harness
+                send_harness_prompt(
+                    &msg.reply_context,
+                    &kind,
+                    &text,
+                    session_mgr,
+                    harnesses,
+                    telegram,
+                    slack,
+                )
+                .await;
             } else {
-                // Blocklist check on plain text too — it's sent to the shell as a command
-                if blocklist.is_blocked(&text) {
-                    send_error(
-                        &msg.reply_context,
-                        "Command blocked by security policy",
-                        telegram,
-                        slack,
-                    )
-                    .await;
-                    return;
-                }
+                // Route to terminal
                 if let Some(fg) = session_mgr.foreground_session() {
                     if let Some(buf) = buffers.get_mut(fg) {
                         buf.snapshot_before_command(session_mgr.tmux(), Some(&text))
@@ -448,14 +558,13 @@ async fn handle_command(
     }
 }
 
-/// Send a prompt to Claude Code via SDK with real-time streaming to chat.
-/// Shows tool activity (Read, Write, Edit, Bash) as it happens,
-/// then delivers the final response.
-async fn send_claude_prompt(
+/// Send a prompt to a harness (Claude, Gemini, Codex) with real-time streaming to chat.
+async fn send_harness_prompt(
     ctx: &ReplyContext,
+    kind: &HarnessKind,
     prompt: &str,
     session_mgr: &SessionManager,
-    claude_mgr: &ClaudeManager,
+    harnesses: &HashMap<HarnessKind, Box<dyn Harness>>,
     telegram: Option<&dyn ChatPlatform>,
     slack: Option<&dyn ChatPlatform>,
 ) {
@@ -464,137 +573,51 @@ async fn send_claude_prompt(
         .unwrap_or("default")
         .to_string();
 
-    let (event_tx, mut event_rx) = mpsc::channel::<ClaudeEvent>(64);
-
-    // Gather what we need for the spawned task (all owned types, no references)
-    let prompt_owned = prompt.to_string();
-    let cwd = claude_mgr.cwd.clone();
-    let resume_session = claude_mgr.get_session_id(&session_name).await;
-    let session_name_clone = session_name.clone();
-
-    // Spawn Claude in a background task — catch panics so user always gets feedback
-    let prompt_handle = tokio::spawn(async move {
-        let result =
-            claude::run_claude_prompt(prompt_owned, cwd, resume_session, event_tx.clone()).await;
-        // If we got here without sending any events, send Done so the loop exits
-        // (event_tx drops after this block, closing the channel)
-        result
-    });
-
-    // Consume events and deliver to chat in real-time.
-    // Deduplicate consecutive same-tool calls to reduce noise.
-    // e.g., 5 consecutive Reads become: "📖 Read src/main.rs (+4 more)"
-    let mut tool_lines: Vec<String> = Vec::new();
-    let mut last_tool_flush = tokio::time::Instant::now();
-    let mut got_any_output = false;
-    let mut last_tool_name: Option<String> = None;
-    let mut consecutive_count: u32 = 0;
-
-    while let Some(event) = event_rx.recv().await {
-        match event {
-            ClaudeEvent::ToolUse { tool, description } => {
-                got_any_output = true;
-
-                if last_tool_name.as_deref() == Some(&tool) {
-                    // Same tool again — just count it
-                    consecutive_count += 1;
-                } else {
-                    // Different tool — flush the previous run's count
-                    if consecutive_count > 0 {
-                        if let Some(last) = tool_lines.last_mut() {
-                            *last = format!("{} (+{} more)", last, consecutive_count);
-                        }
-                    }
-                    consecutive_count = 0;
-                    last_tool_name = Some(tool.clone());
-                    tool_lines.push(format_tool_event(&tool, &description));
-                }
-
-                // Flush batch every 3s or every 5 distinct tool lines
-                if tool_lines.len() >= 5
-                    || last_tool_flush.elapsed() > std::time::Duration::from_secs(3)
-                {
-                    // Append count for the current run before flushing
-                    if consecutive_count > 0 {
-                        if let Some(last) = tool_lines.last_mut() {
-                            *last = format!("{} (+{} more)", last, consecutive_count);
-                        }
-                        consecutive_count = 0;
-                    }
-                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
-                    tool_lines.clear();
-                    last_tool_flush = tokio::time::Instant::now();
-                }
-            }
-            ClaudeEvent::Text(text) => {
-                got_any_output = true;
-                // Flush tool lines with trailing count
-                if !tool_lines.is_empty() {
-                    if consecutive_count > 0 {
-                        if let Some(last) = tool_lines.last_mut() {
-                            *last = format!("{} (+{} more)", last, consecutive_count);
-                        }
-                        consecutive_count = 0;
-                    }
-                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
-                    tool_lines.clear();
-                    last_tool_name = None;
-                }
-                if !text.is_empty() {
-                    for chunk in split_message(&text, 4000) {
-                        send_reply(ctx, &chunk, telegram, slack).await;
-                    }
-                }
-            }
-            ClaudeEvent::Done { .. } => {
-                if !tool_lines.is_empty() {
-                    if consecutive_count > 0 {
-                        if let Some(last) = tool_lines.last_mut() {
-                            *last = format!("{} (+{} more)", last, consecutive_count);
-                        }
-                    }
-                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
-                }
-                got_any_output = true;
-                break;
-            }
-            ClaudeEvent::Error(e) => {
-                if !tool_lines.is_empty() {
-                    if consecutive_count > 0 {
-                        if let Some(last) = tool_lines.last_mut() {
-                            *last = format!("{} (+{} more)", last, consecutive_count);
-                        }
-                    }
-                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
-                }
-                send_error(ctx, &format!("Claude: {}", e), telegram, slack).await;
-                got_any_output = true;
-                break;
-            }
-        }
-    }
-
-    // Handle case where the channel closed without any events
-    // (task panicked, SDK crashed, or stream returned nothing)
-    match prompt_handle.await {
-        Ok(Some(new_session_id)) => {
-            claude_mgr
-                .set_session_id(&session_name_clone, new_session_id)
-                .await;
-        }
-        Ok(None) if !got_any_output => {
+    let harness = match harnesses.get(kind) {
+        Some(h) => h,
+        None => {
             send_error(
                 ctx,
-                "Claude: no response received. The command may not be supported in headless mode.",
+                &format!("{} harness not available", kind.name()),
+                telegram,
+                slack,
+            )
+            .await;
+            return;
+        }
+    };
+    let resume_id = harness.get_session_id(&session_name);
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    match harness
+        .run_prompt(prompt, &cwd, resume_id.as_deref())
+        .await
+    {
+        Ok(event_rx) => {
+            let (got_output, session_id) =
+                drive_harness(event_rx, ctx, telegram, slack).await;
+            if let Some(sid) = session_id {
+                harness.set_session_id(&session_name, sid);
+            }
+            if !got_output {
+                send_error(
+                    ctx,
+                    &format!("{}: no response received", kind.name()),
+                    telegram,
+                    slack,
+                )
+                .await;
+            }
+        }
+        Err(e) => {
+            send_error(
+                ctx,
+                &format!("{}: {}", kind.name(), e),
                 telegram,
                 slack,
             )
             .await;
         }
-        Err(e) => {
-            send_error(ctx, &format!("Claude: task failed: {}", e), telegram, slack).await;
-        }
-        _ => {}
     }
 }
 
@@ -712,7 +735,13 @@ async fn handle_stream_event(
         StreamEvent::NewMessage { session, content } => {
             let chat_id = match session_chat_ids.get(&session) {
                 Some(id) => id.clone(),
-                None => return,
+                None => {
+                    tracing::warn!(
+                        "[delivery] no chat_id for session '{}', dropping message ({} chars)",
+                        session, content.len()
+                    );
+                    return;
+                }
             };
             let thread_ts = session_thread_ts.get(&session).and_then(|t| t.as_deref());
             // Split for Telegram's 4096-char limit

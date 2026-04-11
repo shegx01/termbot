@@ -1,74 +1,103 @@
+use super::{Harness, HarnessEvent, HarnessKind};
+use anyhow::Result;
+use async_trait::async_trait;
 use claude_agent_sdk_rust::{
     query, types::content::ContentBlock, ClaudeAgentOptions, Message, PermissionMode,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::pin::pin;
-use tokio::sync::{mpsc, Mutex};
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 
-/// Events streamed from a Claude session to the chat delivery layer.
-#[derive(Debug, Clone)]
-pub enum ClaudeEvent {
-    /// Claude is using a tool (Read, Write, Edit, Bash, etc.)
-    ToolUse { tool: String, description: String },
-    /// Text from Claude's response
-    Text(String),
-    /// Claude session completed
-    Done {
-        #[allow(dead_code)]
-        session_id: String,
-    },
-    /// An error occurred
-    Error(String),
-}
-
-/// Manages Claude Code sessions with real-time streaming.
-pub struct ClaudeManager {
+/// Claude Code SDK harness with multi-turn session support.
+pub struct ClaudeHarness {
     sessions: Mutex<HashMap<String, String>>, // session_name -> claude session_id
-    pub cwd: PathBuf,
+    cwd: PathBuf,
 }
 
-impl ClaudeManager {
+impl ClaudeHarness {
     pub fn new(cwd: String) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             cwd: PathBuf::from(cwd),
         }
     }
+}
 
-    /// Get the existing session ID for resume, if any.
-    pub async fn get_session_id(&self, session_name: &str) -> Option<String> {
-        let sessions = self.sessions.lock().await;
+#[async_trait]
+impl Harness for ClaudeHarness {
+    fn kind(&self) -> HarnessKind {
+        HarnessKind::Claude
+    }
+
+    fn supports_resume(&self) -> bool {
+        true
+    }
+
+    async fn run_prompt(
+        &self,
+        prompt: &str,
+        _cwd: &Path,
+        session_id: Option<&str>,
+    ) -> Result<mpsc::Receiver<HarnessEvent>> {
+        let (event_tx, event_rx) = mpsc::channel::<HarnessEvent>(64);
+
+        let prompt_owned = prompt.to_string();
+        let cwd = self.cwd.clone();
+        let resume_session = session_id.map(|s| s.to_string());
+
+        tokio::spawn(async move {
+            // Catch panics so the channel always closes cleanly with an error event
+            let result: std::result::Result<(), Box<dyn std::any::Any + Send>> = AssertUnwindSafe(run_claude_prompt_inner(
+                prompt_owned,
+                cwd,
+                resume_session,
+                event_tx.clone(),
+            ))
+            .catch_unwind()
+            .await;
+
+            match result {
+                Ok(()) => {} // events already sent
+                Err(panic_info) => {
+                    let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        format!("Claude: internal panic: {}", s)
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        format!("Claude: internal panic: {}", s)
+                    } else {
+                        "Claude: internal panic (unknown)".to_string()
+                    };
+                    let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+                }
+            }
+        });
+
+        Ok(event_rx)
+    }
+
+    fn get_session_id(&self, session_name: &str) -> Option<String> {
+        let sessions = self.sessions.lock().unwrap();
         sessions.get(session_name).cloned()
     }
 
-    /// Store a session ID after a prompt completes.
-    pub async fn set_session_id(&self, session_name: &str, session_id: String) {
-        let mut sessions = self.sessions.lock().await;
+    fn set_session_id(&self, session_name: &str, session_id: String) {
+        let mut sessions = self.sessions.lock().unwrap();
         sessions.insert(session_name.to_string(), session_id);
-    }
-
-    /// Clear a session
-    #[allow(dead_code)]
-    pub async fn clear_session(&self, session_name: &str) {
-        let mut sessions = self.sessions.lock().await;
-        sessions.remove(session_name);
     }
 }
 
-/// Run a Claude prompt in a background task, streaming events to `event_tx`.
-/// This is a free function (not a method) so it can be spawned in tokio::spawn
-/// without lifetime issues.
-pub async fn run_claude_prompt(
+/// Inner function that runs the Claude prompt and streams events.
+/// Separated so it can be wrapped in catch_unwind.
+async fn run_claude_prompt_inner(
     prompt: String,
     cwd: PathBuf,
     resume_session: Option<String>,
-    event_tx: mpsc::Sender<ClaudeEvent>,
-) -> Option<String> {
+    event_tx: mpsc::Sender<HarnessEvent>,
+) {
     let mut options = ClaudeAgentOptions::default();
-    // BypassPermissions is required for headless operation — there's no terminal
-    // to approve prompts. The user already authenticated via Telegram/Slack.
     options.permission_mode = Some(PermissionMode::BypassPermissions);
     options.cwd = Some(cwd);
     options.allowed_tools = vec![
@@ -95,16 +124,16 @@ pub async fn run_claude_prompt(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            let _ = event_tx.send(ClaudeEvent::Error(e.to_string())).await;
-            return None;
+            let _ = event_tx.send(HarnessEvent::Error(e.to_string())).await;
+            return;
         }
         Err(_) => {
             let _ = event_tx
-                .send(ClaudeEvent::Error(
+                .send(HarnessEvent::Error(
                     "Claude request timed out (5 min limit)".to_string(),
                 ))
                 .await;
-            return None;
+            return;
         }
     };
     let mut stream = pin!(stream);
@@ -121,7 +150,7 @@ pub async fn run_claude_prompt(
                             let tool_name = tool_use.name.clone();
                             let input_desc = describe_tool_input(&tool_name, &tool_use.input);
                             let _ = event_tx
-                                .send(ClaudeEvent::ToolUse {
+                                .send(HarnessEvent::ToolUse {
                                     tool: tool_name,
                                     description: input_desc,
                                 })
@@ -139,8 +168,8 @@ pub async fn run_claude_prompt(
             }
             Ok(_) => {}
             Err(e) => {
-                let _ = event_tx.send(ClaudeEvent::Error(e.to_string())).await;
-                return None;
+                let _ = event_tx.send(HarnessEvent::Error(e.to_string())).await;
+                return;
             }
         }
     }
@@ -148,20 +177,14 @@ pub async fn run_claude_prompt(
     // Send final text response
     let text = response_text.trim().to_string();
     if !text.is_empty() {
-        let _ = event_tx.send(ClaudeEvent::Text(text)).await;
+        let _ = event_tx.send(HarnessEvent::Text(text)).await;
     }
 
     let _ = event_tx
-        .send(ClaudeEvent::Done {
+        .send(HarnessEvent::Done {
             session_id: session_id.clone(),
         })
         .await;
-
-    if session_id.is_empty() {
-        None
-    } else {
-        Some(session_id)
-    }
 }
 
 /// Extract a human-readable description from a tool's input JSON.
@@ -202,25 +225,4 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
     format!("{}...", &s[..end])
-}
-
-/// Format a tool use event for display in chat.
-pub fn format_tool_event(tool: &str, description: &str) -> String {
-    let icon = match tool {
-        "Read" => "📖",
-        "Write" => "📝",
-        "Edit" => "✏️",
-        "Bash" => "💻",
-        "Glob" => "🔍",
-        "Grep" => "🔎",
-        "Agent" => "🤖",
-        "WebSearch" | "WebFetch" => "🌐",
-        _ => "🔧",
-    };
-
-    if description.is_empty() {
-        format!("{} {}", icon, tool)
-    } else {
-        format!("{} {} {}", icon, tool, truncate(description, 80))
-    }
 }

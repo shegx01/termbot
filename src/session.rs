@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use std::collections::HashMap;
 use tokio::time::Instant;
 
+use crate::harness::HarnessKind;
 use crate::tmux::TmuxClient;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -15,6 +16,7 @@ pub struct SessionState {
     pub name: String,
     pub status: SessionStatus,
     pub created_at: Instant,
+    pub active_harness: Option<HarnessKind>,
 }
 
 pub struct SessionManager {
@@ -58,6 +60,7 @@ impl SessionManager {
                     SessionStatus::Background
                 },
                 created_at: Instant::now(),
+                active_harness: None,
             },
         );
         if is_first {
@@ -99,6 +102,7 @@ impl SessionManager {
                 name: name.to_string(),
                 status: SessionStatus::Foreground,
                 created_at: Instant::now(),
+                active_harness: None,
             },
         );
         self.foreground = Some(name.to_string());
@@ -161,6 +165,21 @@ impl SessionManager {
 
     pub fn foreground_session(&self) -> Option<&str> {
         self.foreground.as_deref()
+    }
+
+    /// Get the active harness for the foreground session.
+    pub fn foreground_harness(&self) -> Option<HarnessKind> {
+        self.foreground
+            .as_ref()
+            .and_then(|name| self.sessions.get(name))
+            .and_then(|s| s.active_harness)
+    }
+
+    /// Set the active harness for a named session.
+    pub fn set_harness(&mut self, session_name: &str, harness: Option<HarnessKind>) {
+        if let Some(session) = self.sessions.get_mut(session_name) {
+            session.active_harness = harness;
+        }
     }
 
     pub async fn health_check(&mut self) -> Vec<(String, Option<i32>)> {
