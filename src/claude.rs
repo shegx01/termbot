@@ -1,4 +1,3 @@
-use anyhow::Result;
 use claude_agent_sdk_rust::{
     query,
     ClaudeAgentOptions,
@@ -20,7 +19,7 @@ pub enum ClaudeEvent {
     /// Text from Claude's response
     Text(String),
     /// Claude session completed
-    Done { session_id: String },
+    Done { #[allow(dead_code)] session_id: String },
     /// An error occurred
     Error(String),
 }
@@ -52,6 +51,7 @@ impl ClaudeManager {
     }
 
     /// Clear a session
+    #[allow(dead_code)]
     pub async fn clear_session(&self, session_name: &str) {
         let mut sessions = self.sessions.lock().await;
         sessions.remove(session_name);

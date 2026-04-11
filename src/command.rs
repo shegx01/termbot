@@ -165,16 +165,6 @@ impl CommandBlocklist {
         self.patterns.iter().any(|p| p.is_match(command) || p.is_match(&normalized))
     }
 
-    pub fn matching_pattern(&self, command: &str) -> Option<&str> {
-        let normalized = Self::normalize_command(command);
-        for pattern in &self.patterns {
-            if pattern.is_match(command) || pattern.is_match(&normalized) {
-                return Some(pattern.as_str());
-            }
-        }
-        None
-    }
-
     /// Normalize common shell evasion patterns:
     /// - Strip common binary path prefixes (/usr/bin/, /bin/, /usr/sbin/, /sbin/)
     /// - Remove backslashes before non-special characters (su\do -> sudo)
@@ -323,13 +313,6 @@ mod tests {
         assert!(bl.is_blocked("sudo reboot"));
         assert!(!bl.is_blocked("ls -la"));
         assert!(!bl.is_blocked("echo hello"));
-    }
-
-    #[test]
-    fn blocklist_matching_pattern() {
-        let bl = CommandBlocklist::from_config(&[r"rm\s+-rf\s+/".into()]).unwrap();
-        assert_eq!(bl.matching_pattern("rm -rf /"), Some(r"rm\s+-rf\s+/"));
-        assert_eq!(bl.matching_pattern("ls"), None);
     }
 
     #[test]

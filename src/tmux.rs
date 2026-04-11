@@ -143,10 +143,6 @@ impl TmuxClient {
         Ok(sessions)
     }
 
-    pub async fn cleanup_output_file(&self, name: &str) {
-        let output_file = self.output_file_path(name);
-        let _ = tokio::fs::remove_file(&output_file).await;
-    }
 }
 
 /// Normalize Unicode smart/curly quotes into plain ASCII equivalents.

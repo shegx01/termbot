@@ -626,7 +626,7 @@ async fn handle_stream_event(
             session_chat_ids.insert(session.clone(), chat_id);
             session_thread_ts.insert(session, thread_ts);
         }
-        StreamEvent::NewMessage { session, content } | StreamEvent::EditMessage { session, content } => {
+        StreamEvent::NewMessage { session, content } => {
             let chat_id = match session_chat_ids.get(&session) {
                 Some(id) => id.clone(),
                 None => return,

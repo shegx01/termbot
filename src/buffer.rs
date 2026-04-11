@@ -2,10 +2,6 @@ use crate::tmux::TmuxClient;
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    EditMessage {
-        session: String,
-        content: String,
-    },
     NewMessage {
         session: String,
         content: String,
@@ -54,10 +50,12 @@ impl OutputBuffer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn session_name(&self) -> &str {
         &self.session_name
     }
 
+    #[allow(dead_code)]
     pub fn set_connected(&mut self, connected: bool) {
         self.connected = connected;
     }
@@ -153,6 +151,7 @@ impl OutputBuffer {
         events
     }
 
+    #[allow(dead_code)]
     pub fn reconnect(&mut self) -> Option<StreamEvent> {
         self.connected = true;
         if self.offline_buffer.is_empty() {

@@ -12,6 +12,7 @@ pub enum PlatformType {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum PlatformMessageId {
     Telegram(i32),
     Slack(String), // message ts
@@ -19,8 +20,10 @@ pub enum PlatformMessageId {
 
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
+    #[allow(dead_code)]
     pub user_id: String,
     pub text: String,
+    #[allow(dead_code)]
     pub platform: PlatformType,
     pub reply_context: ReplyContext,
 }
@@ -36,7 +39,9 @@ pub struct ReplyContext {
 pub trait ChatPlatform: Send + Sync {
     async fn start(&self, cmd_tx: mpsc::Sender<IncomingMessage>) -> Result<()>;
     async fn send_message(&self, text: &str, chat_id: &str, thread_ts: Option<&str>) -> Result<PlatformMessageId>;
+    #[allow(dead_code)]
     async fn edit_message(&self, msg_id: &PlatformMessageId, chat_id: &str, text: &str) -> Result<()>;
+    #[allow(dead_code)]
     fn is_connected(&self) -> bool;
     fn platform_type(&self) -> PlatformType;
 }

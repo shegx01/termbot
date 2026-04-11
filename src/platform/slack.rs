@@ -20,8 +20,10 @@ pub struct SlackPlatform {
     channel_id: String,
     authorized_user_id: String,
     connected: Arc<AtomicBool>,
+    #[allow(dead_code)]
     rate_limit_ms: u64,
     http_client: reqwest::Client,
+    #[allow(dead_code)]
     last_edit: Arc<Mutex<Option<Instant>>>,
 }
 

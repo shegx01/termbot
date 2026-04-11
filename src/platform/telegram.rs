@@ -16,7 +16,9 @@ pub struct TelegramAdapter {
     bot: teloxide::Bot,
     authorized_user_id: u64,
     connected: Arc<AtomicBool>,
+    #[allow(dead_code)]
     rate_limit_ms: u64,
+    #[allow(dead_code)]
     last_edit: Arc<tokio::sync::Mutex<Option<Instant>>>,
 }
 
