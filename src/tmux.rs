@@ -165,3 +165,46 @@ fn normalize_quotes(input: &str) -> String {
         .replace('\u{201A}', ",")  // single low-9 quotation mark ‚
         .replace('\u{201E}', "\"") // double low-9 quotation mark „
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_curly_double_quotes() {
+        assert_eq!(
+            normalize_quotes("echo \u{201C}hello world\u{201D}"),
+            "echo \"hello world\""
+        );
+    }
+
+    #[test]
+    fn normalize_curly_single_quotes() {
+        assert_eq!(
+            normalize_quotes("it\u{2019}s a test"),
+            "it's a test"
+        );
+    }
+
+    #[test]
+    fn normalize_angle_quotes() {
+        assert_eq!(
+            normalize_quotes("\u{00AB}bonjour\u{00BB}"),
+            "\"bonjour\""
+        );
+    }
+
+    #[test]
+    fn passthrough_ascii_quotes() {
+        let input = "echo \"hello\" 'world'";
+        assert_eq!(normalize_quotes(input), input);
+    }
+
+    #[test]
+    fn mixed_quotes() {
+        assert_eq!(
+            normalize_quotes("claude -p \u{201C}what is 2+2?\u{201D}"),
+            "claude -p \"what is 2+2?\""
+        );
+    }
+}
