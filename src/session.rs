@@ -204,7 +204,10 @@ impl SessionManager {
     /// Detach from all sessions without killing them.
     /// Sessions survive restart and can be reconnected via `reconcile_startup`.
     pub async fn cleanup_all(&mut self) {
-        tracing::info!("Detaching from {} session(s) (sessions survive for reconnect)", self.sessions.len());
+        tracing::info!(
+            "Detaching from {} session(s) (sessions survive for reconnect)",
+            self.sessions.len()
+        );
         self.sessions.clear();
         self.foreground = None;
     }

@@ -1,5 +1,5 @@
-pub mod telegram;
 pub mod slack;
+pub mod telegram;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -38,9 +38,19 @@ pub struct ReplyContext {
 #[async_trait]
 pub trait ChatPlatform: Send + Sync {
     async fn start(&self, cmd_tx: mpsc::Sender<IncomingMessage>) -> Result<()>;
-    async fn send_message(&self, text: &str, chat_id: &str, thread_ts: Option<&str>) -> Result<PlatformMessageId>;
+    async fn send_message(
+        &self,
+        text: &str,
+        chat_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<PlatformMessageId>;
     #[allow(dead_code)]
-    async fn edit_message(&self, msg_id: &PlatformMessageId, chat_id: &str, text: &str) -> Result<()>;
+    async fn edit_message(
+        &self,
+        msg_id: &PlatformMessageId,
+        chat_id: &str,
+        text: &str,
+    ) -> Result<()>;
     #[allow(dead_code)]
     fn is_connected(&self) -> bool;
     fn platform_type(&self) -> PlatformType;

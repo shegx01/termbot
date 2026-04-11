@@ -111,9 +111,7 @@ impl SlackPlatform {
                     };
 
                     // Acknowledge with envelope_id if present
-                    if let Some(envelope_id) =
-                        payload.get("envelope_id").and_then(|v| v.as_str())
-                    {
+                    if let Some(envelope_id) = payload.get("envelope_id").and_then(|v| v.as_str()) {
                         let ack = serde_json::json!({ "envelope_id": envelope_id });
                         if let Err(e) = ws_sink.send(Message::Text(ack.to_string())).await {
                             error!("Failed to send Slack WS ack: {}", e);
@@ -307,7 +305,11 @@ impl ChatPlatform for SlackPlatform {
             let dur = if let Some(t) = *last {
                 let elapsed = t.elapsed();
                 let min_gap = Duration::from_millis(self.rate_limit_ms);
-                if elapsed < min_gap { Some(min_gap - elapsed) } else { None }
+                if elapsed < min_gap {
+                    Some(min_gap - elapsed)
+                } else {
+                    None
+                }
             } else {
                 None
             };

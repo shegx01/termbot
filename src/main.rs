@@ -14,7 +14,7 @@ use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
 
 use buffer::{OutputBuffer, StreamEvent};
-use claude::{ClaudeEvent, ClaudeManager, format_tool_event};
+use claude::{format_tool_event, ClaudeEvent, ClaudeManager};
 use command::{CommandBlocklist, ParsedCommand};
 use config::Config;
 use platform::slack::SlackPlatform;
@@ -28,7 +28,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("Starting termbot...");
 
-    let config_path = std::env::var("TERMBOT_CONFIG").unwrap_or_else(|_| "termbot.toml".to_string());
+    let config_path =
+        std::env::var("TERMBOT_CONFIG").unwrap_or_else(|_| "termbot.toml".to_string());
     let config = Config::load(&config_path)?;
     tracing::info!("Config loaded successfully");
 
@@ -60,7 +61,10 @@ async fn main() -> Result<()> {
             config.streaming.edit_throttle_ms,
         ));
         adapter.start(cmd_tx.clone()).await?;
-        spawn_delivery_task(Arc::clone(&adapter) as Arc<dyn ChatPlatform>, stream_tx.subscribe());
+        spawn_delivery_task(
+            Arc::clone(&adapter) as Arc<dyn ChatPlatform>,
+            stream_tx.subscribe(),
+        );
         tracing::info!("Telegram adapter started (user_id={})", tg_user_id);
         Some(adapter)
     } else {
@@ -85,7 +89,10 @@ async fn main() -> Result<()> {
                 tracing::error!("Slack adapter error: {}", e);
             }
         });
-        spawn_delivery_task(Arc::clone(&adapter) as Arc<dyn ChatPlatform>, stream_tx.subscribe());
+        spawn_delivery_task(
+            Arc::clone(&adapter) as Arc<dyn ChatPlatform>,
+            stream_tx.subscribe(),
+        );
         tracing::info!("Slack adapter started (user_id={})", sl_user_id);
         Some(adapter)
     } else {
@@ -107,7 +114,10 @@ async fn main() -> Result<()> {
     .into_iter()
     .flatten()
     .collect();
-    tracing::info!("termbot ready — listening on {}", platforms_desc.join(" and "));
+    tracing::info!(
+        "termbot ready — listening on {}",
+        platforms_desc.join(" and ")
+    );
 
     loop {
         tokio::select! {
@@ -213,24 +223,28 @@ async fn handle_command(
             )
             .await;
         }
-        ParsedCommand::NewSession { name } => {
-            match session_mgr.new_session(&name).await {
-                Ok(()) => {
-                    let mut buf = OutputBuffer::new(&name, offline_buffer_max);
-                    buf.sync_offset(session_mgr.tmux()).await;
-                    buffers.insert(name.clone(), buf);
-                    let _ = stream_tx.send(StreamEvent::SessionStarted {
-                        session: name.clone(),
-                        chat_id: msg.reply_context.chat_id.clone(),
-                        thread_ts: msg.reply_context.thread_ts.clone(),
-                    });
-                    send_reply(&msg.reply_context, &format!("Session '{}' created", name), telegram, slack).await;
-                }
-                Err(e) => {
-                    send_error(&msg.reply_context, &e.to_string(), telegram, slack).await;
-                }
+        ParsedCommand::NewSession { name } => match session_mgr.new_session(&name).await {
+            Ok(()) => {
+                let mut buf = OutputBuffer::new(&name, offline_buffer_max);
+                buf.sync_offset(session_mgr.tmux()).await;
+                buffers.insert(name.clone(), buf);
+                let _ = stream_tx.send(StreamEvent::SessionStarted {
+                    session: name.clone(),
+                    chat_id: msg.reply_context.chat_id.clone(),
+                    thread_ts: msg.reply_context.thread_ts.clone(),
+                });
+                send_reply(
+                    &msg.reply_context,
+                    &format!("Session '{}' created", name),
+                    telegram,
+                    slack,
+                )
+                .await;
             }
-        }
+            Err(e) => {
+                send_error(&msg.reply_context, &e.to_string(), telegram, slack).await;
+            }
+        },
         ParsedCommand::Foreground { name } => match session_mgr.fg(&name) {
             Ok(()) => {
                 let _ = stream_tx.send(StreamEvent::SessionStarted {
@@ -238,7 +252,13 @@ async fn handle_command(
                     chat_id: msg.reply_context.chat_id.clone(),
                     thread_ts: msg.reply_context.thread_ts.clone(),
                 });
-                send_reply(&msg.reply_context, &format!("Session '{}' foregrounded", name), telegram, slack).await;
+                send_reply(
+                    &msg.reply_context,
+                    &format!("Session '{}' foregrounded", name),
+                    telegram,
+                    slack,
+                )
+                .await;
             }
             Err(e) => {
                 send_error(&msg.reply_context, &e.to_string(), telegram, slack).await;
@@ -246,10 +266,22 @@ async fn handle_command(
         },
         ParsedCommand::Background => match session_mgr.bg() {
             Ok(Some(name)) => {
-                send_reply(&msg.reply_context, &format!("Session '{}' backgrounded", name), telegram, slack).await;
+                send_reply(
+                    &msg.reply_context,
+                    &format!("Session '{}' backgrounded", name),
+                    telegram,
+                    slack,
+                )
+                .await;
             }
             Ok(None) => {
-                send_error(&msg.reply_context, "No foreground session to background", telegram, slack).await;
+                send_error(
+                    &msg.reply_context,
+                    "No foreground session to background",
+                    telegram,
+                    slack,
+                )
+                .await;
             }
             Err(e) => {
                 send_error(&msg.reply_context, &e.to_string(), telegram, slack).await;
@@ -267,51 +299,57 @@ async fn handle_command(
                         session::SessionStatus::Background => "[background]",
                     };
                     let elapsed = created.elapsed();
-                    lines.push(format!("  {} {} (uptime: {}s)", name, status_str, elapsed.as_secs()));
+                    lines.push(format!(
+                        "  {} {} (uptime: {}s)",
+                        name,
+                        status_str,
+                        elapsed.as_secs()
+                    ));
                 }
                 send_reply(&msg.reply_context, &lines.join("\n"), telegram, slack).await;
             }
         }
-        ParsedCommand::Screen => {
-            match session_mgr.foreground_session() {
-                Some(fg) => {
-                    match session_mgr.tmux().capture_pane(fg).await {
-                        Ok(screen) => {
-                            let trimmed = screen.lines()
-                                .map(|l| l.trim_end())
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                                .trim()
-                                .to_string();
-                            if trimmed.is_empty() {
-                                send_reply(&msg.reply_context, "(empty screen)", telegram, slack).await;
-                            } else {
-                                for chunk in split_message(&trimmed, 4000) {
-                                    send_reply(&msg.reply_context, &chunk, telegram, slack).await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            send_error(&msg.reply_context, &e.to_string(), telegram, slack).await;
+        ParsedCommand::Screen => match session_mgr.foreground_session() {
+            Some(fg) => match session_mgr.tmux().capture_pane(fg).await {
+                Ok(screen) => {
+                    let trimmed = screen
+                        .lines()
+                        .map(|l| l.trim_end())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .trim()
+                        .to_string();
+                    if trimmed.is_empty() {
+                        send_reply(&msg.reply_context, "(empty screen)", telegram, slack).await;
+                    } else {
+                        for chunk in split_message(&trimmed, 4000) {
+                            send_reply(&msg.reply_context, &chunk, telegram, slack).await;
                         }
                     }
-                }
-                None => {
-                    send_error(&msg.reply_context, "No active session", telegram, slack).await;
-                }
-            }
-        }
-        ParsedCommand::KillSession { name } => {
-            match session_mgr.kill(&name).await {
-                Ok(()) => {
-                    buffers.remove(&name);
-                    send_reply(&msg.reply_context, &format!("Session '{}' killed", name), telegram, slack).await;
                 }
                 Err(e) => {
                     send_error(&msg.reply_context, &e.to_string(), telegram, slack).await;
                 }
+            },
+            None => {
+                send_error(&msg.reply_context, "No active session", telegram, slack).await;
             }
-        }
+        },
+        ParsedCommand::KillSession { name } => match session_mgr.kill(&name).await {
+            Ok(()) => {
+                buffers.remove(&name);
+                send_reply(
+                    &msg.reply_context,
+                    &format!("Session '{}' killed", name),
+                    telegram,
+                    slack,
+                )
+                .await;
+            }
+            Err(e) => {
+                send_error(&msg.reply_context, &e.to_string(), telegram, slack).await;
+            }
+        },
         ParsedCommand::ClaudeOn => {
             *claude_mode = true;
             send_reply(
@@ -325,8 +363,10 @@ async fn handle_command(
             send_reply(
                 &msg.reply_context,
                 "Claude mode OFF. Plain text now goes to the terminal session.",
-                telegram, slack,
-            ).await;
+                telegram,
+                slack,
+            )
+            .await;
         }
         ParsedCommand::Claude { ref prompt } => {
             if blocklist.is_blocked(prompt) {
@@ -338,14 +378,23 @@ async fn handle_command(
                 )
                 .await;
             } else {
-                send_claude_prompt(&msg.reply_context, prompt, session_mgr, claude_mgr, telegram, slack).await;
+                send_claude_prompt(
+                    &msg.reply_context,
+                    prompt,
+                    session_mgr,
+                    claude_mgr,
+                    telegram,
+                    slack,
+                )
+                .await;
             }
         }
         ParsedCommand::ShellCommand { cmd } => {
             // Snapshot pane before command so we can diff afterward
             if let Some(fg) = session_mgr.foreground_session() {
                 if let Some(buf) = buffers.get_mut(fg) {
-                    buf.snapshot_before_command(session_mgr.tmux(), Some(&cmd)).await;
+                    buf.snapshot_before_command(session_mgr.tmux(), Some(&cmd))
+                        .await;
                 }
             }
             if let Err(e) = session_mgr.execute_in_foreground(&cmd).await {
@@ -355,19 +404,40 @@ async fn handle_command(
         ParsedCommand::StdinInput { text } => {
             if *claude_mode {
                 if blocklist.is_blocked(&text) {
-                    send_error(&msg.reply_context, "Claude prompt blocked by security policy", telegram, slack).await;
+                    send_error(
+                        &msg.reply_context,
+                        "Claude prompt blocked by security policy",
+                        telegram,
+                        slack,
+                    )
+                    .await;
                 } else {
-                    send_claude_prompt(&msg.reply_context, &text, session_mgr, claude_mgr, telegram, slack).await;
+                    send_claude_prompt(
+                        &msg.reply_context,
+                        &text,
+                        session_mgr,
+                        claude_mgr,
+                        telegram,
+                        slack,
+                    )
+                    .await;
                 }
             } else {
                 // Blocklist check on plain text too — it's sent to the shell as a command
                 if blocklist.is_blocked(&text) {
-                    send_error(&msg.reply_context, "Command blocked by security policy", telegram, slack).await;
+                    send_error(
+                        &msg.reply_context,
+                        "Command blocked by security policy",
+                        telegram,
+                        slack,
+                    )
+                    .await;
                     return;
                 }
                 if let Some(fg) = session_mgr.foreground_session() {
                     if let Some(buf) = buffers.get_mut(fg) {
-                        buf.snapshot_before_command(session_mgr.tmux(), Some(&text)).await;
+                        buf.snapshot_before_command(session_mgr.tmux(), Some(&text))
+                            .await;
                     }
                 }
                 if let Err(e) = session_mgr.send_stdin_to_foreground(&text).await {
@@ -404,9 +474,8 @@ async fn send_claude_prompt(
 
     // Spawn Claude in a background task — catch panics so user always gets feedback
     let prompt_handle = tokio::spawn(async move {
-        let result = claude::run_claude_prompt(
-            prompt_owned, cwd, resume_session, event_tx.clone(),
-        ).await;
+        let result =
+            claude::run_claude_prompt(prompt_owned, cwd, resume_session, event_tx.clone()).await;
         // If we got here without sending any events, send Done so the loop exits
         // (event_tx drops after this block, closing the channel)
         result
@@ -514,7 +583,13 @@ async fn send_claude_prompt(
                 .await;
         }
         Ok(None) if !got_any_output => {
-            send_error(ctx, "Claude: no response received. The command may not be supported in headless mode.", telegram, slack).await;
+            send_error(
+                ctx,
+                "Claude: no response received. The command may not be supported in headless mode.",
+                telegram,
+                slack,
+            )
+            .await;
         }
         Err(e) => {
             send_error(ctx, &format!("Claude: task failed: {}", e), telegram, slack).await;
@@ -569,7 +644,10 @@ async fn send_reply(
         PlatformType::Slack => slack,
     };
     if let Some(p) = platform {
-        if let Err(e) = p.send_message(text, &ctx.chat_id, ctx.thread_ts.as_deref()).await {
+        if let Err(e) = p
+            .send_message(text, &ctx.chat_id, ctx.thread_ts.as_deref())
+            .await
+        {
             tracing::error!("Failed to send reply: {}", e);
         }
     }
@@ -584,10 +662,7 @@ async fn send_error(
     send_reply(ctx, &format!("Error: {}", error), telegram, slack).await;
 }
 
-fn spawn_delivery_task(
-    platform: Arc<dyn ChatPlatform>,
-    mut rx: broadcast::Receiver<StreamEvent>,
-) {
+fn spawn_delivery_task(platform: Arc<dyn ChatPlatform>, mut rx: broadcast::Receiver<StreamEvent>) {
     tokio::spawn(async move {
         let mut session_chat_ids: HashMap<String, String> = HashMap::new();
         let mut session_thread_ts: HashMap<String, Option<String>> = HashMap::new();
@@ -604,7 +679,11 @@ fn spawn_delivery_task(
                     .await;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("{:?} delivery lagged by {} events", platform.platform_type(), n);
+                    tracing::warn!(
+                        "{:?} delivery lagged by {} events",
+                        platform.platform_type(),
+                        n
+                    );
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     tracing::info!("{:?} delivery channel closed", platform.platform_type());
@@ -622,7 +701,11 @@ async fn handle_stream_event(
     session_thread_ts: &mut HashMap<String, Option<String>>,
 ) {
     match event {
-        StreamEvent::SessionStarted { session, chat_id, thread_ts } => {
+        StreamEvent::SessionStarted {
+            session,
+            chat_id,
+            thread_ts,
+        } => {
             session_chat_ids.insert(session.clone(), chat_id);
             session_thread_ts.insert(session, thread_ts);
         }
@@ -677,7 +760,10 @@ async fn reconcile_startup(
     // Reconnect to surviving tb-* tmux sessions
     match session_mgr.tmux().list_sessions().await {
         Ok(sessions) if !sessions.is_empty() => {
-            tracing::info!("Found {} existing tmux session(s), reconnecting...", sessions.len());
+            tracing::info!(
+                "Found {} existing tmux session(s), reconnecting...",
+                sessions.len()
+            );
             for name in sessions {
                 match session_mgr.reconnect_session(&name).await {
                     Ok(()) => {
