@@ -44,6 +44,9 @@ _RELEASE_JSON=""
 # Temp file path (for cleanup trap)
 _TMP_FILE=""
 
+# Version downloaded (set by download_binary, written by caller after verify)
+_DOWNLOADED_VERSION=""
+
 # =============================================================================
 # Global state (set by interactive prompts)
 # =============================================================================
@@ -124,6 +127,9 @@ prompt() {
 
   read -r result < /dev/tty || true
 
+  # Strip leading/trailing whitespace (common paste artifacts)
+  result="$(printf '%s' "$result" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
   if [ -z "$result" ] && [ -n "$default" ]; then
     result="$default"
   fi
@@ -153,17 +159,23 @@ prompt_yn() {
   local default="${2:-y}"
   local result
 
-  if [ "$default" = "y" ]; then
-    printf "  %b%s%b [Y/n]: " "$BOLD" "$message" "$NC" >&2
-  else
-    printf "  %b%s%b [y/N]: " "$BOLD" "$message" "$NC" >&2
-  fi
+  while true; do
+    if [ "$default" = "y" ]; then
+      printf "  %b%s%b [Y/n]: " "$BOLD" "$message" "$NC" >&2
+    else
+      printf "  %b%s%b [y/N]: " "$BOLD" "$message" "$NC" >&2
+    fi
 
-  read -r result < /dev/tty || true
-  result="${result:-$default}"
-  result="$(printf "%s" "$result" | tr '[:upper:]' '[:lower:]')"
+    read -r result < /dev/tty || true
+    result="${result:-$default}"
+    result="$(printf "%s" "$result" | tr '[:upper:]' '[:lower:]')"
 
-  [ "$result" = "y" ] || [ "$result" = "yes" ]
+    case "$result" in
+      y|yes) return 0 ;;
+      n|no)  return 1 ;;
+      *)     warn "Please answer y or n." ;;
+    esac
+  done
 }
 
 # =============================================================================
@@ -307,6 +319,7 @@ check_curl() {
     error "curl is required but not found. Please install curl first."
     exit 1
   fi
+  info "curl found"
 }
 
 check_tmux() {
@@ -337,12 +350,13 @@ install_tmux() {
   local pm="$1"
   step "Installing tmux via ${pm}"
 
+  local install_ok=true
   case "$pm" in
-    brew)   brew install tmux >&2 ;;
-    apt)    sudo apt-get update -qq >&2 && sudo apt-get install -y tmux >&2 ;;
-    dnf)    sudo dnf install -y tmux >&2 ;;
-    yum)    sudo yum install -y tmux >&2 ;;
-    pacman) sudo pacman -S --noconfirm tmux >&2 ;;
+    brew)   brew install tmux >&2                                            || install_ok=false ;;
+    apt)    (sudo apt-get update -qq >&2 && sudo apt-get install -y tmux >&2) || install_ok=false ;;
+    dnf)    sudo dnf install -y tmux >&2                                     || install_ok=false ;;
+    yum)    sudo yum install -y tmux >&2                                     || install_ok=false ;;
+    pacman) sudo pacman -S --noconfirm tmux >&2                              || install_ok=false ;;
   esac
 
   if command -v tmux >/dev/null 2>&1; then
@@ -624,10 +638,24 @@ STREAMING
 # =============================================================================
 
 fetch_release_info() {
-  if [ -z "$_RELEASE_JSON" ]; then
-    _RELEASE_JSON="$(curl -fsSL "$GITHUB_RELEASES" 2>/dev/null || printf "")"
-  fi
+  # NOTE: callers must populate _RELEASE_JSON in the parent shell before
+  # calling get_latest_version / get_expected_checksum, because $() runs
+  # in a subshell and assignments don't propagate back.
   printf '%s' "$_RELEASE_JSON"
+}
+
+# Fetch the release JSON once into the global cache.
+# Call this in the parent shell (not inside $()) before using version/checksum helpers.
+prefetch_release_info() {
+  if [ -z "$_RELEASE_JSON" ]; then
+    _RELEASE_JSON="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+      "$GITHUB_RELEASES" 2>/dev/null || printf "")"
+    # Validate response is actual JSON
+    if [ -n "$_RELEASE_JSON" ] && ! printf '%s' "$_RELEASE_JSON" | grep -q '"tag_name"'; then
+      warn "GitHub API returned unexpected response (rate-limited?)."
+      _RELEASE_JSON=""
+    fi
+  fi
 }
 
 get_latest_version() {
@@ -660,7 +688,9 @@ download_binary() {
 
   step "Downloading termbot"
 
-  # Fetch version first to avoid race condition between download and API call
+  # Populate the release cache in the parent shell (avoids subshell leak)
+  prefetch_release_info
+
   local version
   version="$(get_latest_version)"
   if [ "$version" = "unknown" ]; then
@@ -678,14 +708,28 @@ download_binary() {
   hint_always "Target: ${target}"
   hint_always "URL:    ${url}"
 
-  mkdir -p "$INSTALL_DIR"
+  if ! mkdir -p "$INSTALL_DIR"; then
+    error "Could not create install directory: ${INSTALL_DIR}"
+    exit 1
+  fi
 
-  _TMP_FILE="$(mktemp "${INSTALL_DIR}/${BINARY_NAME}.XXXXXX")"
+  _TMP_FILE="$(mktemp "${INSTALL_DIR}/${BINARY_NAME}.XXXXXX")" || {
+    error "Failed to create temporary file in ${INSTALL_DIR}."
+    exit 1
+  }
 
-  if ! curl -fSL --progress-bar -o "$_TMP_FILE" "$url" 2>&1; then
+  if ! curl -fSL --connect-timeout 15 --max-time 300 --progress-bar -o "$_TMP_FILE" "$url" 2>&1; then
     rm -f "$_TMP_FILE"
     _TMP_FILE=""
     error "Download failed. Check your internet connection and try again."
+    exit 1
+  fi
+
+  # Verify download is non-empty
+  if [ ! -s "$_TMP_FILE" ]; then
+    rm -f "$_TMP_FILE"
+    _TMP_FILE=""
+    error "Downloaded file is empty (disk full?)."
     exit 1
   fi
 
@@ -718,26 +762,35 @@ download_binary() {
     warn "Checksums not available from release. Skipping verification."
   fi
 
-  chmod +x "$_TMP_FILE"
+  if ! chmod +x "$_TMP_FILE"; then
+    rm -f "$_TMP_FILE"
+    _TMP_FILE=""
+    error "Failed to set executable permission on downloaded binary."
+    exit 1
+  fi
 
-  # Atomic swap — back up existing binary with cp (keeps original in place
-  # until the final mv, so there's no window where the binary is missing)
+  # Atomic swap — cp keeps original in place until the final mv
   if [ -f "$BINARY_PATH" ]; then
-    cp "$BINARY_PATH" "$BACKUP_PATH"
+    if ! cp "$BINARY_PATH" "$BACKUP_PATH"; then
+      error "Failed to back up existing binary. Check disk space and permissions."
+      rm -f "$_TMP_FILE"; _TMP_FILE=""
+      exit 1
+    fi
     info "Previous binary backed up to ${BACKUP_PATH}"
   fi
 
-  mv "$_TMP_FILE" "$BINARY_PATH"
+  if ! mv "$_TMP_FILE" "$BINARY_PATH"; then
+    error "Failed to install binary to ${BINARY_PATH}. Check disk space and permissions."
+    _TMP_FILE=""
+    exit 1
+  fi
   _TMP_FILE=""    # clear so cleanup trap doesn't remove the installed binary
   info "Binary installed to ${BINARY_PATH}"
 
-  # Record installed version (only if we got a real version)
-  mkdir -p "$CONFIG_DIR"
-  if [ "$version" != "unknown" ]; then
-    printf "%s" "$version" > "$VERSION_FILE"
-  else
-    warn "Could not determine installed version (GitHub API may be rate-limited)."
-  fi
+  # Version is recorded by the caller (do_install/do_upgrade) after
+  # verifying the service starts, not here, to avoid "already up to date"
+  # blocking recovery from a partial install.
+  _DOWNLOADED_VERSION="$version"
 }
 
 # =============================================================================
@@ -759,7 +812,11 @@ ensure_path() {
   esac
 
   if prompt_yn "Add ${INSTALL_DIR} to PATH in ${shell_rc}?"; then
-    printf '\n# Added by termbot installer\nexport PATH="%s:${PATH}"\n' "$INSTALL_DIR" >> "$shell_rc"
+    if grep -qF "# Added by termbot installer" "$shell_rc" 2>/dev/null; then
+      info "PATH entry already exists in ${shell_rc}"
+    else
+      printf '\n# Added by termbot installer\nexport PATH="%s:${PATH}"\n' "$INSTALL_DIR" >> "$shell_rc"
+    fi
     info "PATH updated in ${shell_rc}"
     hint_always "Run: source ${shell_rc}  (or open a new terminal)"
     export PATH="${INSTALL_DIR}:${PATH}"
@@ -827,27 +884,33 @@ install_service_linux() {
 Description=termbot - terminal control from Telegram/Slack
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart="${BINARY_PATH}"
+ExecStart=${BINARY_PATH}
 WorkingDirectory=${HOME}
 Environment=TERMBOT_CONFIG=${CONFIG_FILE}
 Environment=PATH=${svc_path}
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:${LOG_DIR}/termbot.log
-StandardError=append:${LOG_DIR}/termbot.log
 
-# Send OS notification on crash
-ExecStopPost=-/bin/sh -c 'if [ "\$SERVICE_RESULT" != "success" ]; then "${UPDATE_CHECK_PATH}" --health-notify 2>/dev/null; fi'
+# Send OS notification on crash (not on normal stop via SIGTERM)
+ExecStopPost=-/bin/sh -c 'if [ "\$SERVICE_RESULT" = "exit-code" ]; then ${UPDATE_CHECK_PATH} --health-notify 2>/dev/null; fi'
 
 [Install]
 WantedBy=default.target
 EOF
 
-  systemctl --user daemon-reload
-  systemctl --user enable termbot.service >/dev/null 2>&1
+  if ! systemctl --user daemon-reload; then
+    error "systemctl daemon-reload failed. Check that D-Bus session bus is available."
+    hint_always "Try: export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$(id -u)/bus"
+    return 1
+  fi
+  if ! systemctl --user enable termbot.service 2>&1; then
+    warn "Failed to enable termbot.service. You may need to enable it manually."
+  fi
   info "systemd service installed and enabled"
 
   # Check linger for persistence across logout
@@ -932,7 +995,10 @@ install_service_macos() {
         <string>$(xml_escape "$svc_path")</string>
     </dict>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
@@ -984,10 +1050,20 @@ EOF
 write_wrapper_script() {
   cat > "$WRAPPER_PATH" <<EOF
 #!/usr/bin/env bash
-# termbot wrapper — notify on crash, then exit so launchd restarts
-"${BINARY_PATH}"
+# termbot wrapper — forward signals, notify on crash
+if [ ! -x "${BINARY_PATH}" ]; then
+  echo "termbot binary not found: ${BINARY_PATH}" >&2
+  exit 1
+fi
+
+"${BINARY_PATH}" &
+child=\$!
+trap 'kill -TERM \$child 2>/dev/null; wait \$child' TERM INT
+wait \$child
 ec=\$?
-if [ \$ec -ne 0 ]; then
+
+# 143 = SIGTERM (normal stop), don't notify
+if [ \$ec -ne 0 ] && [ \$ec -ne 143 ]; then
   "${UPDATE_CHECK_PATH}" --health-notify 2>/dev/null || true
 fi
 exit \$ec
@@ -1163,7 +1239,11 @@ restart_service() {
       launchctl bootout "gui/$(id -u)/com.termbot.agent" 2>/dev/null \
         || launchctl unload "$LAUNCHD_SERVICE" 2>/dev/null \
         || true
-      sleep 1
+      # Wait for old process to actually exit (up to 10 seconds)
+      local i=0
+      while pgrep -x termbot >/dev/null 2>&1 && [ $i -lt 10 ]; do
+        sleep 1; i=$((i + 1))
+      done
       launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_SERVICE" 2>/dev/null \
         || launchctl load "$LAUNCHD_SERVICE" 2>/dev/null \
         || true
@@ -1261,13 +1341,15 @@ do_install() {
   # PATH
   ensure_path
 
-  # Helper scripts
+  # Helper scripts (must exist before service files reference them)
   write_update_check_script
+  if [ "$os" = "macos" ]; then
+    write_wrapper_script
+  fi
 
   # Service + timer
   case "$os" in
     macos)
-      write_wrapper_script
       install_service_macos
       install_update_timer_macos
       ;;
@@ -1279,6 +1361,12 @@ do_install() {
 
   # Start
   start_service
+
+  # Record version only after successful start
+  mkdir -p "$CONFIG_DIR"
+  if [ -n "$_DOWNLOADED_VERSION" ] && [ "$_DOWNLOADED_VERSION" != "unknown" ]; then
+    printf "%s" "$_DOWNLOADED_VERSION" > "$VERSION_FILE"
+  fi
 
   # Summary
   print_summary "$os"
@@ -1315,6 +1403,9 @@ do_upgrade() {
     exit 1
   fi
 
+  # Populate release cache in parent shell
+  prefetch_release_info
+
   local installed_version latest_version
   installed_version="$(cat "$VERSION_FILE" 2>/dev/null || printf "unknown")"
   latest_version="$(get_latest_version)"
@@ -1327,6 +1418,13 @@ do_upgrade() {
     exit 0
   fi
 
+  if [ "$latest_version" = "unknown" ]; then
+    warn "Could not determine latest version (GitHub API may be rate-limited)."
+    if ! prompt_yn "Proceed with upgrade anyway?"; then
+      exit 0
+    fi
+  fi
+
   # Download (handles atomic swap + backup)
   download_binary "$target"
 
@@ -1336,6 +1434,20 @@ do_upgrade() {
     write_wrapper_script
   fi
 
+  # Refresh service files (updates PATH, fixes stale references)
+  case "$os" in
+    macos)
+      install_service_macos
+      install_update_timer_macos
+      ;;
+    linux)
+      if has_systemd; then
+        install_service_linux
+        install_update_timer_linux
+      fi
+      ;;
+  esac
+
   # Restart
   step "Restarting service"
   restart_service
@@ -1344,10 +1456,29 @@ do_upgrade() {
   if verify_running; then
     info "termbot upgraded and running (${latest_version})"
     hint_always "Previous version backed up to ${BACKUP_PATH}"
+    # Record version only after verified start
+    mkdir -p "$CONFIG_DIR"
+    if [ -n "$_DOWNLOADED_VERSION" ] && [ "$_DOWNLOADED_VERSION" != "unknown" ]; then
+      printf "%s" "$_DOWNLOADED_VERSION" > "$VERSION_FILE"
+    fi
   else
-    warn "termbot may not have started correctly after upgrade."
-    hint_always "To rollback: mv '${BACKUP_PATH}' '${BINARY_PATH}'"
-    hint_always "Check logs:  tail -f ${LOG_DIR}/termbot.log"
+    warn "New version failed to start. Auto-rolling back..."
+    if [ -f "$BACKUP_PATH" ]; then
+      mv "$BACKUP_PATH" "$BINARY_PATH"
+      if [ -n "$installed_version" ] && [ "$installed_version" != "unknown" ]; then
+        printf "%s" "$installed_version" > "$VERSION_FILE"
+      fi
+      restart_service
+      sleep 2
+      if verify_running; then
+        info "Rolled back to ${installed_version} successfully."
+      else
+        error "Rollback also failed. Check logs: ${LOG_DIR}/termbot.log"
+      fi
+    else
+      error "No backup available for rollback."
+      hint_always "Check logs: tail -f ${LOG_DIR}/termbot.log"
+    fi
   fi
 }
 
