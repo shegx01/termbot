@@ -19,6 +19,12 @@ patterns = [
   "dd\\s+if=",
 ]
 
+[commands]
+# Trigger character for shell commands and built-ins (default: ":")
+# Messages starting with this char + space are parsed as commands.
+# Example: with trigger = "!", you'd type "! ls -la" instead of ": ls -la"
+trigger = ":"
+
 [streaming]
 edit_throttle_ms = 2000
 poll_interval_ms = 250

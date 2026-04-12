@@ -41,8 +41,8 @@ pub enum ParsedCommand {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    #[error("Empty shell command — did you mean to type something after `: `?")]
-    EmptyShellCommand,
+    #[error("Empty shell command — did you mean to type something after `{trigger} `?")]
+    EmptyShellCommand { trigger: char },
     #[error("Missing session name")]
     MissingName,
     #[error("Session names can only contain letters, numbers, hyphens, and underscores")]
@@ -72,12 +72,15 @@ fn validate_session_name(name: &str) -> std::result::Result<(), ParseError> {
 }
 
 impl ParsedCommand {
-    pub fn parse(input: &str) -> std::result::Result<Self, ParseError> {
-        if let Some(rest) = input.strip_prefix(": ") {
+    pub fn parse(input: &str, trigger: char) -> std::result::Result<Self, ParseError> {
+        if let Some(rest) = input
+            .strip_prefix(trigger)
+            .and_then(|s| s.strip_prefix(' '))
+        {
             let rest = rest.trim();
 
             if rest.is_empty() {
-                return Err(ParseError::EmptyShellCommand);
+                return Err(ParseError::EmptyShellCommand { trigger });
             }
 
             // Built-in commands
@@ -146,8 +149,8 @@ impl ParsedCommand {
                 });
             }
 
-            // Reject multi-line commands (newlines would execute as separate commands)
-            if rest.contains('\n') {
+            // Reject multi-line shell commands — only single commands can be safely blocklist-checked
+            if rest.contains('\n') || rest.contains('\r') {
                 return Err(ParseError::MultiLineNotAllowed);
             }
 
@@ -156,11 +159,8 @@ impl ParsedCommand {
                 cmd: rest.to_string(),
             })
         } else {
-            // No `: ` prefix — stdin input
-            // Reject newlines (each line would execute as a separate shell command in tmux)
-            if input.contains('\n') {
-                return Err(ParseError::MultiLineNotAllowed);
-            }
+            // No trigger prefix — stdin input (may contain newlines;
+            // the dispatcher in app.rs decides whether to allow based on harness state)
             Ok(ParsedCommand::StdinInput {
                 text: input.to_string(),
             })
@@ -184,12 +184,37 @@ impl CommandBlocklist {
     }
 
     /// Check if a command is blocked. Normalizes common evasion patterns
-    /// (path prefixes, backslash insertion) before matching.
+    /// (path prefixes, backslash insertion) before matching. For multi-line
+    /// payloads, each line is checked individually in addition to the whole string.
+    #[must_use = "ignoring a blocklist check is a security risk"]
     pub fn is_blocked(&self, command: &str) -> bool {
         let normalized = Self::normalize_command(command);
-        self.patterns
+        if self
+            .patterns
             .iter()
             .any(|p| p.is_match(command) || p.is_match(&normalized))
+        {
+            return true;
+        }
+        // Also check each line individually (multi-line harness prompts could
+        // embed dangerous commands on separate lines)
+        if command.contains('\n') || command.contains('\r') {
+            for line in command.split(['\n', '\r']) {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let norm_line = Self::normalize_command(line);
+                if self
+                    .patterns
+                    .iter()
+                    .any(|p| p.is_match(line) || p.is_match(&norm_line))
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Normalize common shell evasion patterns:
@@ -200,6 +225,8 @@ impl CommandBlocklist {
     ///   `rm -fr`, `rm -rf`, `rm -r -f` all normalize to `rm -fr`
     fn normalize_command(command: &str) -> String {
         let mut s = command.to_string();
+        // Strip null bytes and carriage returns that could confuse matching
+        s.retain(|c| c != '\0' && c != '\r');
         // Strip path prefixes
         for prefix in &[
             "/usr/local/bin/",
@@ -295,7 +322,7 @@ mod tests {
     #[test]
     fn parse_new_session() {
         assert_eq!(
-            ParsedCommand::parse(": new build").unwrap(),
+            ParsedCommand::parse(": new build", ':').unwrap(),
             ParsedCommand::NewSession {
                 name: "build".into()
             }
@@ -305,7 +332,7 @@ mod tests {
     #[test]
     fn parse_foreground() {
         assert_eq!(
-            ParsedCommand::parse(": fg build").unwrap(),
+            ParsedCommand::parse(": fg build", ':').unwrap(),
             ParsedCommand::Foreground {
                 name: "build".into()
             }
@@ -315,7 +342,7 @@ mod tests {
     #[test]
     fn parse_background() {
         assert_eq!(
-            ParsedCommand::parse(": bg").unwrap(),
+            ParsedCommand::parse(": bg", ':').unwrap(),
             ParsedCommand::Background
         );
     }
@@ -323,7 +350,7 @@ mod tests {
     #[test]
     fn parse_list() {
         assert_eq!(
-            ParsedCommand::parse(": list").unwrap(),
+            ParsedCommand::parse(": list", ':').unwrap(),
             ParsedCommand::ListSessions
         );
     }
@@ -331,7 +358,7 @@ mod tests {
     #[test]
     fn parse_kill() {
         assert_eq!(
-            ParsedCommand::parse(": kill build").unwrap(),
+            ParsedCommand::parse(": kill build", ':').unwrap(),
             ParsedCommand::KillSession {
                 name: "build".into()
             }
@@ -341,7 +368,7 @@ mod tests {
     #[test]
     fn parse_shell_command() {
         assert_eq!(
-            ParsedCommand::parse(": ls -la").unwrap(),
+            ParsedCommand::parse(": ls -la", ':').unwrap(),
             ParsedCommand::ShellCommand {
                 cmd: "ls -la".into()
             }
@@ -351,7 +378,7 @@ mod tests {
     #[test]
     fn parse_stdin_input() {
         assert_eq!(
-            ParsedCommand::parse("hello world").unwrap(),
+            ParsedCommand::parse("hello world", ':').unwrap(),
             ParsedCommand::StdinInput {
                 text: "hello world".into()
             }
@@ -361,7 +388,7 @@ mod tests {
     #[test]
     fn parse_claude_prompt() {
         assert_eq!(
-            ParsedCommand::parse(": claude explain this code").unwrap(),
+            ParsedCommand::parse(": claude explain this code", ':').unwrap(),
             ParsedCommand::HarnessPrompt {
                 harness: HarnessKind::Claude,
                 prompt: "explain this code".into()
@@ -372,15 +399,15 @@ mod tests {
     #[test]
     fn parse_empty_shell_command() {
         assert!(matches!(
-            ParsedCommand::parse(":  "),
-            Err(ParseError::EmptyShellCommand)
+            ParsedCommand::parse(":  ", ':'),
+            Err(ParseError::EmptyShellCommand { .. })
         ));
     }
 
     #[test]
     fn parse_missing_name() {
         assert!(matches!(
-            ParsedCommand::parse(": new  "),
+            ParsedCommand::parse(": new  ", ':'),
             Err(ParseError::MissingName)
         ));
     }
@@ -403,16 +430,12 @@ mod tests {
     fn blocklist_evasion_flag_reorder() {
         let bl =
             CommandBlocklist::from_config(&[r"rm\s+-[a-z]*f[a-z]*r[a-z]*\s+/".into()]).unwrap();
-        // Reversed flag order
         assert!(bl.is_blocked("rm -fr /"));
         assert!(bl.is_blocked("rm -rf /"));
-        // Separate flags
         assert!(bl.is_blocked("rm -r -f /"));
         assert!(bl.is_blocked("rm -f -r /"));
-        // Extra flags mixed in
         assert!(bl.is_blocked("rm -rfv /"));
         assert!(bl.is_blocked("rm -vfr /"));
-        // Should NOT block without both flags
         assert!(!bl.is_blocked("rm -r /tmp/junk"));
         assert!(!bl.is_blocked("rm -f /tmp/junk"));
     }
@@ -420,7 +443,7 @@ mod tests {
     #[test]
     fn parse_claude_on() {
         assert_eq!(
-            ParsedCommand::parse(": claude on").unwrap(),
+            ParsedCommand::parse(": claude on", ':').unwrap(),
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
             }
@@ -429,9 +452,8 @@ mod tests {
 
     #[test]
     fn parse_bare_claude_is_shell_command() {
-        // Bare `: claude` launches Claude CLI in tmux, not interactive SDK mode
         assert_eq!(
-            ParsedCommand::parse(": claude").unwrap(),
+            ParsedCommand::parse(": claude", ':').unwrap(),
             ParsedCommand::ShellCommand {
                 cmd: "claude".into()
             }
@@ -441,7 +463,7 @@ mod tests {
     #[test]
     fn parse_claude_off() {
         assert_eq!(
-            ParsedCommand::parse(": claude off").unwrap(),
+            ParsedCommand::parse(": claude off", ':').unwrap(),
             ParsedCommand::HarnessOff {
                 harness: HarnessKind::Claude,
             }
@@ -451,7 +473,7 @@ mod tests {
     #[test]
     fn parse_gemini_on() {
         assert_eq!(
-            ParsedCommand::parse(": gemini on").unwrap(),
+            ParsedCommand::parse(": gemini on", ':').unwrap(),
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Gemini,
             }
@@ -461,7 +483,7 @@ mod tests {
     #[test]
     fn parse_gemini_off() {
         assert_eq!(
-            ParsedCommand::parse(": gemini off").unwrap(),
+            ParsedCommand::parse(": gemini off", ':').unwrap(),
             ParsedCommand::HarnessOff {
                 harness: HarnessKind::Gemini,
             }
@@ -471,7 +493,7 @@ mod tests {
     #[test]
     fn parse_codex_prompt() {
         assert_eq!(
-            ParsedCommand::parse(": codex explain this").unwrap(),
+            ParsedCommand::parse(": codex explain this", ':').unwrap(),
             ParsedCommand::HarnessPrompt {
                 harness: HarnessKind::Codex,
                 prompt: "explain this".into()
@@ -482,7 +504,7 @@ mod tests {
     #[test]
     fn parse_bare_gemini_is_shell_command() {
         assert_eq!(
-            ParsedCommand::parse(": gemini").unwrap(),
+            ParsedCommand::parse(": gemini", ':').unwrap(),
             ParsedCommand::ShellCommand {
                 cmd: "gemini".into()
             }
@@ -492,15 +514,15 @@ mod tests {
     #[test]
     fn reject_invalid_session_name() {
         assert!(matches!(
-            ParsedCommand::parse(": new foo:bar"),
+            ParsedCommand::parse(": new foo:bar", ':'),
             Err(ParseError::InvalidSessionName)
         ));
         assert!(matches!(
-            ParsedCommand::parse(": new foo.bar"),
+            ParsedCommand::parse(": new foo.bar", ':'),
             Err(ParseError::InvalidSessionName)
         ));
         assert!(matches!(
-            ParsedCommand::parse(": fg ../etc"),
+            ParsedCommand::parse(": fg ../etc", ':'),
             Err(ParseError::InvalidSessionName)
         ));
     }
@@ -508,7 +530,7 @@ mod tests {
     #[test]
     fn valid_session_names() {
         assert_eq!(
-            ParsedCommand::parse(": new my-session_1").unwrap(),
+            ParsedCommand::parse(": new my-session_1", ':').unwrap(),
             ParsedCommand::NewSession {
                 name: "my-session_1".into()
             }
@@ -516,26 +538,21 @@ mod tests {
     }
 
     #[test]
-    fn reject_multiline_shell_command() {
-        assert!(matches!(
-            ParsedCommand::parse(": echo hello\nrm -rf /"),
-            Err(ParseError::MultiLineNotAllowed)
-        ));
-    }
-
-    #[test]
-    fn reject_multiline_stdin() {
-        assert!(matches!(
-            ParsedCommand::parse("line1\nline2"),
-            Err(ParseError::MultiLineNotAllowed)
-        ));
+    fn multiline_stdin_allowed_by_parser() {
+        // Parser allows multi-line StdinInput; dispatcher decides based on harness state
+        assert_eq!(
+            ParsedCommand::parse("line1\nline2", ':').unwrap(),
+            ParsedCommand::StdinInput {
+                text: "line1\nline2".into()
+            }
+        );
     }
 
     #[test]
     fn reject_long_session_name() {
         let long_name = "a".repeat(65);
         assert!(matches!(
-            ParsedCommand::parse(&format!(": new {}", long_name)),
+            ParsedCommand::parse(&format!(": new {}", long_name), ':'),
             Err(ParseError::SessionNameTooLong)
         ));
     }
@@ -556,8 +573,92 @@ mod tests {
     #[test]
     fn parse_screen() {
         assert_eq!(
-            ParsedCommand::parse(": screen").unwrap(),
+            ParsedCommand::parse(": screen", ':').unwrap(),
             ParsedCommand::Screen
         );
+    }
+
+    // --- New tests for configurable trigger and multi-line ---
+
+    #[test]
+    fn parse_custom_trigger() {
+        assert_eq!(
+            ParsedCommand::parse("! ls -la", '!').unwrap(),
+            ParsedCommand::ShellCommand {
+                cmd: "ls -la".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_custom_trigger_harness_prompt() {
+        assert_eq!(
+            ParsedCommand::parse("! claude explain this", '!').unwrap(),
+            ParsedCommand::HarnessPrompt {
+                harness: HarnessKind::Claude,
+                prompt: "explain this".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multiline_harness_prompt_allowed() {
+        assert_eq!(
+            ParsedCommand::parse(": claude explain\nthis code", ':').unwrap(),
+            ParsedCommand::HarnessPrompt {
+                harness: HarnessKind::Claude,
+                prompt: "explain\nthis code".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multiline_shell_command_rejected() {
+        assert!(matches!(
+            ParsedCommand::parse(": echo hello\nrm -rf /", ':'),
+            Err(ParseError::MultiLineNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn parse_wrong_trigger_is_stdin() {
+        // ":" prefix with trigger "!" is not recognized as a command
+        assert_eq!(
+            ParsedCommand::parse(": ls", '!').unwrap(),
+            ParsedCommand::StdinInput {
+                text: ": ls".into()
+            }
+        );
+    }
+
+    #[test]
+    fn empty_shell_command_includes_trigger() {
+        let err = ParsedCommand::parse(":  ", ':').unwrap_err();
+        assert!(err.to_string().contains(": "));
+        let err = ParsedCommand::parse("!  ", '!').unwrap_err();
+        assert!(err.to_string().contains("! "));
+    }
+
+    #[test]
+    fn trigger_without_space_is_stdin() {
+        assert_eq!(
+            ParsedCommand::parse(":ls", ':').unwrap(),
+            ParsedCommand::StdinInput { text: ":ls".into() }
+        );
+    }
+
+    #[test]
+    fn blocklist_per_line_multiline() {
+        let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
+        assert!(bl.is_blocked("innocent text\nsudo reboot"));
+        assert!(bl.is_blocked("line1\nline2\nsudo rm -rf /"));
+        assert!(!bl.is_blocked("innocent text\nls -la")); // no dangerous commands on any line
+    }
+
+    #[test]
+    fn blocklist_normalize_strips_cr_and_null() {
+        let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
+        assert!(bl.is_blocked("su\0do reboot")); // null stripped -> "sudo reboot"
+        assert!(bl.is_blocked("sudo\r reboot")); // \r stripped -> "sudo reboot"
     }
 }

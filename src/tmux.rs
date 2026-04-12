@@ -62,6 +62,11 @@ impl TmuxClient {
     /// from interpreting special characters like `?`, `*`, `!` as globs.
     /// Then sends Enter separately to submit the line.
     pub async fn send_keys(&self, name: &str, keys: &str) -> Result<()> {
+        // Defense-in-depth: reject newlines at the tmux layer. Newlines in
+        // send-keys -l would be interpreted as Enter, executing multiple commands.
+        if keys.contains('\n') || keys.contains('\r') {
+            anyhow::bail!("send_keys: refusing input containing newline characters");
+        }
         let prefixed = self.prefixed(name);
         // Normalize smart/curly quotes from mobile keyboards (Telegram, Slack)
         // into plain ASCII quotes that shells understand

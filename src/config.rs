@@ -11,6 +11,8 @@ pub struct Config {
     pub blocklist: BlocklistConfig,
     #[serde(default)]
     pub streaming: StreamingConfig,
+    #[serde(default)]
+    pub commands: CommandsConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +98,24 @@ fn default_max_sessions() -> usize {
     10
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CommandsConfig {
+    #[serde(default = "default_trigger")]
+    pub trigger: char,
+}
+
+impl Default for CommandsConfig {
+    fn default() -> Self {
+        Self {
+            trigger: default_trigger(),
+        }
+    }
+}
+
+fn default_trigger() -> char {
+    ':'
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -142,6 +162,17 @@ impl Config {
             if self.auth.slack_user_id.is_none() {
                 anyhow::bail!("[slack] section present but auth.slack_user_id is not set");
             }
+        }
+
+        const SAFE_TRIGGERS: &[char] = &[
+            ':', '!', '>', ';', '.', ',', '@', '~', '^', '-', '+', '=', '|', '%', '?',
+        ];
+        if !SAFE_TRIGGERS.contains(&self.commands.trigger) {
+            anyhow::bail!(
+                "commands.trigger must be one of {:?}, got {:?}",
+                SAFE_TRIGGERS,
+                self.commands.trigger
+            );
         }
 
         if self.streaming.poll_interval_ms == 0 {

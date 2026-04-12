@@ -22,12 +22,15 @@ pub struct App {
     telegram: Option<Arc<dyn ChatPlatform>>,
     slack: Option<Arc<dyn ChatPlatform>>,
     offline_buffer_max: usize,
+    trigger: char,
 }
 
 impl App {
     pub fn new(config: &Config) -> Result<Self> {
         let blocklist = CommandBlocklist::from_config(&config.blocklist.patterns)?;
-        let session_mgr = SessionManager::new(TmuxClient::new(), config.streaming.max_sessions);
+        let trigger = config.commands.trigger;
+        let session_mgr =
+            SessionManager::new(TmuxClient::new(), config.streaming.max_sessions, trigger);
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
@@ -44,6 +47,7 @@ impl App {
             telegram: None,
             slack: None,
             offline_buffer_max: config.streaming.offline_buffer_max_bytes,
+            trigger,
         })
     }
 
@@ -110,13 +114,33 @@ impl App {
     }
 
     pub async fn handle_command(&mut self, msg: &IncomingMessage) {
-        let cmd = match ParsedCommand::parse(&msg.text) {
+        let cmd = match ParsedCommand::parse(&msg.text, self.trigger) {
             Ok(cmd) => cmd,
             Err(e) => {
                 self.send_error(&msg.reply_context, &e.to_string()).await;
                 return;
             }
         };
+
+        // Multi-line StdinInput guard: the parser allows multi-line StdinInput,
+        // but the dispatcher must check harness state before routing to tmux.
+        if let ParsedCommand::StdinInput { ref text } = cmd {
+            if (text.contains('\n') || text.contains('\r'))
+                && self.session_mgr.foreground_harness().is_none()
+            {
+                self.send_error(
+                    &msg.reply_context,
+                    &format!(
+                        "Multi-line input requires harness mode. \
+                         Use `{} claude on` to enable, or prefix with `{} claude <prompt>` for one-off.",
+                        self.trigger, self.trigger
+                    ),
+                )
+                .await;
+                cleanup_attachments(&msg.attachments).await;
+                return;
+            }
+        }
 
         tracing::info!(
             "handle_command: {:?} (fg={:?})",
@@ -127,10 +151,9 @@ impl App {
         // Clean up image temp files for commands that won't route to a harness.
         // Harness paths (HarnessPrompt, StdinInput->harness) handle their own cleanup
         // inside the spawned harness task.
-        let harness_will_handle = matches!(
-            cmd,
-            ParsedCommand::HarnessPrompt { .. } | ParsedCommand::StdinInput { .. }
-        );
+        let harness_will_handle = matches!(cmd, ParsedCommand::HarnessPrompt { .. })
+            || (matches!(cmd, ParsedCommand::StdinInput { .. })
+                && self.session_mgr.foreground_harness().is_some());
         if !harness_will_handle && !msg.attachments.is_empty() {
             cleanup_attachments(&msg.attachments).await;
         }
@@ -295,8 +318,9 @@ impl App {
                             self.send_error(
                                 &msg.reply_context,
                                 &format!(
-                                    "{} is active but doesn't support resume. Run `: {} off` first to avoid losing context.",
+                                    "{} is active but doesn't support resume. Run `{} {} off` first to avoid losing context.",
                                     current.name(),
+                                    self.trigger,
                                     current.name().to_lowercase()
                                 ),
                             )
@@ -319,9 +343,10 @@ impl App {
                 self.send_reply(
                     &msg.reply_context,
                     &format!(
-                        "{} mode ON. Plain text now goes to {}. Use `: {} off` to switch back.",
+                        "{} mode ON. Plain text now goes to {}. Use `{} {} off` to switch back.",
                         kind.name(),
                         kind.name(),
+                        self.trigger,
                         kind.name().to_lowercase()
                     ),
                 )
@@ -419,7 +444,7 @@ impl App {
                         cleanup_attachments(&msg.attachments).await;
                         self.send_error(
                             &msg.reply_context,
-                            "Images are only supported in harness mode. Use `: claude on` first.",
+                            &format!("Images are only supported in harness mode. Use `{} claude on` first.", self.trigger),
                         )
                         .await;
                         return;

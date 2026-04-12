@@ -24,15 +24,17 @@ pub struct SessionManager {
     sessions: HashMap<String, SessionState>,
     foreground: Option<String>,
     max_sessions: usize,
+    trigger: char,
 }
 
 impl SessionManager {
-    pub fn new(tmux: TmuxClient, max_sessions: usize) -> Self {
+    pub fn new(tmux: TmuxClient, max_sessions: usize, trigger: char) -> Self {
         Self {
             tmux,
             sessions: HashMap::new(),
             foreground: None,
             max_sessions,
+            trigger,
         }
     }
 
@@ -84,7 +86,7 @@ impl SessionManager {
         }
 
         if self.tmux.has_session(name).await? {
-            bail!("tmux session 'tb-{}' already exists externally. Use `: fg {}` after restart to reconnect.", name, name);
+            bail!("tmux session 'tb-{}' already exists externally. Use `{} fg {}` after restart to reconnect.", name, self.trigger, name);
         }
 
         self.tmux.create_session(name).await?;
@@ -209,14 +211,20 @@ impl SessionManager {
     pub async fn execute_in_foreground(&self, cmd: &str) -> Result<()> {
         match &self.foreground {
             Some(name) => self.tmux.send_keys(name, cmd).await,
-            None => bail!("No active session. Use `: new <name>` to create one."),
+            None => bail!(
+                "No active session. Use `{} new <name>` to create one.",
+                self.trigger
+            ),
         }
     }
 
     pub async fn send_stdin_to_foreground(&self, text: &str) -> Result<()> {
         match &self.foreground {
             Some(name) => self.tmux.send_stdin(name, text).await,
-            None => bail!("No active session. Use `: new <name>` to create one."),
+            None => bail!(
+                "No active session. Use `{} new <name>` to create one.",
+                self.trigger
+            ),
         }
     }
 
