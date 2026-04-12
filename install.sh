@@ -38,6 +38,12 @@ SYSTEMD_SERVICE="${SYSTEMD_DIR}/termbot.service"
 SYSTEMD_UPDATE_SERVICE="${SYSTEMD_DIR}/termbot-update-check.service"
 SYSTEMD_UPDATE_TIMER="${SYSTEMD_DIR}/termbot-update-check.timer"
 
+# Cached release JSON (fetched once, reused for version + checksum)
+_RELEASE_JSON=""
+
+# Temp file path (for cleanup trap)
+_TMP_FILE=""
+
 # =============================================================================
 # Global state (set by interactive prompts)
 # =============================================================================
@@ -56,7 +62,7 @@ UPGRADE=false
 UNINSTALL=false
 
 # =============================================================================
-# Colors (disabled when stderr is not a terminal)
+# Colors + glyphs (disabled when stderr is not a terminal)
 # =============================================================================
 
 setup_colors() {
@@ -69,8 +75,24 @@ setup_colors() {
     BOLD='\033[1m'
     DIM='\033[2m'
     NC='\033[0m'
+    # Use fancy glyphs only in UTF-8 locales
+    case "${LANG:-}${LC_ALL:-}${LC_CTYPE:-}" in
+      *[Uu][Tt][Ff][-_]8*) TICK='✓'; CROSS='✗'; ARROW='▸' ;;
+      *)                    TICK='+'; CROSS='x'; ARROW='>' ;;
+    esac
   else
     RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' NC=''
+    TICK='+' CROSS='x' ARROW='>'
+  fi
+}
+
+# =============================================================================
+# Cleanup trap — removes temp files on interrupt / error
+# =============================================================================
+
+cleanup() {
+  if [ -n "${_TMP_FILE:-}" ] && [ -f "$_TMP_FILE" ]; then
+    rm -f "$_TMP_FILE"
   fi
 }
 
@@ -78,12 +100,12 @@ setup_colors() {
 # Output helpers (all go to stderr to keep stdout clean)
 # =============================================================================
 
-info()    { printf "  ${GREEN}✓${NC} %s\n" "$1" >&2; }
-warn()    { printf "  ${YELLOW}!${NC} %s\n" "$1" >&2; }
-error()   { printf "  ${RED}✗${NC} %s\n" "$1" >&2; }
-step()    { printf "\n${BOLD}${BLUE}▸ %s${NC}\n" "$1" >&2; }
-hint()    { if [ "$QUICK" = false ]; then printf "    ${DIM}%s${NC}\n" "$1" >&2; fi; }
-hint_always() { printf "    ${DIM}%s${NC}\n" "$1" >&2; }
+info()    { printf "  %b%s%b %s\n" "$GREEN" "$TICK" "$NC" "$1" >&2; }
+warn()    { printf "  %b!%b %s\n" "$YELLOW" "$NC" "$1" >&2; }
+error()   { printf "  %b%s%b %s\n" "$RED" "$CROSS" "$NC" "$1" >&2; }
+step()    { printf "\n%b%b%s %s%b\n" "$BOLD" "$BLUE" "$ARROW" "$1" "$NC" >&2; }
+hint()    { if [ "$QUICK" = false ]; then printf "    %b%s%b\n" "$DIM" "$1" "$NC" >&2; fi; }
+hint_always() { printf "    %b%s%b\n" "$DIM" "$1" "$NC" >&2; }
 
 # =============================================================================
 # Input helpers (read from /dev/tty so curl|bash works)
@@ -95,9 +117,9 @@ prompt() {
   local result
 
   if [ -n "$default" ]; then
-    printf "  ${BOLD}%s${NC} [%s]: " "$message" "$default" >&2
+    printf "  %b%s%b [%s]: " "$BOLD" "$message" "$NC" "$default" >&2
   else
-    printf "  ${BOLD}%s${NC}: " "$message" >&2
+    printf "  %b%s%b: " "$BOLD" "$message" "$NC" >&2
   fi
 
   read -r result < /dev/tty || true
@@ -115,12 +137,12 @@ prompt_choice() {
   local i=1
   local choice
 
-  printf "\n  ${BOLD}%s${NC}\n" "$message" >&2
+  printf "\n  %b%s%b\n" "$BOLD" "$message" "$NC" >&2
   for opt in "$@"; do
-    printf "    ${CYAN}%d)${NC} %s\n" "$i" "$opt" >&2
+    printf "    %b%d)%b %s\n" "$CYAN" "$i" "$NC" "$opt" >&2
     i=$((i + 1))
   done
-  printf "  ${BOLD}>${NC} " >&2
+  printf "  %b>%b " "$BOLD" "$NC" >&2
 
   read -r choice < /dev/tty || true
   printf "%s" "$choice"
@@ -132,9 +154,9 @@ prompt_yn() {
   local result
 
   if [ "$default" = "y" ]; then
-    printf "  ${BOLD}%s${NC} [Y/n]: " "$message" >&2
+    printf "  %b%s%b [Y/n]: " "$BOLD" "$message" "$NC" >&2
   else
-    printf "  ${BOLD}%s${NC} [y/N]: " "$message" >&2
+    printf "  %b%s%b [y/N]: " "$BOLD" "$message" "$NC" >&2
   fi
 
   read -r result < /dev/tty || true
@@ -145,7 +167,62 @@ prompt_yn() {
 }
 
 # =============================================================================
-# OS-native notifications
+# Safety helpers
+# =============================================================================
+
+# Check that /dev/tty is available for interactive prompts
+require_tty() {
+  if [ ! -c /dev/tty ]; then
+    error "This installer requires an interactive terminal."
+    hint_always "When using SSH: ssh -t user@host 'curl ... | bash'"
+    hint_always "Or download and run directly: bash install.sh"
+    exit 1
+  fi
+}
+
+# Check if systemd is available and functional for user units
+has_systemd() {
+  command -v systemctl >/dev/null 2>&1 \
+    && systemctl --user show-environment >/dev/null 2>&1
+}
+
+# Ensure DBUS session bus is set (required for systemctl --user over SSH)
+ensure_user_bus() {
+  if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    local uid
+    uid="$(id -u)"
+    export XDG_RUNTIME_DIR="/run/user/${uid}"
+  fi
+  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "${XDG_RUNTIME_DIR}/bus" ]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+  fi
+}
+
+# Sanitize a value for safe embedding in a TOML double-quoted string.
+# Rejects control characters, escapes backslashes and double-quotes.
+sanitize_toml_value() {
+  local val="$1"
+  # Reject control characters (newlines, tabs, etc.)
+  case "$val" in
+    *"$(printf '\n')"*|*"$(printf '\r')"*|*"$(printf '\t')"*)
+      error "Input contains invalid characters (control characters not allowed)."
+      exit 1
+      ;;
+  esac
+  # Escape backslashes then double-quotes
+  val="$(printf '%s' "$val" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  printf '%s' "$val"
+}
+
+# Escape a string for safe embedding in an XML <string> element (launchd plists)
+xml_escape() {
+  local s="$1"
+  s="$(printf '%s' "$s" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')"
+  printf '%s' "$s"
+}
+
+# =============================================================================
+# OS-native notifications (safe from injection)
 # =============================================================================
 
 notify_os() {
@@ -154,7 +231,12 @@ notify_os() {
 
   case "$(uname -s)" in
     Darwin)
-      osascript -e "display notification \"${message}\" with title \"${title}\"" 2>/dev/null || true
+      # Use argv-based AppleScript to avoid string injection
+      osascript \
+        -e 'on run argv' \
+        -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+        -e 'end run' \
+        -- "$title" "$message" 2>/dev/null || true
       ;;
     Linux)
       if command -v notify-send >/dev/null 2>&1; then
@@ -282,14 +364,15 @@ check_claude() {
 }
 
 # =============================================================================
-# Token validation
+# Token / ID validation (strict character sets to prevent injection)
 # =============================================================================
 
 validate_telegram_token() {
-  # Format: digits:alphanumeric  e.g. 7012345678:AAHxyz...
+  # Real format: digits:alphanumeric-underscore  e.g. 7012345678:AAHxyz_abc-123
   case "$1" in
-    [0-9]*:*) return 0 ;;
-    *)        return 1 ;;
+    *[!0-9A-Za-z:_-]*) return 1 ;;   # reject chars outside allowed set
+    [0-9]*:*)           return 0 ;;   # must start with digits, contain colon
+    *)                  return 1 ;;
   esac
 }
 
@@ -302,15 +385,31 @@ validate_telegram_user_id() {
 
 validate_slack_bot_token() {
   case "$1" in
-    xoxb-*) return 0 ;;
-    *)      return 1 ;;
+    *[!0-9A-Za-z_-]*) return 1 ;;    # reject non-token chars
+    xoxb-*)            return 0 ;;
+    *)                 return 1 ;;
   esac
 }
 
 validate_slack_app_token() {
   case "$1" in
-    xapp-*) return 0 ;;
-    *)      return 1 ;;
+    *[!0-9A-Za-z_-]*) return 1 ;;
+    xapp-*)            return 0 ;;
+    *)                 return 1 ;;
+  esac
+}
+
+validate_slack_user_id() {
+  case "$1" in
+    U[A-Z0-9]*) return 0 ;;
+    *)           return 1 ;;
+  esac
+}
+
+validate_slack_channel_id() {
+  case "$1" in
+    C[A-Z0-9]*) return 0 ;;
+    *)           return 1 ;;
   esac
 }
 
@@ -319,18 +418,17 @@ validate_slack_app_token() {
 # =============================================================================
 
 prompt_platform_choice() {
-  local choice
-  choice="$(prompt_choice "Which platform will you use?" "Telegram" "Slack" "Both")"
+  while true; do
+    local choice
+    choice="$(prompt_choice "Which platform will you use?" "Telegram" "Slack" "Both")"
 
-  case "$choice" in
-    1) PLATFORM="telegram" ;;
-    2) PLATFORM="slack" ;;
-    3) PLATFORM="both" ;;
-    *)
-      warn "Invalid choice — enter 1, 2, or 3."
-      prompt_platform_choice
-      ;;
-  esac
+    case "$choice" in
+      1) PLATFORM="telegram"; return ;;
+      2) PLATFORM="slack";    return ;;
+      3) PLATFORM="both";     return ;;
+      *) warn "Invalid choice -- enter 1, 2, or 3." ;;
+    esac
+  done
 }
 
 prompt_telegram() {
@@ -395,7 +493,7 @@ prompt_slack() {
       info "Bot token format valid"
       break
     else
-      warn "Slack bot token should start with xoxb-"
+      warn "Slack bot token should start with xoxb- and contain only alphanumeric characters"
     fi
   done
 
@@ -412,30 +510,53 @@ prompt_slack() {
       info "App token format valid"
       break
     else
-      warn "Slack app token should start with xapp-"
+      warn "Slack app token should start with xapp- and contain only alphanumeric characters"
     fi
   done
 
   # Member ID
-  hint ""
-  hint "Member ID: Click your profile picture -> Profile -> ... -> Copy member ID"
-  hint ""
-  SL_USER_ID="$(prompt "Your Slack member ID (U...)")"
-  info "Member ID set"
+  while true; do
+    hint ""
+    hint "Member ID: Click your profile picture -> Profile -> ... -> Copy member ID"
+    hint ""
+
+    SL_USER_ID="$(prompt "Your Slack member ID (U...)")"
+
+    if validate_slack_user_id "$SL_USER_ID"; then
+      info "Member ID format valid"
+      break
+    else
+      warn "Slack member ID should start with U followed by alphanumeric characters"
+    fi
+  done
 
   # Channel ID
-  hint ""
-  hint "Channel ID: Right-click channel -> View channel details -> ID at bottom"
-  hint ""
-  SL_CHANNEL_ID="$(prompt "Slack channel ID (C...)")"
-  info "Channel ID set"
+  while true; do
+    hint ""
+    hint "Channel ID: Right-click channel -> View channel details -> ID at bottom"
+    hint ""
+
+    SL_CHANNEL_ID="$(prompt "Slack channel ID (C...)")"
+
+    if validate_slack_channel_id "$SL_CHANNEL_ID"; then
+      info "Channel ID format valid"
+      break
+    else
+      warn "Slack channel ID should start with C followed by alphanumeric characters"
+    fi
+  done
 }
 
 # =============================================================================
-# Config file writer
+# Config file writer (with TOML injection prevention + restrictive permissions)
 # =============================================================================
 
 write_config() {
+  # Set restrictive umask so both directory and file are created securely
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+
   mkdir -p "$CONFIG_DIR"
 
   {
@@ -449,21 +570,21 @@ write_config() {
       printf "telegram_user_id = %s\n" "$TG_USER_ID"
     fi
     if [ "$PLATFORM" = "slack" ] || [ "$PLATFORM" = "both" ]; then
-      printf "slack_user_id = \"%s\"\n" "$SL_USER_ID"
+      printf "slack_user_id = \"%s\"\n" "$(sanitize_toml_value "$SL_USER_ID")"
     fi
 
     # [telegram]
     if [ "$PLATFORM" = "telegram" ] || [ "$PLATFORM" = "both" ]; then
       printf "\n[telegram]\n"
-      printf "bot_token = \"%s\"\n" "$TG_BOT_TOKEN"
+      printf "bot_token = \"%s\"\n" "$(sanitize_toml_value "$TG_BOT_TOKEN")"
     fi
 
     # [slack]
     if [ "$PLATFORM" = "slack" ] || [ "$PLATFORM" = "both" ]; then
       printf "\n[slack]\n"
-      printf "bot_token = \"%s\"\n" "$SL_BOT_TOKEN"
-      printf "app_token = \"%s\"\n" "$SL_APP_TOKEN"
-      printf "channel_id = \"%s\"\n" "$SL_CHANNEL_ID"
+      printf "bot_token = \"%s\"\n" "$(sanitize_toml_value "$SL_BOT_TOKEN")"
+      printf "app_token = \"%s\"\n" "$(sanitize_toml_value "$SL_APP_TOKEN")"
+      printf "channel_id = \"%s\"\n" "$(sanitize_toml_value "$SL_CHANNEL_ID")"
     fi
 
     # [blocklist]
@@ -492,54 +613,129 @@ STREAMING
   } > "$CONFIG_FILE"
 
   chmod 600 "$CONFIG_FILE"
+  umask "$old_umask"
   info "Config written to ${CONFIG_FILE}"
 }
 
 # =============================================================================
-# Binary download
+# Release info (fetched once, cached)
 # =============================================================================
 
-get_latest_version() {
-  curl -fsSL "$GITHUB_RELEASES" 2>/dev/null \
-    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' \
-    || printf "unknown"
+fetch_release_info() {
+  if [ -z "$_RELEASE_JSON" ]; then
+    _RELEASE_JSON="$(curl -fsSL "$GITHUB_RELEASES" 2>/dev/null || printf "")"
+  fi
+  printf '%s' "$_RELEASE_JSON"
 }
+
+get_latest_version() {
+  local json
+  json="$(fetch_release_info)"
+  if [ -n "$json" ]; then
+    printf '%s' "$json" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
+  else
+    printf "unknown"
+  fi
+}
+
+# Extract the expected SHA-256 checksum for a given binary from the release body
+get_expected_checksum() {
+  local target="$1" json
+  json="$(fetch_release_info)"
+  if [ -z "$json" ]; then
+    return 1
+  fi
+  # Release body contains lines like:  <hash>  termbot-<target>
+  printf '%s' "$json" | grep -oE '[a-f0-9]{64}  termbot-'"${target}" | head -1 | awk '{print $1}'
+}
+
+# =============================================================================
+# Binary download (with checksum verification + atomic swap)
+# =============================================================================
 
 download_binary() {
   local target="$1"
-  local url="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}-${target}"
-  local tmp_file
 
   step "Downloading termbot"
+
+  # Fetch version first to avoid race condition between download and API call
+  local version
+  version="$(get_latest_version)"
+  if [ "$version" = "unknown" ]; then
+    warn "Could not determine latest version from GitHub API."
+    warn "Falling back to /releases/latest redirect."
+  fi
+
+  local url
+  if [ "$version" != "unknown" ]; then
+    url="https://github.com/${REPO}/releases/download/${version}/${BINARY_NAME}-${target}"
+  else
+    url="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}-${target}"
+  fi
+
   hint_always "Target: ${target}"
   hint_always "URL:    ${url}"
 
   mkdir -p "$INSTALL_DIR"
 
-  tmp_file="$(mktemp "${INSTALL_DIR}/${BINARY_NAME}.XXXXXX")"
+  _TMP_FILE="$(mktemp "${INSTALL_DIR}/${BINARY_NAME}.XXXXXX")"
 
-  if ! curl -fSL --progress-bar -o "$tmp_file" "$url" 2>&2; then
-    rm -f "$tmp_file"
+  if ! curl -fSL --progress-bar -o "$_TMP_FILE" "$url" 2>&1; then
+    rm -f "$_TMP_FILE"
+    _TMP_FILE=""
     error "Download failed. Check your internet connection and try again."
     exit 1
   fi
 
-  chmod +x "$tmp_file"
+  # Checksum verification (best-effort: warns if checksums unavailable)
+  local expected_checksum actual_checksum
+  expected_checksum="$(get_expected_checksum "$target" || printf "")"
 
-  # Atomic swap — back up existing binary
+  if [ -n "$expected_checksum" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      actual_checksum="$(sha256sum "$_TMP_FILE" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+      actual_checksum="$(shasum -a 256 "$_TMP_FILE" | awk '{print $1}')"
+    fi
+
+    if [ -n "$actual_checksum" ]; then
+      if [ "$expected_checksum" = "$actual_checksum" ]; then
+        info "Checksum verified (SHA-256)"
+      else
+        rm -f "$_TMP_FILE"
+        _TMP_FILE=""
+        error "Checksum verification FAILED. The download may be corrupted or tampered with."
+        error "Expected: ${expected_checksum}"
+        error "Got:      ${actual_checksum}"
+        exit 1
+      fi
+    else
+      warn "No SHA-256 tool available. Skipping checksum verification."
+    fi
+  else
+    warn "Checksums not available from release. Skipping verification."
+  fi
+
+  chmod +x "$_TMP_FILE"
+
+  # Atomic swap — back up existing binary with cp (keeps original in place
+  # until the final mv, so there's no window where the binary is missing)
   if [ -f "$BINARY_PATH" ]; then
-    mv "$BINARY_PATH" "$BACKUP_PATH"
+    cp "$BINARY_PATH" "$BACKUP_PATH"
     info "Previous binary backed up to ${BACKUP_PATH}"
   fi
 
-  mv "$tmp_file" "$BINARY_PATH"
+  mv "$_TMP_FILE" "$BINARY_PATH"
+  _TMP_FILE=""    # clear so cleanup trap doesn't remove the installed binary
   info "Binary installed to ${BINARY_PATH}"
 
-  # Record installed version
-  local version
-  version="$(get_latest_version)"
+  # Record installed version (only if we got a real version)
   mkdir -p "$CONFIG_DIR"
-  printf "%s" "$version" > "$VERSION_FILE"
+  if [ "$version" != "unknown" ]; then
+    printf "%s" "$version" > "$VERSION_FILE"
+  else
+    warn "Could not determine installed version (GitHub API may be rate-limited)."
+  fi
 }
 
 # =============================================================================
@@ -561,7 +757,7 @@ ensure_path() {
   esac
 
   if prompt_yn "Add ${INSTALL_DIR} to PATH in ${shell_rc}?"; then
-    printf '\n# Added by termbot installer\nexport PATH="${HOME}/.local/bin:${PATH}"\n' >> "$shell_rc"
+    printf '\n# Added by termbot installer\nexport PATH="%s:${PATH}"\n' "$INSTALL_DIR" >> "$shell_rc"
     info "PATH updated in ${shell_rc}"
     hint_always "Run: source ${shell_rc}  (or open a new terminal)"
     export PATH="${INSTALL_DIR}:${PATH}"
@@ -591,8 +787,11 @@ build_service_path() {
   case ":${paths}:" in *":${claude_dir}:"*) ;; *) [ -n "$claude_dir" ] && paths="${claude_dir}:${paths}" ;; esac
 
   # npm global bin (common claude location)
-  local npm_bin
-  npm_bin="$(npm bin -g 2>/dev/null)" || true
+  local npm_prefix npm_bin=""
+  npm_prefix="$(npm config get prefix 2>/dev/null)" || true
+  if [ -n "$npm_prefix" ] && [ -d "${npm_prefix}/bin" ]; then
+    npm_bin="${npm_prefix}/bin"
+  fi
   case ":${paths}:" in *":${npm_bin}:"*) ;; *) [ -n "$npm_bin" ] && paths="${npm_bin}:${paths}" ;; esac
 
   printf "%s" "$paths"
@@ -603,6 +802,15 @@ build_service_path() {
 # =============================================================================
 
 install_service_linux() {
+  if ! has_systemd; then
+    warn "systemd not available -- skipping service installation."
+    hint_always "Start termbot manually: TERMBOT_CONFIG=${CONFIG_FILE} ${BINARY_PATH} &"
+    hint_always "Or add to crontab:      @reboot TERMBOT_CONFIG=${CONFIG_FILE} ${BINARY_PATH}"
+    return 0
+  fi
+
+  ensure_user_bus
+
   step "Installing systemd service"
 
   local svc_path
@@ -610,6 +818,7 @@ install_service_linux() {
 
   mkdir -p "$SYSTEMD_DIR"
   mkdir -p "$LOG_DIR"
+  chmod 700 "$LOG_DIR"
 
   cat > "$SYSTEMD_SERVICE" <<EOF
 [Unit]
@@ -619,7 +828,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${BINARY_PATH}
+ExecStart="${BINARY_PATH}"
 WorkingDirectory=${HOME}
 Environment=TERMBOT_CONFIG=${CONFIG_FILE}
 Environment=PATH=${svc_path}
@@ -629,7 +838,7 @@ StandardOutput=append:${LOG_DIR}/termbot.log
 StandardError=append:${LOG_DIR}/termbot.log
 
 # Send OS notification on crash
-ExecStopPost=-/bin/sh -c 'if [ "\$SERVICE_RESULT" != "success" ]; then ${UPDATE_CHECK_PATH} --health-notify 2>/dev/null; fi'
+ExecStopPost=-/bin/sh -c 'if [ "\$SERVICE_RESULT" != "success" ]; then "${UPDATE_CHECK_PATH}" --health-notify 2>/dev/null; fi'
 
 [Install]
 WantedBy=default.target
@@ -638,10 +847,25 @@ EOF
   systemctl --user daemon-reload
   systemctl --user enable termbot.service >/dev/null 2>&1
   info "systemd service installed and enabled"
+
+  # Check linger for persistence across logout
+  if command -v loginctl >/dev/null 2>&1; then
+    if ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q "yes"; then
+      warn "User lingering is not enabled. Service may not survive logout."
+      hint_always "Enable with: sudo loginctl enable-linger $(id -un)"
+    fi
+  fi
 }
 
 install_update_timer_linux() {
+  if ! has_systemd; then
+    return 0
+  fi
+
   step "Installing daily update check"
+
+  local svc_path
+  svc_path="$(build_service_path)"
 
   cat > "$SYSTEMD_UPDATE_SERVICE" <<EOF
 [Unit]
@@ -649,8 +873,8 @@ Description=Check for termbot updates
 
 [Service]
 Type=oneshot
-ExecStart=${UPDATE_CHECK_PATH}
-Environment=PATH=${INSTALL_DIR}:/usr/local/bin:/usr/bin:/bin
+ExecStart="${UPDATE_CHECK_PATH}"
+Environment=PATH=${svc_path}
 EOF
 
   cat > "$SYSTEMD_UPDATE_TIMER" <<EOF
@@ -683,6 +907,7 @@ install_service_macos() {
 
   mkdir -p "$(dirname "$LAUNCHD_SERVICE")"
   mkdir -p "$LOG_DIR"
+  chmod 700 "$LOG_DIR"
 
   cat > "$LAUNCHD_SERVICE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -693,25 +918,25 @@ install_service_macos() {
     <string>com.termbot.agent</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${WRAPPER_PATH}</string>
+        <string>$(xml_escape "$WRAPPER_PATH")</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>${HOME}</string>
+    <string>$(xml_escape "$HOME")</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>TERMBOT_CONFIG</key>
-        <string>${CONFIG_FILE}</string>
+        <string>$(xml_escape "$CONFIG_FILE")</string>
         <key>PATH</key>
-        <string>${svc_path}</string>
+        <string>$(xml_escape "$svc_path")</string>
     </dict>
     <key>KeepAlive</key>
     <true/>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>${LOG_DIR}/termbot.log</string>
+    <string>$(xml_escape "${LOG_DIR}/termbot.log")</string>
     <key>StandardErrorPath</key>
-    <string>${LOG_DIR}/termbot.log</string>
+    <string>$(xml_escape "${LOG_DIR}/termbot.log")</string>
     <key>ThrottleInterval</key>
     <integer>10</integer>
 </dict>
@@ -733,7 +958,7 @@ install_update_timer_macos() {
     <string>com.termbot.update-check</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${UPDATE_CHECK_PATH}</string>
+        <string>$(xml_escape "$UPDATE_CHECK_PATH")</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -743,9 +968,9 @@ install_update_timer_macos() {
         <integer>0</integer>
     </dict>
     <key>StandardOutPath</key>
-    <string>${LOG_DIR}/update-check.log</string>
+    <string>$(xml_escape "${LOG_DIR}/update-check.log")</string>
     <key>StandardErrorPath</key>
-    <string>${LOG_DIR}/update-check.log</string>
+    <string>$(xml_escape "${LOG_DIR}/update-check.log")</string>
 </dict>
 </plist>
 EOF
@@ -784,21 +1009,30 @@ REPO="shegx01/termbot"
 API="https://api.github.com/repos/${REPO}/releases/latest"
 
 mkdir -p "$LOG_DIR"
+chmod 700 "$LOG_DIR"
 
 log() { printf "[%s] %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" >> "${LOG_DIR}/update-check.log"; }
 
 notify() {
   local title="$1" message="$2"
   case "$(uname -s)" in
-    Darwin) osascript -e "display notification \"${message}\" with title \"${title}\"" 2>/dev/null || true ;;
-    Linux)  command -v notify-send >/dev/null 2>&1 && notify-send "$title" "$message" 2>/dev/null || true ;;
+    Darwin)
+      osascript \
+        -e 'on run argv' \
+        -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+        -e 'end run' \
+        -- "$title" "$message" 2>/dev/null || true
+      ;;
+    Linux)
+      command -v notify-send >/dev/null 2>&1 && notify-send "$title" "$message" 2>/dev/null || true
+      ;;
   esac
   log "${title}: ${message}"
 }
 
 # --health-notify: called by service wrapper on crash
 if [ "${1:-}" = "--health-notify" ]; then
-  notify "termbot" "Service crashed — restarting automatically..."
+  notify "termbot" "Service crashed -- restarting automatically..."
   exit 0
 fi
 
@@ -814,6 +1048,10 @@ check_health() {
       if command -v systemctl >/dev/null 2>&1; then
         if ! systemctl --user is-active --quiet termbot.service 2>/dev/null; then
           notify "termbot" "Service is not running. Check: systemctl --user status termbot"
+        fi
+      else
+        if ! pgrep -x termbot >/dev/null 2>&1; then
+          notify "termbot" "Service is not running."
         fi
       fi
       ;;
@@ -866,7 +1104,13 @@ start_service() {
         || true
       ;;
     linux)
-      systemctl --user start termbot.service
+      if has_systemd; then
+        ensure_user_bus
+        systemctl --user start termbot.service || true
+      else
+        # No systemd — start directly in background
+        TERMBOT_CONFIG="$CONFIG_FILE" nohup "$BINARY_PATH" >> "${LOG_DIR}/termbot.log" 2>&1 &
+      fi
       ;;
   esac
 
@@ -894,10 +1138,16 @@ stop_service() {
         || true
       ;;
     linux)
-      systemctl --user stop termbot.service 2>/dev/null || true
-      systemctl --user stop termbot-update-check.timer 2>/dev/null || true
-      systemctl --user disable termbot.service 2>/dev/null || true
-      systemctl --user disable termbot-update-check.timer 2>/dev/null || true
+      if has_systemd; then
+        ensure_user_bus
+        systemctl --user stop termbot.service 2>/dev/null || true
+        systemctl --user stop termbot-update-check.timer 2>/dev/null || true
+        systemctl --user disable termbot.service 2>/dev/null || true
+        systemctl --user disable termbot-update-check.timer 2>/dev/null || true
+      else
+        # No systemd — kill by PID
+        pkill -x termbot 2>/dev/null || true
+      fi
       ;;
   esac
 }
@@ -917,7 +1167,16 @@ restart_service() {
         || true
       ;;
     linux)
-      systemctl --user restart termbot.service
+      if has_systemd; then
+        ensure_user_bus
+        systemctl --user restart termbot.service 2>/dev/null \
+          || systemctl --user start termbot.service 2>/dev/null \
+          || true
+      else
+        pkill -x termbot 2>/dev/null || true
+        sleep 1
+        TERMBOT_CONFIG="$CONFIG_FILE" nohup "$BINARY_PATH" >> "${LOG_DIR}/termbot.log" 2>&1 &
+      fi
       ;;
   esac
 }
@@ -928,7 +1187,13 @@ verify_running() {
 
   case "$os" in
     macos) pgrep -x termbot >/dev/null 2>&1 ;;
-    linux) systemctl --user is-active --quiet termbot.service 2>/dev/null ;;
+    linux)
+      if has_systemd; then
+        systemctl --user is-active --quiet termbot.service 2>/dev/null
+      else
+        pgrep -x termbot >/dev/null 2>&1
+      fi
+      ;;
   esac
 }
 
@@ -943,8 +1208,8 @@ do_install() {
 
   # Banner
   printf "\n" >&2
-  printf "  ${BOLD}termbot installer${NC}\n" >&2
-  printf "  ${DIM}https://github.com/%s${NC}\n" "$REPO" >&2
+  printf "  %btermbot installer%b\n" "$BOLD" "$NC" >&2
+  printf "  %bhttps://github.com/%s%b\n" "$DIM" "$REPO" "$NC" >&2
 
   # Already installed?
   if [ -f "$BINARY_PATH" ]; then
@@ -957,7 +1222,7 @@ do_install() {
       do_upgrade
       return
     elif prompt_yn "Reinstall from scratch? (config will be preserved)"; then
-      true  # continue with install
+      stop_service   # stop before replacing the binary
     else
       info "No changes made."
       exit 0
@@ -1018,6 +1283,8 @@ do_install() {
 }
 
 setup_config() {
+  require_tty
+
   step "Configuration"
   prompt_platform_choice
 
@@ -1039,7 +1306,7 @@ do_upgrade() {
   target="$(get_target)"
 
   printf "\n" >&2
-  printf "  ${BOLD}termbot upgrade${NC}\n\n" >&2
+  printf "  %btermbot upgrade%b\n\n" "$BOLD" "$NC" >&2
 
   if [ ! -f "$BINARY_PATH" ]; then
     error "termbot is not installed. Run install.sh without flags to install."
@@ -1053,7 +1320,7 @@ do_upgrade() {
   info "Installed: ${installed_version}"
   info "Latest:    ${latest_version}"
 
-  if [ "$installed_version" = "$latest_version" ]; then
+  if [ "$installed_version" = "$latest_version" ] && [ "$installed_version" != "unknown" ]; then
     info "Already up to date!"
     exit 0
   fi
@@ -1087,7 +1354,7 @@ do_uninstall() {
   os="$(detect_os)"
 
   printf "\n" >&2
-  printf "  ${BOLD}termbot uninstall${NC}\n\n" >&2
+  printf "  %btermbot uninstall%b\n\n" "$BOLD" "$NC" >&2
 
   # Stop services
   step "Stopping services"
@@ -1114,7 +1381,10 @@ do_uninstall() {
       for f in "$SYSTEMD_SERVICE" "$SYSTEMD_UPDATE_SERVICE" "$SYSTEMD_UPDATE_TIMER"; do
         if [ -f "$f" ]; then rm -f "$f"; info "Removed ${f}"; fi
       done
-      systemctl --user daemon-reload 2>/dev/null || true
+      if has_systemd; then
+        ensure_user_bus
+        systemctl --user daemon-reload 2>/dev/null || true
+      fi
       ;;
   esac
 
@@ -1148,15 +1418,15 @@ do_uninstall() {
 print_summary() {
   local os="$1"
 
-  printf "\n${BOLD}${GREEN}  termbot is installed and running!${NC}\n\n" >&2
+  printf "\n  %b%btermbot is installed and running!%b\n\n" "$BOLD" "$GREEN" "$NC" >&2
 
-  printf "  ${BOLD}Files${NC}\n" >&2
+  printf "  %bFiles%b\n" "$BOLD" "$NC" >&2
   printf "    Binary   %s\n" "$BINARY_PATH" >&2
   printf "    Config   %s\n" "$CONFIG_FILE" >&2
   printf "    Logs     %s\n" "${LOG_DIR}/termbot.log" >&2
   printf "\n" >&2
 
-  printf "  ${BOLD}Commands${NC}\n" >&2
+  printf "  %bCommands%b\n" "$BOLD" "$NC" >&2
   case "$os" in
     macos)
       printf "    Status     launchctl list com.termbot.agent\n" >&2
@@ -1164,16 +1434,21 @@ print_summary() {
       printf "    Restart    launchctl kickstart -k gui/\$(id -u)/com.termbot.agent\n" >&2
       ;;
     linux)
-      printf "    Status     systemctl --user status termbot\n" >&2
-      printf "    Logs       journalctl --user -u termbot -f\n" >&2
-      printf "    Restart    systemctl --user restart termbot\n" >&2
+      if has_systemd; then
+        printf "    Status     systemctl --user status termbot\n" >&2
+        printf "    Logs       journalctl --user -u termbot -f\n" >&2
+        printf "    Restart    systemctl --user restart termbot\n" >&2
+      else
+        printf "    Status     pgrep -x termbot\n" >&2
+        printf "    Logs       tail -f %s/termbot.log\n" "$LOG_DIR" >&2
+      fi
       ;;
   esac
   printf "    Upgrade    curl -sSL https://raw.githubusercontent.com/%s/main/install.sh | bash -s -- --upgrade\n" "$REPO" >&2
   printf "    Uninstall  curl -sSL https://raw.githubusercontent.com/%s/main/install.sh | bash -s -- --uninstall\n" "$REPO" >&2
   printf "\n" >&2
 
-  printf "  ${DIM}Open Telegram or Slack and send a message to your bot!${NC}\n\n" >&2
+  printf "  %bOpen Telegram or Slack and send a message to your bot!%b\n\n" "$DIM" "$NC" >&2
 }
 
 # =============================================================================
@@ -1181,33 +1456,33 @@ print_summary() {
 # =============================================================================
 
 show_help() {
-  cat >&2 <<EOF
+  cat >&2 <<HELPEOF
 
-  ${BOLD}termbot installer${NC}
+  $(printf '%btermbot installer%b' "$BOLD" "$NC")
 
-  ${BOLD}Usage${NC}
+  $(printf '%bUsage%b' "$BOLD" "$NC")
     install.sh                 Install termbot interactively
     install.sh --quick         Install with minimal prompts
     install.sh --upgrade       Upgrade to the latest version
     install.sh --uninstall     Remove termbot
 
-  ${BOLD}Options${NC}
+  $(printf '%bOptions%b' "$BOLD" "$NC")
     --quick, -q        Skip inline help text during setup
     --upgrade, -u      Download latest binary, restart service (config untouched)
     --uninstall        Stop service, remove files (config preserved by default)
     --help, -h         Show this help
 
-  ${BOLD}Examples${NC}
+  $(printf '%bExamples%b' "$BOLD" "$NC")
     # Fresh install via curl
     curl -sSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash
+
+    # Install without help text
+    curl -sSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --quick
 
     # Upgrade
     curl -sSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --upgrade
 
-    # Uninstall
-    curl -sSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --uninstall
-
-EOF
+HELPEOF
 }
 
 parse_args() {
@@ -1228,6 +1503,16 @@ parse_args() {
 
 main() {
   setup_colors
+
+  # Validate environment
+  if [ -z "${HOME:-}" ]; then
+    error "\$HOME is not set. Cannot determine installation paths."
+    exit 1
+  fi
+
+  # Register cleanup trap for interrupted downloads
+  trap cleanup EXIT INT TERM
+
   parse_args "$@"
 
   if [ "$UNINSTALL" = true ]; then
