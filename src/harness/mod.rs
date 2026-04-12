@@ -98,6 +98,7 @@ pub fn format_tool_event(tool: &str, description: &str) -> String {
         "Grep" => "🔎",
         "Agent" => "🤖",
         "WebSearch" | "WebFetch" => "🌐",
+        "Thinking" => "🧠",
         _ => "🔧",
     };
 

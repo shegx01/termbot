@@ -621,9 +621,6 @@ async fn send_harness_prompt(
     let resume_id = harness.get_session_id(&session_name);
     let cwd = std::env::current_dir().unwrap_or_default();
 
-    // Let the user know the harness is working before any output arrives
-    send_reply(ctx, &format!("{} is thinking...", kind.name()), telegram, slack).await;
-
     match harness
         .run_prompt(prompt, attachments, &cwd, resume_id.as_deref())
         .await
