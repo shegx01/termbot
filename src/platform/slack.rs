@@ -31,6 +31,51 @@ pub struct SlackPlatform {
     last_edit: Arc<Mutex<Option<Instant>>>,
 }
 
+/// Validate that a URL is a legitimate Slack file-hosting URL to prevent SSRF.
+///
+/// Only `files.slack.com` is accepted as the host. This rejects lookalike
+/// domains such as `files.slack.com.evil.com` or `evil-slack.com`.
+pub fn is_valid_slack_download_url(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h == "files.slack.com"))
+        .unwrap_or(false)
+}
+
+/// Guess the MIME type for a file based on its extension (case-insensitive).
+/// Falls back to `application/octet-stream` for unknown or missing extensions.
+pub fn guess_mime(filename: &str) -> String {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "tiff" | "tif" => "image/tiff",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// Extract the user-supplied text from a `file_share` event.
+///
+/// Slack auto-generates text like `"<@U123> uploaded a file: <url|name>"` when
+/// a file is uploaded without a caption. Treat any string containing the
+/// literal `"uploaded a file:"` as empty so that caption-less photo messages
+/// are handled correctly.
+pub fn extract_file_share_text(raw: &str) -> String {
+    if raw.contains("uploaded a file:") {
+        String::new()
+    } else {
+        raw.to_string()
+    }
+}
+
 impl SlackPlatform {
     pub fn new(
         bot_token: String,
@@ -209,11 +254,7 @@ impl SlackPlatform {
                 .or_else(|| event.get("text").and_then(|v| v.as_str()))
                 .unwrap_or("");
             // Strip Slack's auto-generated upload text
-            if raw.contains("uploaded a file:") {
-                String::new()
-            } else {
-                raw.to_string()
-            }
+            extract_file_share_text(raw)
         } else {
             event.get("text").and_then(|v| v.as_str())?.to_string()
         };
@@ -270,11 +311,7 @@ impl SlackPlatform {
 
             // SSRF prevention: only download from Slack's file hosting domain.
             // Using exact match to prevent bypasses like evil-slack.com.
-            let is_slack_url = url::Url::parse(url)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h == "files.slack.com"))
-                .unwrap_or(false);
-            if !is_slack_url {
+            if !is_valid_slack_download_url(url) {
                 warn!("Rejecting non-Slack download URL: {}", url);
                 continue;
             }
@@ -345,23 +382,9 @@ impl SlackPlatform {
         attachments
     }
 
-    /// Guess MIME type from filename extension.
+    /// Guess MIME type from filename extension (delegates to the free function).
     fn guess_mime(&self, filename: &str) -> String {
-        let ext = std::path::Path::new(filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        match ext.as_str() {
-            "jpg" | "jpeg" => "image/jpeg",
-            "png" => "image/png",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            "bmp" => "image/bmp",
-            "tiff" | "tif" => "image/tiff",
-            _ => "application/octet-stream",
-        }
-        .to_string()
+        guess_mime(filename)
     }
 }
 
@@ -601,5 +624,117 @@ impl ChatPlatform for SlackPlatform {
 
     fn platform_type(&self) -> PlatformType {
         PlatformType::Slack
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // is_valid_slack_download_url
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ssrf_valid_slack_download_url_accepted() {
+        assert!(is_valid_slack_download_url(
+            "https://files.slack.com/files-pri/T123/download/image.png"
+        ));
+    }
+
+    #[test]
+    fn ssrf_lookalike_evil_slack_domain_rejected() {
+        assert!(!is_valid_slack_download_url("https://evil-slack.com/files"));
+    }
+
+    #[test]
+    fn ssrf_subdomain_confusion_rejected() {
+        // files.slack.com.evil.com is NOT files.slack.com
+        assert!(!is_valid_slack_download_url(
+            "https://files.slack.com.evil.com/exploit"
+        ));
+    }
+
+    #[test]
+    fn ssrf_slack_com_without_files_subdomain_rejected() {
+        // slack.com (no files. prefix) must be rejected
+        assert!(!is_valid_slack_download_url("https://slack.com/files"));
+    }
+
+    #[test]
+    fn ssrf_http_scheme_with_valid_host_accepted() {
+        // Scheme does not matter — only the host is checked
+        assert!(is_valid_slack_download_url("http://files.slack.com/file"));
+    }
+
+    #[test]
+    fn ssrf_non_url_string_rejected() {
+        assert!(!is_valid_slack_download_url("not-a-url"));
+    }
+
+    #[test]
+    fn ssrf_empty_string_rejected() {
+        assert!(!is_valid_slack_download_url(""));
+    }
+
+    // -------------------------------------------------------------------------
+    // guess_mime
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn guess_mime_jpg_lowercase() {
+        assert_eq!(guess_mime("photo.jpg"), "image/jpeg");
+    }
+
+    #[test]
+    fn guess_mime_jpeg_uppercase_case_insensitive() {
+        assert_eq!(guess_mime("photo.JPEG"), "image/jpeg");
+    }
+
+    #[test]
+    fn guess_mime_png() {
+        assert_eq!(guess_mime("doc.png"), "image/png");
+    }
+
+    #[test]
+    fn guess_mime_unknown_extension_falls_back_to_octet_stream() {
+        assert_eq!(guess_mime("file.xyz"), "application/octet-stream");
+    }
+
+    #[test]
+    fn guess_mime_no_extension_falls_back_to_octet_stream() {
+        assert_eq!(guess_mime("no_extension"), "application/octet-stream");
+    }
+
+    // -------------------------------------------------------------------------
+    // extract_file_share_text
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn file_share_text_auto_generated_upload_text_stripped() {
+        // Slack's auto-generated "<@U123> uploaded a file: <url|name>" becomes empty
+        assert_eq!(
+            extract_file_share_text("<@U123> uploaded a file: <url|name>"),
+            ""
+        );
+    }
+
+    #[test]
+    fn file_share_text_user_caption_preserved() {
+        assert_eq!(
+            extract_file_share_text("Here is my caption"),
+            "Here is my caption"
+        );
+    }
+
+    #[test]
+    fn file_share_text_empty_input_stays_empty() {
+        assert_eq!(extract_file_share_text(""), "");
+    }
+
+    #[test]
+    fn file_share_text_inline_pattern_treated_as_empty() {
+        // A plain-language sentence that contains the trigger phrase is also stripped
+        assert_eq!(extract_file_share_text("I uploaded a file: report.pdf"), "");
     }
 }

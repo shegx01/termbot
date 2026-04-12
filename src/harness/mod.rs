@@ -326,7 +326,7 @@ async fn send_document_reply(
 
 /// Split a message into chunks of at most `max_len` characters,
 /// breaking at newline boundaries when possible.
-fn split_message(text: &str, max_len: usize) -> Vec<String> {
+pub(crate) fn split_message(text: &str, max_len: usize) -> Vec<String> {
     if text.len() <= max_len {
         return vec![text.to_string()];
     }
@@ -355,4 +355,216 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
         remaining = &remaining[split_at..];
     }
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── format_tool_event ────────────────────────────────────────────────────
+
+    #[test]
+    fn format_tool_event_read_contains_icon_tool_and_description() {
+        let result = format_tool_event("Read", "file.rs");
+        assert!(result.contains("📖"), "expected book icon");
+        assert!(result.contains("Read"), "expected tool name");
+        assert!(result.contains("file.rs"), "expected description");
+    }
+
+    #[test]
+    fn format_tool_event_thinking_contains_brain_icon_and_tool_name() {
+        let result = format_tool_event("Thinking", "");
+        assert!(result.contains("🧠"), "expected brain icon");
+        assert!(result.contains("Thinking"), "expected tool name");
+    }
+
+    #[test]
+    fn format_tool_event_write_contains_pencil_icon() {
+        let result = format_tool_event("Write", "some/long/path");
+        assert!(result.contains("📝"), "expected pencil icon");
+    }
+
+    #[test]
+    fn format_tool_event_unknown_tool_contains_wrench_icon() {
+        let result = format_tool_event("UnknownTool", "arg");
+        assert!(
+            result.contains("🔧"),
+            "expected wrench icon for unknown tool"
+        );
+    }
+
+    #[test]
+    fn format_tool_event_empty_description_has_no_trailing_space() {
+        let result = format_tool_event("Bash", "");
+        assert!(!result.ends_with(' '), "should not have trailing space");
+        assert!(result.contains("💻"), "expected computer icon");
+        assert!(result.contains("Bash"), "expected tool name");
+    }
+
+    #[test]
+    fn format_tool_event_long_description_is_truncated_with_ellipsis() {
+        let long_desc = "x".repeat(100);
+        let result = format_tool_event("Read", &long_desc);
+        assert!(result.contains("..."), "expected truncation ellipsis");
+        // The description portion should not exceed 80 chars + "..."
+        // Full result is icon + space + tool + space + truncated_desc
+        let desc_part = result
+            .splitn(3, ' ')
+            .nth(2)
+            .expect("result should have at least 3 space-separated parts");
+        // 80 chars of content + 3 for "..." = 83 chars max for the truncated portion
+        assert!(
+            desc_part.chars().count() <= 83,
+            "truncated description too long: {} chars",
+            desc_part.chars().count()
+        );
+    }
+
+    #[test]
+    fn format_tool_event_description_exactly_at_80_chars_is_not_truncated() {
+        let desc = "y".repeat(80);
+        let result = format_tool_event("Grep", &desc);
+        assert!(
+            !result.contains("..."),
+            "80-char description should not be truncated"
+        );
+    }
+
+    // ── truncate ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_string_is_returned_unchanged() {
+        let s = "hello";
+        assert_eq!(truncate(s, 10), "hello");
+    }
+
+    #[test]
+    fn truncate_string_exactly_at_limit_is_returned_unchanged() {
+        let s = "hello";
+        assert_eq!(truncate(s, 5), "hello");
+    }
+
+    #[test]
+    fn truncate_string_over_limit_ends_with_ellipsis() {
+        let result = truncate("hello world", 5);
+        assert_eq!(result, "hello...");
+    }
+
+    #[test]
+    fn truncate_unicode_string_does_not_panic() {
+        // Each emoji is >1 byte; slicing at a byte boundary would panic without char-aware logic
+        let emoji_str = "🎉🎊🎈🎁🎀🎆🎇✨🌟⭐";
+        let result = truncate(emoji_str, 3);
+        assert!(result.ends_with("..."), "should end with ellipsis");
+        // Should not have sliced through a multi-byte char
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "must be valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn truncate_empty_string_returns_empty() {
+        assert_eq!(truncate("", 10), "");
+    }
+
+    #[test]
+    fn truncate_cjk_unicode_does_not_panic() {
+        let cjk = "中文字符测试内容比较长";
+        let result = truncate(cjk, 4);
+        assert!(result.ends_with("..."), "should end with ellipsis");
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "must be valid UTF-8"
+        );
+    }
+
+    // ── split_message ────────────────────────────────────────────────────────
+
+    #[test]
+    fn split_message_short_text_returns_single_chunk() {
+        let chunks = split_message("hello", 100);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "hello");
+    }
+
+    #[test]
+    fn split_message_text_over_limit_returns_multiple_chunks() {
+        let text = "a".repeat(200);
+        let chunks = split_message(&text, 100);
+        assert!(chunks.len() >= 2, "expected multiple chunks");
+    }
+
+    #[test]
+    fn split_message_prefers_newline_boundary_over_mid_word_split() {
+        // "aaaa\n" is 5 chars; "bbbb" is 4; total 9 > 8 limit.
+        // Should split at the newline so first chunk is "aaaa\n".
+        let text = "aaaa\nbbbb";
+        let chunks = split_message(text, 8);
+        assert!(
+            chunks[0].ends_with('\n') || chunks[0] == "aaaa\n",
+            "first chunk should end at newline boundary, got: {:?}",
+            chunks[0]
+        );
+        assert!(chunks.last().unwrap().contains("bbbb"));
+    }
+
+    #[test]
+    fn split_message_text_exactly_at_limit_returns_single_chunk() {
+        let text = "a".repeat(50);
+        let chunks = split_message(&text, 50);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn split_message_emoji_text_does_not_panic_and_produces_valid_utf8() {
+        // emoji are 4 bytes each; 100 of them = 400 bytes but only 100 chars
+        let text = "🚀".repeat(100);
+        let chunks = split_message(&text, 50);
+        assert!(chunks.len() >= 1, "should produce at least one chunk");
+        for chunk in &chunks {
+            assert!(
+                std::str::from_utf8(chunk.as_bytes()).is_ok(),
+                "chunk is not valid UTF-8"
+            );
+        }
+    }
+
+    #[test]
+    fn split_message_cjk_text_does_not_panic_and_produces_valid_utf8() {
+        // CJK characters are 3 bytes each
+        let text = "字".repeat(200);
+        let chunks = split_message(&text, 50);
+        assert!(chunks.len() >= 2);
+        for chunk in &chunks {
+            assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn split_message_reassembled_chunks_equal_original_text() {
+        let text = "line one\nline two\nline three\nline four\nline five";
+        let chunks = split_message(text, 15);
+        let reassembled = chunks.join("");
+        assert_eq!(
+            reassembled, text,
+            "reassembled chunks should equal original"
+        );
+    }
+
+    #[test]
+    fn split_message_no_chunk_exceeds_max_len_by_more_than_char_boundary_slack() {
+        let text = "🎉".repeat(50); // 200 bytes, 50 chars
+        let max_len = 30;
+        let chunks = split_message(&text, max_len);
+        for chunk in &chunks {
+            // Allow a small slack for char-boundary rounding (one emoji = 4 bytes)
+            assert!(
+                chunk.len() <= max_len + 4,
+                "chunk byte length {} exceeds max {} by more than one char",
+                chunk.len(),
+                max_len
+            );
+        }
+    }
 }
