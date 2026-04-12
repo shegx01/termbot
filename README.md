@@ -2,7 +2,7 @@
 
 Control your terminal from Telegram or Slack. Built in Rust.
 
-termbot gives you remote access to terminal sessions and Claude Code from your phone. Run shell commands, manage tmux sessions, and have multi-turn AI conversations -- all through chat.
+termbot gives you remote access to terminal sessions and Claude Code from your phone. Run shell commands, manage tmux sessions, send images, and have multi-turn AI conversations -- all through chat.
 
 ---
 
@@ -18,6 +18,12 @@ cargo build --release
 
 Then open Telegram or Slack and start typing.
 
+To use a config file at a custom path, set `TERMBOT_CONFIG`:
+
+```bash
+TERMBOT_CONFIG=/path/to/config.toml ./target/release/termbot
+```
+
 ---
 
 ## What can it do?
@@ -31,6 +37,7 @@ Then open Telegram or Slack and start typing.
 : bg                             # background current session
 : fg dev                         # switch to a session
 : kill dev                       # destroy a session
+: screen                         # snapshot the terminal screen
 ```
 
 **Claude Code** -- ask questions, refactor code, explore projects:
@@ -38,7 +45,6 @@ Then open Telegram or Slack and start typing.
 ```
 : claude explain this codebase
 : claude find all TODO comments and prioritize them
-: claude /commit                 # Claude Code slash commands work too
 ```
 
 **Interactive Claude mode** -- multi-turn conversation from chat:
@@ -49,6 +55,15 @@ What does the auth module do?    # just type naturally
 Can you refactor it?             # conversation continues
 Show me the test gaps.           # still the same session
 : claude off                     # back to terminal
+```
+
+**Image support** -- send photos to Claude directly from chat:
+
+```
+: claude on
+[send a screenshot with caption] what's wrong with this error?
+[send a diagram]                 # photo-only messages work too
+: claude off
 ```
 
 ---
@@ -75,7 +90,7 @@ bot_token = "7012345678:AAH..."
 
 [blocklist]
 patterns = [
-  "rm\\s+-rf\\s+/",
+  "rm\\s+-[a-z]*f[a-z]*r[a-z]*\\s+/",
   "sudo\\s+",
   ":\\(\\)\\{\\s*:\\|:\\&\\s*\\};:",
   "mkfs\\.",
@@ -87,6 +102,7 @@ edit_throttle_ms = 2000
 poll_interval_ms = 250
 chunk_size = 4000
 offline_buffer_max_bytes = 1048576
+max_sessions = 10
 ```
 
 <details>
@@ -117,7 +133,7 @@ channel_id = "C01ABCDEF"
 
 [blocklist]
 patterns = [
-  "rm\\s+-rf\\s+/",
+  "rm\\s+-[a-z]*f[a-z]*r[a-z]*\\s+/",
   "sudo\\s+",
   ":\\(\\)\\{\\s*:\\|:\\&\\s*\\};:",
 ]
@@ -127,6 +143,7 @@ edit_throttle_ms = 2000
 poll_interval_ms = 250
 chunk_size = 4000
 offline_buffer_max_bytes = 1048576
+max_sessions = 10
 ```
 
 <details>
@@ -166,7 +183,7 @@ All commands use the `: ` (colon + space) prefix:
 | `: kill <name>` | Destroy a session |
 | `: screen` | Send a snapshot of the current terminal screen to chat |
 
-Session names can contain letters, numbers, hyphens, and underscores.
+Session names can contain letters, numbers, hyphens, and underscores (max 64 characters).
 
 ### Shell commands
 
@@ -185,16 +202,18 @@ Session names can contain letters, numbers, hyphens, and underscores.
 
 In Claude mode, plain text goes to Claude instead of the terminal. Multi-turn -- each message continues the same conversation.
 
+You can also send images (photos, screenshots, diagrams) in Claude mode. Attach a photo with an optional caption and Claude will see it. Photo-only messages default to "What is in this image?".
+
 Uses your **Claude subscription** (Pro/Max), not API credits.
 
 ### Two ways to use Claude
 
-**SDK mode** (`: claude`) -- structured output, real-time tool activity, multi-turn. Best for prompts and Q&A:
+**SDK mode** (`: claude`) -- structured output, real-time tool activity, multi-turn, image input. Best for prompts and Q&A:
 
 ```
 : claude explain the auth module
 : claude on
-What are the open bugs?
+What does the auth module do?
 : claude off
 ```
 
@@ -231,7 +250,7 @@ To check what Claude (or any program) is doing in a tmux session, use `: screen`
 
 This captures exactly what you'd see if you were looking at the terminal -- useful when Claude is working on a long task and you want a progress check.
 
-Use tmux mode when you need Claude Code's full interactive features (slash commands, permission prompts, multi-file editing workflows). Use SDK mode when you want quick, clean answers.
+Use tmux mode when you need Claude Code's full interactive features (slash commands, permission prompts, multi-file editing workflows). Use SDK mode when you want quick, clean answers with image support.
 
 ---
 
@@ -252,13 +271,27 @@ The `: claude` command uses the `claude-agent-sdk-rust` crate, which calls the C
 - **Structured typed output** -- no terminal scraping
 - **Real-time tool activity** -- see what Claude is doing as it works:
   ```
+  🧠 Thinking
   📖 Read src/main.rs
   🔎 Grep "TODO"
   ✏️ Edit src/buffer.rs
   💻 Bash cargo test
+  🤖 Agent "investigate auth module"
   ```
 - **Multi-turn sessions** -- conversation state preserved via `--resume`
-- **Slash commands and skills** -- full Claude Code functionality
+- **Image input** -- send photos from Telegram/Slack, Claude receives them as `@/path` mentions
+- **File output** -- Claude-created files (images, PDFs, CSVs, etc.) are automatically delivered back to chat
+- **5-minute timeout** -- long-running prompts time out with a clear error
+
+### Output file delivery
+
+When Claude creates or writes files during a prompt, termbot automatically delivers qualifying files back to chat:
+
+- **Images** (png, jpg, gif, webp, svg, bmp) -- sent as native photo previews
+- **Documents** (pdf, csv, xlsx, docx, pptx) -- sent as file attachments
+- **Text/data** (md, txt, json, yaml, toml, xml, html) -- sent as file attachments
+
+Files are detected from Write/Edit tool calls, Bash output redirects (`-o`, `>`, `--output`), and a post-prompt scan of the working directory and `/tmp`. Sensitive files (`termbot.toml`, `.env`, `credentials*`, `secret*`, `token*`, `password*`, `private_key*`) are never delivered. Max file size: 50 MB.
 
 ### Session persistence
 
@@ -274,15 +307,24 @@ Single-user only. Messages from any user ID other than the configured one are **
 
 ### Command blocklist
 
-Dangerous commands are blocked by regex patterns in `termbot.toml`. Both `: ` prefixed commands AND plain text input are checked. The defaults block:
+Dangerous commands are blocked by regex patterns in `termbot.toml`. Both `: ` prefixed commands AND plain text input (including text routed to Claude) are checked. The defaults block:
 
 | Pattern | Blocks |
 |---------|--------|
-| `rm\s+-rf\s+/` | Recursive delete from root |
+| `rm\s+-[a-z]*f[a-z]*r[a-z]*\s+/` | Recursive force-delete from root (any flag order) |
 | `sudo\s+` | Privilege escalation |
 | `:\(\)\{\s*:\|:\&\s*\};:` | Fork bomb |
 | `mkfs\.` | Filesystem format |
 | `dd\s+if=` | Raw disk write |
+
+### Evasion prevention
+
+Commands are normalized before matching to prevent common evasion techniques:
+
+- **Path prefix stripping** -- `/usr/bin/sudo reboot` is caught as `sudo reboot`
+- **Backslash removal** -- `su\do reboot` is caught as `sudo reboot`
+- **Flag reordering** -- `rm -fr /`, `rm -rf /`, and `rm -r -f /` all normalize to the same form
+- **Space collapsing** -- extra whitespace between tokens is collapsed
 
 Multi-line messages are rejected to prevent newline injection bypasses.
 
@@ -291,12 +333,21 @@ Add your own patterns:
 ```toml
 [blocklist]
 patterns = [
-  "rm\\s+-rf\\s+/",
+  "rm\\s+-[a-z]*f[a-z]*r[a-z]*\\s+/",
   "sudo\\s+",
   "shutdown",
   "reboot",
 ]
 ```
+
+### Output file safety
+
+Files delivered from Claude are restricted:
+
+- Only allowlisted extensions (images, documents, data files)
+- Files must be under the working directory or `/tmp` (path traversal blocked)
+- Sensitive filenames are never delivered
+- Max 50 MB per file
 
 ### Smart quote normalization
 
@@ -319,6 +370,9 @@ Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. termbo
 | `streaming.poll_interval_ms` | integer | Terminal output poll interval (default: 250) |
 | `streaming.chunk_size` | integer | Max chars per message (default: 4000) |
 | `streaming.offline_buffer_max_bytes` | integer | Max offline buffer (default: 1048576) |
+| `streaming.max_sessions` | integer | Max concurrent terminal sessions (default: 10) |
+
+Override the config file path with `TERMBOT_CONFIG=/path/to/file.toml`.
 
 ---
 
@@ -326,35 +380,46 @@ Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. termbo
 
 ```
 src/
-  main.rs            Core event loop (tokio::select!)
-  config.rs          TOML config with validation
-  command.rs         Command parser + blocklist + session name validation
-  session.rs         Session manager (foreground/background state machine)
-  tmux.rs            tmux CLI wrapper (capture-pane, send-keys, smart quotes)
-  buffer.rs          Output diffing via scrollback line tracking
-  claude.rs          Claude Code SDK integration (streaming events)
+  main.rs              Core event loop (tokio::select!)
+  app.rs               Application state, command dispatch, delivery tasks
+  config.rs            TOML config with validation
+  command.rs           Command parser + blocklist + evasion normalization
+  session.rs           Session manager (foreground/background state machine)
+  tmux.rs              tmux CLI wrapper (capture-pane, send-keys, smart quotes)
+  buffer.rs            Output diffing via scrollback line tracking
+  harness/
+    mod.rs             Harness trait, event types, streaming driver
+    claude.rs          Claude Code SDK integration (streaming, images, file delivery)
+    gemini.rs          Gemini harness (planned)
+    codex.rs           Codex harness (planned)
   platform/
-    mod.rs           ChatPlatform trait
-    telegram.rs      Telegram adapter (teloxide, long-polling)
-    slack.rs         Slack adapter (Socket Mode, tokio-tungstenite)
+    mod.rs             ChatPlatform trait + Attachment type
+    telegram.rs        Telegram adapter (teloxide, long-polling)
+    slack.rs           Slack adapter (Socket Mode, tokio-tungstenite)
 ```
 
 ```
 Telegram/Slack
     |
     v
-cmd_tx (mpsc) ──> tokio::select! core loop
-                    ├── handle_command() ──> tmux send-keys
-                    │                   └──> Claude SDK (stream-json)
+cmd_tx (mpsc) ──> tokio::select! core loop (main.rs)
+                    ├── handle_command() (app.rs)
+                    │   ├── tmux send-keys (shell commands)
+                    │   └── harness driver (Claude SDK stream-json)
+                    │       ├── tool events ──> chat
+                    │       ├── text response ──> chat
+                    │       └── output files ──> chat (photos/documents)
                     ├── health_check (5s) ──> tmux has-session
                     ├── poll_tick (250ms) ──> tmux capture-pane
-                    └── ctrl_c ──> cleanup
+                    └── ctrl_c ──> cleanup (detach, sessions survive)
                            |
                     broadcast::channel
                            |
                     ├── Telegram delivery task
                     └── Slack delivery task
 ```
+
+The harness system is extensible via the `Harness` trait. Currently only Claude is implemented; Gemini and Codex have stubs ready for future integration. Each harness supports streaming events (`ToolUse`, `Text`, `File`, `Done`, `Error`) and optional multi-turn session resume.
 
 ---
 
@@ -400,6 +465,18 @@ The Claude CLI must be installed and authenticated: `npm i -g @anthropic-ai/clau
 <summary>Smart quotes causing shell errors</summary>
 
 termbot normalizes curly quotes automatically. If you still see issues, check that you're running the latest build.
+</details>
+
+<details>
+<summary>Images not working with Claude</summary>
+
+Images are only supported in harness mode. Enter Claude mode first with `: claude on`, then send a photo. Sending images to the terminal (without an active harness) will show an error.
+</details>
+
+<details>
+<summary>"Maximum session limit reached"</summary>
+
+The default limit is 10 concurrent sessions. Kill unused sessions with `: kill <name>` or increase `streaming.max_sessions` in the config.
 </details>
 
 ---
