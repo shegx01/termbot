@@ -33,10 +33,11 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
       - name: Audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit
 
   build:
     name: Build (${{ matrix.target }})
