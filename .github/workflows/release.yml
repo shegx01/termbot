@@ -49,16 +49,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            use_cross: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            use_cross: true
           - target: x86_64-apple-darwin
             os: macos-14
-            use_cross: false
           - target: aarch64-apple-darwin
             os: macos-14
-            use_cross: false
     steps:
       - uses: actions/checkout@v4
 
@@ -70,20 +66,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross
-        if: matrix.use_cross
-        run: cargo install cross --version 0.2.5 --locked
+      - name: Install cross-compilation linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build (cross)
-        if: matrix.use_cross
+      - name: Build
         env:
           BUILD_TARGET: ${{ matrix.target }}
-        run: cross build --release --target "$BUILD_TARGET"
-
-      - name: Build (cargo)
-        if: "!matrix.use_cross"
-        env:
-          BUILD_TARGET: ${{ matrix.target }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target "$BUILD_TARGET"
 
       - name: Rename binary
