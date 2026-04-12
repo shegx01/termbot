@@ -149,13 +149,9 @@ impl TmuxClient {
 /// quotes with typographic variants that shells don't recognize.
 fn normalize_quotes(input: &str) -> String {
     input
-        .replace('\u{201C}', "\"") // left double quotation mark "
-        .replace('\u{201D}', "\"") // right double quotation mark "
-        .replace('\u{2018}', "'") // left single quotation mark '
-        .replace('\u{2019}', "'") // right single quotation mark '
-        .replace('\u{00AB}', "\"") // left-pointing double angle «
-        .replace('\u{00BB}', "\"") // right-pointing double angle »
-        .replace('\u{2033}', "\"") // double prime ″
+        .replace(['\u{201C}', '\u{201D}'], "\"") // left/right double quotation marks ""
+        .replace(['\u{2018}', '\u{2019}'], "'") // left/right single quotation marks ''
+        .replace(['\u{00AB}', '\u{00BB}', '\u{2033}'], "\"") // angle quotes «» and double prime ″
         .replace('\u{2032}', "'") // prime ′
         .replace('\u{201A}', ",") // single low-9 quotation mark ‚
         .replace('\u{201E}', "\"") // double low-9 quotation mark „

@@ -382,7 +382,7 @@ async fn scan_new_files(dir: &Path, since: std::time::SystemTime) -> Vec<String>
         if !path
             .extension()
             .and_then(|e| e.to_str())
-            .map_or(false, is_deliverable_extension)
+            .is_some_and(is_deliverable_extension)
         {
             continue;
         }
