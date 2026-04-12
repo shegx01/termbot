@@ -403,7 +403,7 @@ async fn emit_output_files(
             Ok(c) => c,
             Err(_) => continue,
         };
-        let tmp_dir = PathBuf::from("/tmp");
+        let tmp_dir = PathBuf::from("/tmp").canonicalize().unwrap_or_else(|_| PathBuf::from("/tmp"));
         let in_cwd = canonical.starts_with(&cwd_canonical);
         let in_tmp = canonical.starts_with(&tmp_dir);
         if !in_cwd && !in_tmp {
