@@ -175,9 +175,9 @@ async fn run_claude_prompt_inner(
             None => break, // stream ended
         };
 
-        // Reset thinking state on any real event
+        // Reset silence timer on any real event (but keep thinking_sent=true
+        // so the indicator only fires once, before the first real content)
         last_event_time = tokio::time::Instant::now();
-        thinking_sent = false;
 
         match msg {
             Ok(Message::Assistant(assistant)) => {
