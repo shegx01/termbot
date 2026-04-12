@@ -398,13 +398,16 @@ async fn emit_output_files(
     for file_path_str in written_files {
         let path = Path::new(file_path_str);
 
-        // Path traversal guard: only deliver files under the working directory
+        // Path traversal guard: only deliver files under the working directory or /tmp
         let canonical = match tokio::fs::canonicalize(path).await {
             Ok(c) => c,
             Err(_) => continue,
         };
-        if !canonical.starts_with(&cwd_canonical) {
-            tracing::warn!("Refusing to deliver file outside CWD: {}", file_path_str);
+        let tmp_dir = PathBuf::from("/tmp");
+        let in_cwd = canonical.starts_with(&cwd_canonical);
+        let in_tmp = canonical.starts_with(&tmp_dir);
+        if !in_cwd && !in_tmp {
+            tracing::warn!("Refusing to deliver file outside CWD/tmp: {}", file_path_str);
             continue;
         }
 

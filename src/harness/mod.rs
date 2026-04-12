@@ -143,8 +143,9 @@ pub async fn drive_harness(
                 }
 
                 // Flush batch every 3s or every 5 distinct tool lines
-                if tool_lines.len() >= 5
-                    || last_tool_flush.elapsed() > std::time::Duration::from_secs(3)
+                if !tool_lines.is_empty()
+                    && (tool_lines.len() >= 5
+                        || last_tool_flush.elapsed() > std::time::Duration::from_secs(3))
                 {
                     if consecutive_count > 0 {
                         if let Some(last) = tool_lines.last_mut() {
