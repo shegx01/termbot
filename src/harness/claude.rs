@@ -217,15 +217,26 @@ async fn run_claude_prompt_inner(
         let _ = event_tx.send(HarnessEvent::Text(text)).await;
     }
 
-    // Discover new deliverable files in the working directory created during this prompt.
-    // This catches files from scripts (e.g. python3 generating a PDF) that aren't
-    // tracked by Write/Edit/Bash-flag detection.
-    let discovered = scan_new_files(&cwd_for_scan, prompt_start).await;
-    for path in &discovered {
-        if !written_files.contains(path) {
-            written_files.push(path.clone());
+    // Discover new deliverable files created during this prompt.
+    // Scan both CWD and /tmp to catch scripts that write output to temp directories.
+    let tmp_dir = PathBuf::from("/tmp");
+    let scan_dirs = [cwd_for_scan.as_path(), tmp_dir.as_path()];
+    for dir in &scan_dirs {
+        let discovered = scan_new_files(dir, prompt_start).await;
+        for path in &discovered {
+            if !written_files.contains(path) {
+                written_files.push(path.clone());
+            }
         }
     }
+
+    // Deduplicate by canonical path (Write tool may track relative, scan returns absolute)
+    let mut seen = std::collections::HashSet::new();
+    written_files.retain(|p| {
+        let canonical = std::fs::canonicalize(p)
+            .unwrap_or_else(|_| PathBuf::from(p));
+        seen.insert(canonical)
+    });
 
     // Always emit deliverable files, even if the stream ended with an error
     emit_output_files(&written_files, &cwd_for_scan, &event_tx).await;
