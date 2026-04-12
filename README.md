@@ -8,6 +8,26 @@ termbot gives you remote access to terminal sessions and Claude Code from your p
 
 ## Quick start
 
+### Download a pre-built binary (recommended)
+
+Pre-built binaries are available for macOS and Linux on the [Releases](https://github.com/shegx01/termbot/releases/latest) page.
+
+```bash
+# Download the binary for your platform
+# Options: termbot-aarch64-apple-darwin   (macOS Apple Silicon)
+#          termbot-x86_64-apple-darwin    (macOS Intel)
+#          termbot-aarch64-unknown-linux-gnu (Linux ARM64)
+#          termbot-x86_64-unknown-linux-gnu  (Linux x86_64)
+curl -L -o termbot \
+  https://github.com/shegx01/termbot/releases/latest/download/termbot-$(uname -m)-apple-darwin
+
+chmod +x termbot
+cp termbot.example.toml termbot.toml   # edit with your tokens
+./termbot
+```
+
+### Build from source
+
 ```bash
 git clone https://github.com/shegx01/termbot.git
 cd termbot
@@ -21,7 +41,7 @@ Then open Telegram or Slack and start typing.
 To use a config file at a custom path, set `TERMBOT_CONFIG`:
 
 ```bash
-TERMBOT_CONFIG=/path/to/config.toml ./target/release/termbot
+TERMBOT_CONFIG=/path/to/config.toml ./termbot
 ```
 
 ---
