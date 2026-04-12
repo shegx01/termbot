@@ -260,8 +260,7 @@ async fn run_claude_prompt_inner(
     // Deduplicate by canonical path (Write tool may track relative, scan returns absolute)
     let mut seen = std::collections::HashSet::new();
     written_files.retain(|p| {
-        let canonical = std::fs::canonicalize(p)
-            .unwrap_or_else(|_| PathBuf::from(p));
+        let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
         seen.insert(canonical)
     });
 
@@ -441,11 +440,16 @@ async fn emit_output_files(
             Ok(c) => c,
             Err(_) => continue,
         };
-        let tmp_dir = PathBuf::from("/tmp").canonicalize().unwrap_or_else(|_| PathBuf::from("/tmp"));
+        let tmp_dir = PathBuf::from("/tmp")
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("/tmp"));
         let in_cwd = canonical.starts_with(&cwd_canonical);
         let in_tmp = canonical.starts_with(&tmp_dir);
         if !in_cwd && !in_tmp {
-            tracing::warn!("Refusing to deliver file outside CWD/tmp: {}", file_path_str);
+            tracing::warn!(
+                "Refusing to deliver file outside CWD/tmp: {}",
+                file_path_str
+            );
             continue;
         }
 
@@ -525,5 +529,260 @@ fn build_image_prompt(prompt: &str, attachments: &[Attachment]) -> String {
         format!("What is in this image? {}", mentions_str)
     } else {
         format!("{} {}", prompt, mentions_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // Helper to construct a minimal Attachment for testing build_image_prompt.
+    fn make_attachment(path: &str) -> Attachment {
+        Attachment {
+            path: PathBuf::from(path),
+            filename: path.to_string(),
+            media_type: "image/png".to_string(),
+        }
+    }
+
+    // --- build_image_prompt ---
+
+    #[test]
+    fn build_image_prompt_no_attachments_returns_prompt_unchanged() {
+        assert_eq!(build_image_prompt("hello world", &[]), "hello world");
+    }
+
+    #[test]
+    fn build_image_prompt_nonempty_prompt_one_attachment_appends_mention() {
+        let att = make_attachment("/tmp/photo.png");
+        assert_eq!(
+            build_image_prompt("describe this", &[att]),
+            "describe this @/tmp/photo.png"
+        );
+    }
+
+    #[test]
+    fn build_image_prompt_nonempty_prompt_three_attachments_appends_all_mentions() {
+        let atts = vec![
+            make_attachment("/tmp/a.png"),
+            make_attachment("/tmp/b.png"),
+            make_attachment("/tmp/c.png"),
+        ];
+        assert_eq!(
+            build_image_prompt("what are these", &atts),
+            "what are these @/tmp/a.png @/tmp/b.png @/tmp/c.png"
+        );
+    }
+
+    #[test]
+    fn build_image_prompt_empty_prompt_one_attachment_uses_default_instruction() {
+        let att = make_attachment("/tmp/photo.png");
+        assert_eq!(
+            build_image_prompt("", &[att]),
+            "What is in this image? @/tmp/photo.png"
+        );
+    }
+
+    #[test]
+    fn build_image_prompt_empty_prompt_three_attachments_uses_default_instruction_with_all_mentions(
+    ) {
+        let atts = vec![
+            make_attachment("/tmp/a.png"),
+            make_attachment("/tmp/b.png"),
+            make_attachment("/tmp/c.png"),
+        ];
+        assert_eq!(
+            build_image_prompt("", &atts),
+            "What is in this image? @/tmp/a.png @/tmp/b.png @/tmp/c.png"
+        );
+    }
+
+    #[test]
+    fn build_image_prompt_whitespace_only_prompt_treated_as_empty() {
+        let att = make_attachment("/tmp/photo.png");
+        assert_eq!(
+            build_image_prompt("   ", &[att]),
+            "What is in this image? @/tmp/photo.png"
+        );
+    }
+
+    // --- extract_bash_output_paths ---
+
+    #[test]
+    fn extract_bash_output_paths_short_flag_o() {
+        assert_eq!(
+            extract_bash_output_paths("pandoc -o file.pdf"),
+            vec!["file.pdf"]
+        );
+    }
+
+    #[test]
+    fn extract_bash_output_paths_long_flag_output_space() {
+        assert_eq!(
+            extract_bash_output_paths("cmd --output file.csv"),
+            vec!["file.csv"]
+        );
+    }
+
+    #[test]
+    fn extract_bash_output_paths_long_flag_output_equals() {
+        assert_eq!(
+            extract_bash_output_paths("cmd --output=report.md"),
+            vec!["report.md"]
+        );
+    }
+
+    #[test]
+    fn extract_bash_output_paths_shell_redirect() {
+        assert_eq!(
+            extract_bash_output_paths("echo hello > output.txt"),
+            vec!["output.txt"]
+        );
+    }
+
+    #[test]
+    fn extract_bash_output_paths_no_output_flag_returns_empty() {
+        assert_eq!(
+            extract_bash_output_paths("echo hello"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn extract_bash_output_paths_multiple_flags_collects_all() {
+        let paths = extract_bash_output_paths("cmd -o a.pdf > b.txt");
+        assert_eq!(paths, vec!["a.pdf", "b.txt"]);
+    }
+
+    #[test]
+    fn extract_bash_output_paths_o_flag_at_end_returns_empty() {
+        assert_eq!(extract_bash_output_paths("cmd -o"), Vec::<String>::new());
+    }
+
+    // --- is_deliverable_extension ---
+
+    #[test]
+    fn is_deliverable_extension_pdf_is_deliverable() {
+        assert!(is_deliverable_extension("pdf"));
+    }
+
+    #[test]
+    fn is_deliverable_extension_csv_is_deliverable() {
+        assert!(is_deliverable_extension("csv"));
+    }
+
+    #[test]
+    fn is_deliverable_extension_png_is_deliverable() {
+        assert!(is_deliverable_extension("png"));
+    }
+
+    #[test]
+    fn is_deliverable_extension_md_is_deliverable() {
+        assert!(is_deliverable_extension("md"));
+    }
+
+    #[test]
+    fn is_deliverable_extension_json_is_deliverable() {
+        assert!(is_deliverable_extension("json"));
+    }
+
+    #[test]
+    fn is_deliverable_extension_rs_is_not_deliverable() {
+        assert!(!is_deliverable_extension("rs"));
+    }
+
+    #[test]
+    fn is_deliverable_extension_py_is_not_deliverable() {
+        assert!(!is_deliverable_extension("py"));
+    }
+
+    #[test]
+    fn is_deliverable_extension_js_is_not_deliverable() {
+        assert!(!is_deliverable_extension("js"));
+    }
+
+    #[test]
+    fn is_deliverable_extension_exe_is_not_deliverable() {
+        assert!(!is_deliverable_extension("exe"));
+    }
+
+    #[test]
+    fn is_deliverable_extension_uppercase_pdf_is_deliverable() {
+        assert!(is_deliverable_extension("PDF"));
+    }
+
+    #[test]
+    fn is_deliverable_extension_mixed_case_csv_is_deliverable() {
+        assert!(is_deliverable_extension("Csv"));
+    }
+
+    #[test]
+    fn is_deliverable_extension_empty_string_returns_false() {
+        assert!(!is_deliverable_extension(""));
+    }
+
+    // --- mime_from_ext ---
+
+    #[test]
+    fn mime_from_ext_pdf_returns_application_pdf() {
+        assert_eq!(mime_from_ext("pdf"), "application/pdf");
+    }
+
+    #[test]
+    fn mime_from_ext_png_returns_image_png() {
+        assert_eq!(mime_from_ext("png"), "image/png");
+    }
+
+    #[test]
+    fn mime_from_ext_csv_returns_text_csv() {
+        assert_eq!(mime_from_ext("csv"), "text/csv");
+    }
+
+    #[test]
+    fn mime_from_ext_json_returns_application_json() {
+        assert_eq!(mime_from_ext("json"), "application/json");
+    }
+
+    #[test]
+    fn mime_from_ext_unknown_extension_returns_octet_stream() {
+        assert_eq!(mime_from_ext("xyz"), "application/octet-stream");
+    }
+
+    #[test]
+    fn mime_from_ext_uppercase_pdf_returns_application_pdf() {
+        assert_eq!(mime_from_ext("PDF"), "application/pdf");
+    }
+
+    // --- SENSITIVE_PATTERNS ---
+
+    fn filename_is_sensitive(name: &str) -> bool {
+        let name_lower = name.to_ascii_lowercase();
+        SENSITIVE_PATTERNS.iter().any(|s| name_lower.contains(s))
+    }
+
+    #[test]
+    fn sensitive_patterns_termbot_toml_matches() {
+        assert!(filename_is_sensitive("termbot.toml"));
+    }
+
+    #[test]
+    fn sensitive_patterns_env_json_matches() {
+        assert!(filename_is_sensitive(".env.json"));
+    }
+
+    #[test]
+    fn sensitive_patterns_credentials_yaml_matches() {
+        assert!(filename_is_sensitive("credentials.yaml"));
+    }
+
+    #[test]
+    fn sensitive_patterns_report_pdf_does_not_match() {
+        assert!(!filename_is_sensitive("report.pdf"));
+    }
+
+    #[test]
+    fn sensitive_patterns_secret_in_filename_matches() {
+        assert!(filename_is_sensitive("my-secret-config.json"));
     }
 }
