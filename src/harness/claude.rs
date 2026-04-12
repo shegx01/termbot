@@ -150,9 +150,35 @@ async fn run_claude_prompt_inner(
     let mut response_text = String::new();
     let mut session_id = String::new();
     let mut written_files: Vec<String> = Vec::new();
-    let mut last_event_sent = tokio::time::Instant::now();
+    let mut last_event_time = tokio::time::Instant::now();
+    let mut thinking_sent = false;
 
-    while let Some(msg) = stream.next().await {
+    loop {
+        // Wait for the next stream message, or fire a thinking indicator on 2s silence
+        let msg = tokio::select! {
+            msg = stream.next() => msg,
+            _ = tokio::time::sleep_until(last_event_time + std::time::Duration::from_secs(2)), if !thinking_sent => {
+                // 2s of silence — let the user know the model is still working
+                let _ = event_tx
+                    .send(HarnessEvent::ToolUse {
+                        tool: "Thinking".to_string(),
+                        description: String::new(),
+                    })
+                    .await;
+                thinking_sent = true;
+                continue;
+            }
+        };
+
+        let msg = match msg {
+            Some(m) => m,
+            None => break, // stream ended
+        };
+
+        // Reset thinking state on any real event
+        last_event_time = tokio::time::Instant::now();
+        thinking_sent = false;
+
         match msg {
             Ok(Message::Assistant(assistant)) => {
                 for block in &assistant.message.content {
@@ -185,23 +211,9 @@ async fn run_claude_prompt_inner(
                                     description: input_desc,
                                 })
                                 .await;
-                            last_event_sent = tokio::time::Instant::now();
                         }
                         ContentBlock::Text(text_block) => {
                             response_text.push_str(&text_block.text);
-                            last_event_sent = tokio::time::Instant::now();
-                        }
-                        ContentBlock::Thinking(_) => {
-                            // Show thinking indicator if >2s since last visible output
-                            if last_event_sent.elapsed() > std::time::Duration::from_secs(2) {
-                                let _ = event_tx
-                                    .send(HarnessEvent::ToolUse {
-                                        tool: "Thinking".to_string(),
-                                        description: String::new(),
-                                    })
-                                    .await;
-                                last_event_sent = tokio::time::Instant::now();
-                            }
                         }
                         _ => {}
                     }
