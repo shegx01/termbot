@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit
+        run: cargo audit
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+          - target: x86_64-apple-darwin
+            os: macos-14
+            use_cross: false
+          - target: aarch64-apple-darwin
+            os: macos-14
+            use_cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: cross build --release --target "$BUILD_TARGET"
+
+      - name: Build (cargo)
+        if: "!matrix.use_cross"
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: cargo build --release --target "$BUILD_TARGET"
+
+      - name: Rename binary
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: mv "target/${BUILD_TARGET}/release/termbot" "termbot-${BUILD_TARGET}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termbot-${{ matrix.target }}
+          path: termbot-${{ matrix.target }}
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums and release notes
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          cd artifacts
+          sha256sum termbot-* > checksums.txt
+          {
+            echo "Automated release from commit ${COMMIT_SHA}"
+            echo ""
+            echo "## SHA-256 Checksums"
+            echo '```'
+            cat checksums.txt
+            echo '```'
+          } > ../release-notes.md
+
+      - name: Set tag name
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: echo "TAG=build-${COMMIT_SHA::8}" >> "$GITHUB_ENV"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: "Build ${{ env.TAG }}"
+          body_path: release-notes.md
+          files: |
+            artifacts/termbot-*
+          fail_on_unmatched_files: true
