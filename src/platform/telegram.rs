@@ -16,6 +16,15 @@ use super::{
     Attachment, ChatPlatform, IncomingMessage, PlatformMessageId, PlatformType, ReplyContext,
 };
 
+/// Compute exponential backoff delay in seconds for polling retries.
+/// Starts at 5s, doubles each consecutive failure, capped at 60s.
+fn polling_backoff_secs(consecutive_failures: u32) -> u64 {
+    std::cmp::min(
+        5u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1))),
+        60,
+    )
+}
+
 pub struct TelegramAdapter {
     bot: teloxide::Bot,
     authorized_user_id: u64,
@@ -71,6 +80,7 @@ impl ChatPlatform for TelegramAdapter {
             );
 
             let mut offset: i32 = 0;
+            let mut consecutive_failures: u32 = 0;
 
             loop {
                 let updates = bot
@@ -82,10 +92,31 @@ impl ChatPlatform for TelegramAdapter {
                     .await;
 
                 let updates: Vec<Update> = match updates {
-                    Ok(updates) => updates,
+                    Ok(updates) => {
+                        if consecutive_failures > 0 {
+                            tracing::info!(
+                                "Telegram: polling recovered after {} consecutive failures",
+                                consecutive_failures
+                            );
+                        }
+                        consecutive_failures = 0;
+                        updates
+                    }
                     Err(e) => {
-                        tracing::error!("Telegram: getUpdates failed: {}", e);
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        consecutive_failures += 1;
+                        // Exponential backoff: 5s, 10s, 20s, 40s, capped at 60s
+                        let backoff_secs = polling_backoff_secs(consecutive_failures);
+                        if consecutive_failures == 1 {
+                            tracing::error!("Telegram: getUpdates failed: {}", e);
+                        } else {
+                            tracing::warn!(
+                                "Telegram: getUpdates failed ({} consecutive), retrying in {}s: {}",
+                                consecutive_failures,
+                                backoff_secs,
+                                e
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                         continue;
                     }
                 };
@@ -405,5 +436,42 @@ impl ChatPlatform for TelegramAdapter {
 
     fn platform_type(&self) -> PlatformType {
         PlatformType::Telegram
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_first_failure_is_5s() {
+        assert_eq!(polling_backoff_secs(1), 5);
+    }
+
+    #[test]
+    fn backoff_doubles_each_failure() {
+        assert_eq!(polling_backoff_secs(2), 10);
+        assert_eq!(polling_backoff_secs(3), 20);
+        assert_eq!(polling_backoff_secs(4), 40);
+    }
+
+    #[test]
+    fn backoff_caps_at_60s() {
+        assert_eq!(polling_backoff_secs(5), 60);
+        assert_eq!(polling_backoff_secs(6), 60);
+        assert_eq!(polling_backoff_secs(100), 60);
+    }
+
+    #[test]
+    fn backoff_zero_failures_does_not_panic() {
+        // Edge case: should not be called with 0, but must not panic
+        let result = polling_backoff_secs(0);
+        assert!(result >= 1 && result <= 60);
+    }
+
+    #[test]
+    fn backoff_u32_max_does_not_overflow() {
+        let result = polling_backoff_secs(u32::MAX);
+        assert_eq!(result, 60);
     }
 }
