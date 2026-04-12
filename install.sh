@@ -202,9 +202,11 @@ ensure_user_bus() {
 # Rejects control characters, escapes backslashes and double-quotes.
 sanitize_toml_value() {
   local val="$1"
-  # Reject control characters (newlines, tabs, etc.)
+  # Reject control characters (newlines, tabs, carriage returns)
+  # Note: $'\n' is used instead of $(printf '\n') because command
+  # substitution strips trailing newlines, producing an empty match.
   case "$val" in
-    *"$(printf '\n')"*|*"$(printf '\r')"*|*"$(printf '\t')"*)
+    *$'\n'*|*$'\r'*|*$'\t'*)
       error "Input contains invalid characters (control characters not allowed)."
       exit 1
       ;;
