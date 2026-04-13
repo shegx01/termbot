@@ -7,6 +7,12 @@ pub mod fake;
 pub mod policy;
 pub mod types;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
+#[cfg(target_os = "linux")]
+pub mod linux;
+
 #[allow(unused_imports)]
 pub use types::{LidState, PowerEvent, PowerSignal, PowerSource};
 
