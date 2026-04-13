@@ -13,7 +13,7 @@ use chrono::{DateTime, Local, Utc};
 use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::StreamEvent;
-use crate::platform::ChatPlatform;
+use crate::chat_adapters::ChatPlatform;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Shared type aliases

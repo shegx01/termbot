@@ -32,7 +32,7 @@ src/
                     watermarks) owned exclusively by App; adapters send updates
                     via mpsc::Sender<StateUpdate>
   claude.rs         Claude Code SDK integration (claude-agent-sdk-rust crate)
-  platform/
+  chat_adapters/
     mod.rs          ChatPlatform trait (async_trait)
     telegram.rs     Telegram adapter (teloxide, long-polling, level-triggered
                     watch-channel pause/resume for banner ordering)

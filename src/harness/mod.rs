@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use std::path::Path;
 use tokio::sync::mpsc;
 
-use crate::platform::{Attachment, ChatPlatform, PlatformType, ReplyContext};
+use crate::chat_adapters::{Attachment, ChatPlatform, PlatformType, ReplyContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HarnessKind {
@@ -244,7 +244,7 @@ async fn send_reply(
     telegram: Option<&dyn ChatPlatform>,
     slack: Option<&dyn ChatPlatform>,
 ) {
-    use crate::platform::PlatformType;
+    use crate::chat_adapters::PlatformType;
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
         PlatformType::Slack => slack,

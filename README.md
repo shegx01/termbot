@@ -530,7 +530,7 @@ src/
     claude.rs          Claude Code SDK integration (streaming, images, file delivery)
     gemini.rs          Gemini harness (planned)
     codex.rs           Codex harness (planned)
-  platform/
+  chat_adapters/
     mod.rs             ChatPlatform trait + Attachment type
     telegram.rs        Telegram adapter (teloxide, long-polling)
     slack.rs           Slack adapter (Socket Mode, tokio-tungstenite)

@@ -4,7 +4,7 @@ mod command;
 mod config;
 mod delivery;
 mod harness;
-mod platform;
+mod chat_adapters;
 mod power;
 mod session;
 mod state_store;
@@ -18,9 +18,9 @@ use tokio::sync::mpsc;
 
 use app::App;
 use config::Config;
-use platform::slack::SlackPlatform;
-use platform::telegram::TelegramAdapter;
-use platform::{ChatPlatform, IncomingMessage};
+use chat_adapters::slack::SlackPlatform;
+use chat_adapters::telegram::TelegramAdapter;
+use chat_adapters::{ChatPlatform, IncomingMessage};
 use power::types::PowerSignal;
 use state_store::{StateStore, StateUpdate};
 
