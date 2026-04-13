@@ -4,8 +4,6 @@
 //! and reads sysfs/procfs directly for lid state and power-source detection.
 //! No D-Bus / zbus dependency — see ADR in the consensus plan.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -155,11 +153,7 @@ impl PowerManager for LinuxPowerManager {
                             // content was unrecognised — try next entry
                         }
                         Err(e) => {
-                            debug!(
-                                "lid_state: cannot read {}: {}",
-                                state_path.display(),
-                                e
-                            );
+                            debug!("lid_state: cannot read {}: {}", state_path.display(), e);
                         }
                     }
                 }
@@ -187,11 +181,7 @@ impl PowerManager for LinuxPowerManager {
         let mut dir = match tokio::fs::read_dir(supply_dir).await {
             Ok(d) => d,
             Err(e) => {
-                debug!(
-                    "power_source: cannot open {}: {}",
-                    supply_dir.display(),
-                    e
-                );
+                debug!("power_source: cannot open {}: {}", supply_dir.display(), e);
                 return PowerSource::Unknown;
             }
         };
@@ -219,11 +209,7 @@ impl PowerManager for LinuxPowerManager {
                             }
                         }
                         Err(e) => {
-                            debug!(
-                                "power_source: cannot read {}: {}",
-                                online_path.display(),
-                                e
-                            );
+                            debug!("power_source: cannot read {}: {}", online_path.display(), e);
                         }
                     }
                 }
@@ -309,7 +295,10 @@ impl PowerManager for LinuxPowerManager {
         } else {
             // Release: kill child if present.
             if let Some(mut child) = guard.child.take() {
-                child.kill().await.context("failed to kill systemd-inhibit")?;
+                child
+                    .kill()
+                    .await
+                    .context("failed to kill systemd-inhibit")?;
                 child
                     .wait()
                     .await
@@ -348,10 +337,7 @@ mod tests {
 
     #[test]
     fn lid_state_open() {
-        assert_eq!(
-            parse_lid_state_file("state:      open\n"),
-            LidState::Open
-        );
+        assert_eq!(parse_lid_state_file("state:      open\n"), LidState::Open);
     }
 
     #[test]

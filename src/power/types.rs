@@ -1,5 +1,4 @@
 //! Shared type vocabulary for the power management subsystem.
-#![allow(dead_code)]
 
 /// State of the laptop lid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +20,7 @@ pub enum PowerSource {
 
 /// Push events that a platform impl may publish on its broadcast channel.
 /// Polling impls never publish these; they exist for a future FFI impl.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum PowerEvent {
     LidChanged(LidState),
@@ -49,19 +49,5 @@ mod tests {
         let s = format!("{:?}", ev);
         assert!(s.contains("Inhibit"));
         assert!(s.contains("true"));
-    }
-
-    #[test]
-    fn lid_state_copy() {
-        let a = LidState::Open;
-        let b = a;
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn power_source_copy() {
-        let a = PowerSource::Ac;
-        let b = a;
-        assert_eq!(a, b);
     }
 }

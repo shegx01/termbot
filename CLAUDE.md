@@ -18,7 +18,11 @@ Single crate, flat modules. No workspace members.
 
 ```
 src/
-  main.rs           tokio::select! event loop, command dispatch, delivery tasks
+  main.rs           tokio::select! event loop, command dispatch
+  app.rs            App state, handle_gap, mark_clean_shutdown, StateStore owner
+  delivery.rs       Per-platform delivery task, StreamEvent handling, gap-banner
+                    rendering, inline-prefix fallback; resolves
+                    PendingBannerAcks oneshots directly (no main-loop round-trip)
   config.rs         TOML config (serde Deserialize)
   command.rs        `: ` prefix command parser + regex blocklist
   session.rs        Foreground/background session state machine
@@ -55,13 +59,20 @@ src/
    so the gap banner is dispatched before any queued platform message races it)
 2. **state_rx** -- `StateUpdate` mpsc from adapters and App internals; debounced
    persist (≥10 updates OR ≥5s)
-3. **delivery_ack_rx** -- `DeliveryAck::BannerSent` confirmation from per-platform
-   delivery tasks (enables the banner-sent wait in `handle_gap`)
-4. **cmd_rx** -- incoming messages from platform adapters
-5. **health_interval** -- 5s timer, crashed-session detection + `StateUpdate::Tick`
-6. **poll_interval** -- 250ms timer, capture-pane scrollback read
-7. **ctrl_c** -- graceful shutdown; calls `App::mark_clean_shutdown()` to flip
+3. **cmd_rx** -- incoming messages from platform adapters
+4. **health_interval** -- 5s timer, crashed-session detection + `StateUpdate::Tick`
+5. **poll_interval** -- 250ms timer, capture-pane scrollback read
+6. **ctrl_c** -- graceful shutdown; calls `App::mark_clean_shutdown()` to flip
    `last_clean_shutdown=true` before cleanup so restarts don't fire false banners
+
+**Banner-ack ordering** (no main-loop round-trip, no deadlock): `handle_gap`
+inserts per-chat `oneshot::Sender` handles into the shared
+`PendingBannerAcks` (`Arc<tokio::sync::Mutex<HashMap<...>>>`), broadcasts
+`StreamEvent::GapBanner`, then awaits the receivers with a 5s timeout. The
+delivery task (in `src/delivery.rs`) resolves each oneshot directly on
+successful `send_message`. On timeout, the fallback engages: a `GapInfo` is
+inserted into the shared `GapPrefixes` map, and the delivery task prepends
+`[gap: Xm Ys] ` to the next outbound `NewMessage` for that chat.
 
 Output events flow through `broadcast::channel<StreamEvent>` (capacity 256) to
 per-platform delivery tasks. `StreamEvent::GapBanner` is rendered by the

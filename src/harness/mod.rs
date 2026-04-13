@@ -521,7 +521,7 @@ mod tests {
         // emoji are 4 bytes each; 100 of them = 400 bytes but only 100 chars
         let text = "🚀".repeat(100);
         let chunks = split_message(&text, 50);
-        assert!(chunks.len() >= 1, "should produce at least one chunk");
+        assert!(!chunks.is_empty(), "should produce at least one chunk");
         for chunk in &chunks {
             assert!(
                 std::str::from_utf8(chunk.as_bytes()).is_ok(),

@@ -3,51 +3,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::{Local, Utc};
+use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::{OutputBuffer, StreamEvent};
 use crate::command::{CommandBlocklist, ParsedCommand};
 use crate::config::Config;
+use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
 use crate::harness::{drive_harness, Harness, HarnessKind};
-use crate::platform::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
 use crate::platform::telegram::TelegramAdapter;
+use crate::platform::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
 use crate::power::types::PowerSignal;
 use crate::session::{self, SessionManager};
 use crate::state_store::{StateStore, StateUpdate};
 use crate::tmux::TmuxClient;
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Banner-ack map — shared between App (writer/waiter) and delivery tasks (resolver)
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Shared registry of pending banner-delivery notifications.
-/// `App::handle_gap` inserts a oneshot sender keyed by chat_id before
-/// broadcasting a `StreamEvent::GapBanner`.  The delivery task removes
-/// and fires it immediately on successful send so `handle_gap`'s await
-/// unblocks without routing through the main `tokio::select!` loop.
-///
-/// This direct-resolution pattern is required because `handle_gap` runs
-/// inline on the main select branch — routing the ack through a separate
-/// mpsc would deadlock (the main loop can't process the ack channel
-/// while blocked inside `handle_gap`).
-pub type PendingBannerAcks = Arc<AsyncMutex<HashMap<String, oneshot::Sender<()>>>>;
-
-// ──────────────────────────────────────────────────────────────────────────────
-// GapInfo — stored for the fallback inline-prefix path
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Retained gap information for the fallback inline-prefix path.
-/// When `handle_gap` banner delivery times out, we store this and prepend
-/// `[gap: Xm Ys]` to the next outbound message for the chat.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct GapInfo {
-    pub gap: Duration,
-    pub paused_at: chrono::DateTime<Utc>,
-    pub resumed_at: chrono::DateTime<Utc>,
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // App
@@ -86,7 +56,9 @@ pub struct App {
     telegram_adapter: Option<Arc<TelegramAdapter>>,
     /// Inline fallback gap prefixes: if banner delivery times out, store here
     /// and prepend `[gap: Xm Ys]` to the next message for that chat.
-    gap_prefix: HashMap<String, GapInfo>,
+    /// Shared via `Arc<AsyncMutex<_>>` so delivery tasks can consume entries
+    /// without going through the main `tokio::select!` loop.
+    gap_prefix: GapPrefixes,
     /// Whether we have already sent a `MarkDirty` update to state.
     dirty_sent: bool,
     /// Snapshot of `last_clean_shutdown` from the state file *before* we
@@ -115,10 +87,8 @@ impl App {
 
         // Hydrate active chat sets from persisted state.
         let snapshot = store.snapshot();
-        let active_telegram_chats: HashSet<i64> =
-            snapshot.chats.telegram.iter().copied().collect();
-        let active_slack_chats: HashSet<String> =
-            snapshot.chats.slack.iter().cloned().collect();
+        let active_telegram_chats: HashSet<i64> = snapshot.chats.telegram.iter().copied().collect();
+        let active_slack_chats: HashSet<String> = snapshot.chats.slack.iter().cloned().collect();
         // Capture this BEFORE applying MarkDirty, so emit_startup_gap_banners
         // knows whether the *previous* run exited cleanly.
         let startup_was_clean = snapshot.last_clean_shutdown;
@@ -141,7 +111,7 @@ impl App {
             last_state_persist: Instant::now(),
             updates_since_persist: 0,
             telegram_adapter: None,
-            gap_prefix: HashMap::new(),
+            gap_prefix: Arc::new(AsyncMutex::new(HashMap::new())),
             dirty_sent: false,
             startup_was_clean,
         };
@@ -177,6 +147,13 @@ impl App {
     /// so delivery tasks can resolve pending oneshots directly.
     pub fn pending_banner_acks_handle(&self) -> PendingBannerAcks {
         Arc::clone(&self.pending_banner_acks)
+    }
+
+    /// Shared handle to the gap-prefix map — passed into `spawn_delivery_task`
+    /// so delivery tasks can consume inline `[gap: …]` markers set by
+    /// `handle_gap` when banner delivery times out.
+    pub fn gap_prefix_handle(&self) -> GapPrefixes {
+        Arc::clone(&self.gap_prefix)
     }
 
     /// Returns the initial Telegram offset from the persisted state snapshot.
@@ -334,6 +311,11 @@ impl App {
             let mut pending = self.pending_banner_acks.lock().await;
             for chat_id in &all_chats {
                 let (tx, rx) = oneshot::channel::<()>();
+                // If `handle_gap` is invoked a second time while the first is still
+                // awaiting acks, this insert replaces the first oneshot sender.  The
+                // first `rx.await` then returns `Err(RecvError)` and the inline-prefix
+                // fallback fires for it — acceptable single-user semantics since the user
+                // will still see a banner for the second gap.
                 pending.insert(chat_id.clone(), tx);
                 ack_futures.push((chat_id.clone(), rx));
             }
@@ -367,7 +349,8 @@ impl App {
                         chat_id
                     );
                     // Store for inline fallback on next outbound message.
-                    self.gap_prefix.insert(
+                    // Lock held only for the insert — never across an await.
+                    self.gap_prefix.lock().await.insert(
                         chat_id.clone(),
                         GapInfo {
                             gap,
@@ -427,11 +410,11 @@ impl App {
     }
 
     /// Consume and return the inline gap prefix for `chat_id` if one is
-    /// pending.  The delivery task can call this to prepend `[gap: Xm Ys]`
-    /// to the next outbound message when banner delivery timed out.
-    #[allow(dead_code)]
-    pub fn consume_gap_prefix(&mut self, chat_id: &str) -> Option<GapInfo> {
-        self.gap_prefix.remove(chat_id)
+    /// pending.  The delivery task consumes entries directly via
+    /// `gap_prefix_handle()`, but this method is also used by unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn consume_gap_prefix(&self, chat_id: &str) -> Option<GapInfo> {
+        self.gap_prefix.lock().await.remove(chat_id)
     }
 
     pub async fn handle_command(&mut self, msg: &IncomingMessage) {
@@ -913,185 +896,6 @@ impl App {
     }
 }
 
-// --- Free functions (used by delivery tasks, not tied to App state) ---
-
-/// Spawn a delivery task that consumes `StreamEvent`s from the broadcast
-/// channel and sends them via `platform`.  `pending_banner_acks` is the
-/// shared map used to resolve `handle_gap`'s per-chat oneshot waiters
-/// directly (avoids the main-loop deadlock that an mpsc ack channel would
-/// have introduced).
-pub fn spawn_delivery_task(
-    platform: Arc<dyn ChatPlatform>,
-    mut rx: broadcast::Receiver<StreamEvent>,
-    pending_banner_acks: PendingBannerAcks,
-) {
-    tokio::spawn(async move {
-        let mut session_chat_ids: HashMap<String, String> = HashMap::new();
-        let mut session_thread_ts: HashMap<String, Option<String>> = HashMap::new();
-
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    handle_stream_event(
-                        &*platform,
-                        event,
-                        &mut session_chat_ids,
-                        &mut session_thread_ts,
-                        &pending_banner_acks,
-                    )
-                    .await;
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(
-                        "{:?} delivery lagged by {} events",
-                        platform.platform_type(),
-                        n
-                    );
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    tracing::info!("{:?} delivery channel closed", platform.platform_type());
-                    break;
-                }
-            }
-        }
-    });
-}
-
-async fn handle_stream_event(
-    platform: &dyn ChatPlatform,
-    event: StreamEvent,
-    session_chat_ids: &mut HashMap<String, String>,
-    session_thread_ts: &mut HashMap<String, Option<String>>,
-    pending_banner_acks: &PendingBannerAcks,
-) {
-    match event {
-        StreamEvent::SessionStarted {
-            session,
-            chat_id,
-            thread_ts,
-        } => {
-            session_chat_ids.insert(session.clone(), chat_id);
-            session_thread_ts.insert(session, thread_ts);
-        }
-        StreamEvent::NewMessage { session, content } => {
-            let chat_id = match session_chat_ids.get(&session) {
-                Some(id) => id.clone(),
-                None => {
-                    tracing::warn!(
-                        "[delivery] no chat_id for session '{}', dropping message ({} chars)",
-                        session,
-                        content.len()
-                    );
-                    return;
-                }
-            };
-            let thread_ts = session_thread_ts.get(&session).and_then(|t| t.as_deref());
-            // Split for Telegram's 4096-char limit
-            for chunk in split_message(&content, 4000) {
-                if let Err(e) = platform.send_message(&chunk, &chat_id, thread_ts).await {
-                    tracing::error!("Failed to send message: {}", e);
-                }
-            }
-        }
-        StreamEvent::SessionExited { session, code } => {
-            let chat_id = match session_chat_ids.get(&session) {
-                Some(id) => id.clone(),
-                None => return,
-            };
-            let thread_ts = session_thread_ts.get(&session).and_then(|t| t.as_deref());
-            let msg = match code {
-                Some(c) => format!("Session '{}' exited (code {})", session, c),
-                None => format!("Session '{}' has exited unexpectedly", session),
-            };
-            let _ = platform.send_message(&msg, &chat_id, thread_ts).await;
-            session_chat_ids.remove(&session);
-            session_thread_ts.remove(&session);
-        }
-        StreamEvent::GapBanner {
-            chat_id,
-            paused_at,
-            resumed_at,
-            gap,
-            missed_count,
-        } => {
-            // Format timestamps in local time for readability.
-            let paused_local = paused_at.with_timezone(&Local);
-            let resumed_local = resumed_at.with_timezone(&Local);
-            let gap_mins = gap.as_secs() / 60;
-            let gap_secs = gap.as_secs() % 60;
-            let msg = if missed_count > 0 {
-                format!(
-                    "\u{23f8} paused at {}, resumed at {} (gap: {}m {}s), processing {} queued messages",
-                    paused_local.format("%H:%M"),
-                    resumed_local.format("%H:%M"),
-                    gap_mins,
-                    gap_secs,
-                    missed_count,
-                )
-            } else {
-                format!(
-                    "\u{23f8} paused at {}, resumed at {} (gap: {}m {}s)",
-                    paused_local.format("%H:%M"),
-                    resumed_local.format("%H:%M"),
-                    gap_mins,
-                    gap_secs,
-                )
-            };
-            if let Err(e) = platform.send_message(&msg, &chat_id, None).await {
-                tracing::error!(
-                    "Failed to send GapBanner for chat_id={}: {}",
-                    chat_id,
-                    e
-                );
-                // Do NOT resolve the oneshot on failure — let handle_gap's
-                // 5s timeout fire so the inline-prefix fallback engages.
-            } else {
-                // Directly resolve the waiter in App::handle_gap.  Lock held
-                // only for the remove+send; never across `.await` of outgoing
-                // I/O.
-                if let Some(tx) = pending_banner_acks.lock().await.remove(&chat_id) {
-                    let _ = tx.send(());
-                }
-            }
-        }
-    }
-}
-
-/// Split a message into chunks of at most `max_len` characters,
-/// breaking at newline boundaries when possible.
-pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
-        return vec![text.to_string()];
-    }
-    let mut chunks = Vec::new();
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        if remaining.len() <= max_len {
-            chunks.push(remaining.to_string());
-            break;
-        }
-        // Find a safe byte boundary (don't split inside a multi-byte char)
-        let byte_limit = max_len.min(remaining.len());
-        let safe_limit = match remaining.get(..byte_limit) {
-            Some(_) => byte_limit,
-            None => remaining
-                .char_indices()
-                .take_while(|(i, _)| *i <= byte_limit)
-                .last()
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(remaining.len()),
-        };
-        // Prefer splitting at a newline
-        let split_at = remaining[..safe_limit]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(safe_limit);
-        chunks.push(remaining[..split_at].to_string());
-        remaining = &remaining[split_at..];
-    }
-    chunks
-}
-
 /// Clean up temp files from attachments that won't reach the harness
 /// (which normally handles its own cleanup in the spawned task).
 async fn cleanup_attachments(attachments: &[Attachment]) {
@@ -1136,54 +940,7 @@ patterns = []
         (app, state_rx)
     }
 
-    // ─── split_message tests (preserved from original) ──────────────────────
-
-    #[test]
-    fn split_short_message() {
-        let chunks = split_message("hello", 4000);
-        assert_eq!(chunks, vec!["hello"]);
-    }
-
-    #[test]
-    fn split_at_newline_boundary() {
-        let text = "line1\nline2\nline3";
-        let chunks = split_message(text, 10);
-        // "line1\n" = 6 chars, fits. "line2\n" would make 12, too long.
-        // So first chunk is "line1\n", second is "line2\nline3"
-        assert!(chunks.len() >= 2);
-        assert!(chunks[0].contains("line1"));
-        assert!(chunks.last().unwrap().contains("line3"));
-    }
-
-    #[test]
-    fn split_unicode_safe() {
-        // Create a string with multi-byte emoji that would panic if sliced at byte boundary
-        let text = "a\u{1f916}b".repeat(2000); // ~6000 chars, each emoji is 4 bytes
-        let chunks = split_message(&text, 4000);
-        assert!(chunks.len() >= 2);
-        // Verify no panic and each chunk is valid UTF-8
-        for chunk in &chunks {
-            assert!(chunk.len() <= 4100); // some slack for boundary finding
-        }
-    }
-
-    #[test]
-    fn split_exact_limit() {
-        let text = "a".repeat(4000);
-        let chunks = split_message(&text, 4000);
-        assert_eq!(chunks.len(), 1);
-    }
-
-    #[test]
-    fn split_just_over_limit() {
-        let text = "a".repeat(4001);
-        let chunks = split_message(&text, 4000);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 4000);
-        assert_eq!(chunks[1].len(), 1);
-    }
-
-    // ─── New sleep/wake recovery tests ──────────────────────────────────────
+    // ─── Sleep/wake recovery tests ───────────────────────────────────────────
 
     #[tokio::test]
     async fn apply_state_update_debounces_below_threshold() {
@@ -1268,13 +1025,10 @@ patterns = []
         app.emit_startup_gap_banners();
 
         // Should receive a GapBanner for chat 111.
-        let event = tokio::time::timeout(
-            Duration::from_millis(100),
-            sub.recv(),
-        )
-        .await
-        .expect("timeout waiting for GapBanner")
-        .expect("channel error");
+        let event = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timeout waiting for GapBanner")
+            .expect("channel error");
 
         match event {
             StreamEvent::GapBanner { chat_id, .. } => {
@@ -1343,8 +1097,7 @@ patterns = []
     async fn delivery_resolves_banner_ack_directly() {
         // Regression test for the Architect-identified deadlock: the delivery
         // task must resolve the pending oneshot *directly* via the shared
-        // map, not via an mpsc the main loop drains.  We simulate that here
-        // by taking the handle and resolving a pending oneshot through it.
+        // map, not via an mpsc the main loop drains.
         let dir = tempdir().unwrap();
         let (app, _state_rx) = make_app(dir.path());
 
@@ -1359,8 +1112,6 @@ patterns = []
             let _ = removed.unwrap().send(());
         }
 
-        // The handle_gap waiter would see this without the main loop ever
-        // running.  We assert the same here.
         assert!(rx.await.is_ok(), "oneshot should be resolved directly");
         assert!(
             acks.lock().await.is_empty(),
@@ -1371,12 +1122,6 @@ patterns = []
     #[tokio::test]
     async fn handle_gap_completes_when_delivery_resolves_directly() {
         // End-to-end regression test for the Architect-identified deadlock.
-        // Before the fix: handle_gap awaited on a oneshot whose sender could
-        // only be produced by a main-loop branch the awaiting task itself was
-        // blocking — so every gap hit the 5s timeout and engaged the inline
-        // fallback unconditionally.  After the fix: a simulated delivery task
-        // resolves the oneshot directly via the shared map handle, and
-        // handle_gap should return in ~milliseconds, well under the 5s bound.
         let dir = tempdir().unwrap();
         let (mut app, _state_rx) = make_app(dir.path());
 
@@ -1391,12 +1136,10 @@ patterns = []
         let delivery_task = tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {
                 if let StreamEvent::GapBanner { chat_id, .. } = event {
-                    // Brief lock + remove + resolve — the pattern the real
-                    // delivery task uses on a successful send.
                     if let Some(tx) = acks.lock().await.remove(&chat_id) {
                         let _ = tx.send(());
                     }
-                    return; // one banner is enough for this test
+                    return;
                 }
             }
         });
@@ -1407,41 +1150,28 @@ patterns = []
             gap: Duration::from_secs(90),
         };
 
-        // Timebox the whole call — if deadlocked, this would hit 5s (the
-        // internal timeout) + some overhead.  We allow up to 1s for ample
-        // scheduling slack on slow CI; a deadlocked version would blow past.
         let result = tokio::time::timeout(Duration::from_secs(1), app.handle_gap(signal)).await;
         assert!(
             result.is_ok(),
             "handle_gap deadlocked or timed out beyond the 1s bound"
         );
 
-        // And no gap_prefix fallback should have been engaged (meaning the
-        // ack was received cleanly, not via the timeout path).
+        // No gap_prefix fallback should have been engaged.
         assert!(
-            app.gap_prefix.is_empty(),
-            "gap_prefix should be empty when the ack resolved in time; got {:?}",
-            app.gap_prefix
+            app.gap_prefix.lock().await.is_empty(),
+            "gap_prefix should be empty when the ack resolved in time"
         );
 
-        // Clean up the delivery task.
         let _ = tokio::time::timeout(Duration::from_millis(100), delivery_task).await;
     }
 
-    #[test]
-    fn consume_gap_prefix_returns_and_clears() {
+    #[tokio::test]
+    async fn consume_gap_prefix_returns_and_clears() {
         let dir = tempdir().unwrap();
-        let (mut app, _state_rx) = {
-            let config = make_test_config(dir.path());
-            let store =
-                StateStore::load(dir.path().join("termbot-state.json")).expect("load state");
-            let (state_tx, state_rx) = mpsc::channel::<StateUpdate>(64);
-            let app = App::new(&config, store, state_tx).expect("App::new");
-            (app, state_rx)
-        };
+        let (app, _state_rx) = make_app(dir.path());
 
         let now = Utc::now();
-        app.gap_prefix.insert(
+        app.gap_prefix.lock().await.insert(
             "chat42".to_string(),
             GapInfo {
                 gap: Duration::from_secs(90),
@@ -1450,10 +1180,10 @@ patterns = []
             },
         );
 
-        let prefix = app.consume_gap_prefix("chat42");
+        let prefix = app.consume_gap_prefix("chat42").await;
         assert!(prefix.is_some(), "should return the gap info");
         assert_eq!(prefix.unwrap().gap, Duration::from_secs(90));
         // Second call: cleared.
-        assert!(app.consume_gap_prefix("chat42").is_none());
+        assert!(app.consume_gap_prefix("chat42").await.is_none());
     }
 }

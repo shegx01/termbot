@@ -5,7 +5,6 @@
 //!   - Lid / power state: shell out to `ioreg` and `pmset` (synchronous reads).
 //!
 //! No IOKit FFI, core-foundation, or new crates are used.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -165,7 +164,10 @@ impl PowerManager for MacOsPowerManager {
             if let Some(mut child) = g.child.take() {
                 let pid = child.id();
                 child.kill().await.context("killing caffeinate")?;
-                child.wait().await.context("waiting for caffeinate to exit")?;
+                child
+                    .wait()
+                    .await
+                    .context("waiting for caffeinate to exit")?;
                 info!(pid = pid, "sleep inhibit released; caffeinate killed");
                 g.inhibit_held = false;
             } else {
@@ -198,10 +200,7 @@ async fn run_ioreg_clamshell() -> anyhow::Result<String> {
         .context("running ioreg")?;
 
     if !out.status.success() {
-        anyhow::bail!(
-            "ioreg exited with status {}",
-            out.status
-        );
+        anyhow::bail!("ioreg exited with status {}", out.status);
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -214,10 +213,7 @@ async fn run_pmset_batt() -> anyhow::Result<String> {
         .context("running pmset")?;
 
     if !out.status.success() {
-        anyhow::bail!(
-            "pmset exited with status {}",
-            out.status
-        );
+        anyhow::bail!("pmset exited with status {}", out.status);
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -233,7 +229,7 @@ async fn run_pmset_batt() -> anyhow::Result<String> {
 /// - `LidState::Closed`  if `= Yes`
 /// - `LidState::Open`    if `= No`
 /// - `LidState::Absent`  if the key is not present (e.g. Mac mini)
-pub fn parse_clamshell_output(output: &str) -> LidState {
+pub(crate) fn parse_clamshell_output(output: &str) -> LidState {
     for line in output.lines() {
         if line.contains("\"AppleClamshellState\"") {
             if line.contains("= Yes") {
@@ -250,7 +246,7 @@ pub fn parse_clamshell_output(output: &str) -> LidState {
 ///
 /// The first line is the authoritative source; it contains either
 /// `'AC Power'` or `'Battery Power'`.
-pub fn parse_power_source_output(output: &str) -> PowerSource {
+pub(crate) fn parse_power_source_output(output: &str) -> PowerSource {
     for line in output.lines() {
         if line.contains("AC Power") {
             return PowerSource::Ac;
@@ -369,46 +365,34 @@ mod tests {
         assert!(!pm.is_inhibited_cached());
 
         // Hold.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            pm.set_inhibit(true),
-        )
-        .await
-        .expect("set_inhibit(true) timed out")
-        .expect("set_inhibit(true) returned an error");
+        tokio::time::timeout(std::time::Duration::from_secs(5), pm.set_inhibit(true))
+            .await
+            .expect("set_inhibit(true) timed out")
+            .expect("set_inhibit(true) returned an error");
 
         assert!(pm.is_inhibited_cached());
 
         // Idempotent second hold — should not error.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            pm.set_inhibit(true),
-        )
-        .await
-        .expect("idempotent set_inhibit(true) timed out")
-        .expect("idempotent set_inhibit(true) returned an error");
+        tokio::time::timeout(std::time::Duration::from_secs(5), pm.set_inhibit(true))
+            .await
+            .expect("idempotent set_inhibit(true) timed out")
+            .expect("idempotent set_inhibit(true) returned an error");
 
         assert!(pm.is_inhibited_cached());
 
         // Release.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            pm.set_inhibit(false),
-        )
-        .await
-        .expect("set_inhibit(false) timed out")
-        .expect("set_inhibit(false) returned an error");
+        tokio::time::timeout(std::time::Duration::from_secs(5), pm.set_inhibit(false))
+            .await
+            .expect("set_inhibit(false) timed out")
+            .expect("set_inhibit(false) returned an error");
 
         assert!(!pm.is_inhibited_cached());
 
         // Idempotent release — should not error.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            pm.set_inhibit(false),
-        )
-        .await
-        .expect("idempotent set_inhibit(false) timed out")
-        .expect("idempotent set_inhibit(false) returned an error");
+        tokio::time::timeout(std::time::Duration::from_secs(5), pm.set_inhibit(false))
+            .await
+            .expect("idempotent set_inhibit(false) timed out")
+            .expect("idempotent set_inhibit(false) returned an error");
 
         assert!(!pm.is_inhibited_cached());
     }

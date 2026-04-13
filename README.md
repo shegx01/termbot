@@ -216,6 +216,43 @@ max_sessions = 10
 
 Include both `[telegram]` and `[slack]` sections with both IDs in `[auth]`. Either platform can be omitted -- termbot starts with whatever is configured.
 
+### Sleep/wake management (optional)
+
+By default, termbot holds an idle-sleep inhibitor whenever the lid is open (or the device has no lid) and the host is on AC. Drop a `[power]` section into `termbot.toml` to adjust:
+
+```toml
+[power]
+# Enable the power-management subsystem (default: true).
+# Set to false for CI/headless environments with no caffeinate/systemd-inhibit.
+enabled = true
+
+# Hold the inhibitor on battery power too (default: false = AC-only).
+# Turn on only if you want real-time delivery while unplugged; it will drain
+# the battery faster since the host can't idle-sleep.
+stayawake_on_battery = false
+
+# Override the state-file location (default: <termbot.toml dir>/termbot-state.json).
+# This file stores the Telegram offset, chat bindings, last-seen-wall timestamp,
+# and the clean-shutdown flag. It MUST be writable by the termbot process.
+# state_file = "/absolute/path/to/termbot-state.json"
+```
+
+All fields are optional — an empty `[power]` section (or no section at all) uses the defaults above. Verify the inhibitor is live with:
+
+- macOS: `pmset -g assertions | grep PreventUserIdleSystem`
+- Linux: `systemd-inhibit --list | grep termbot`
+
+### Command trigger (optional)
+
+The default command prefix is `: ` (colon + space). Change it in `[commands]`:
+
+```toml
+[commands]
+trigger = "!"   # Now use `! ls -la` instead of `: ls -la`
+```
+
+Allowed characters: `` : ! > ; . , @ ~ ^ - + = | % ? ``.
+
 ---
 
 ## Commands reference
@@ -421,7 +458,8 @@ Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. termbo
 | `streaming.chunk_size` | integer | Max chars per message (default: 4000) |
 | `streaming.offline_buffer_max_bytes` | integer | Max offline buffer (default: 1048576) |
 | `streaming.max_sessions` | integer | Max concurrent terminal sessions (default: 10) |
-| `power.enabled` | bool | Enable the power-management subsystem (default: true) |
+| `commands.trigger` | char | Command prefix character (default: `:`). Must be one of `: ! > ; . , @ ~ ^ - + = \| % ?` |
+| `power.enabled` | bool | Enable the power-management subsystem (default: true). Set false for CI / headless |
 | `power.stayawake_on_battery` | bool | Prevent idle sleep on battery power too (default: false; AC-only) |
 | `power.state_file` | string | Override for the persisted-state JSON file (default: adjacent to `termbot.toml`) |
 
@@ -436,17 +474,24 @@ Closed-lid sleep is **never** blocked — macOS clamshell and Linux
 lid-close suspend continue to work normally.
 
 When the host does sleep (lid close, forced suspend, overnight), termbot
-detects the gap on wake via monotonic/wall-clock divergence and emits a
-one-time banner per active chat:
+detects the gap on wake via monotonic/wall-clock divergence (>30s) and emits
+a one-time banner per active chat:
 
 ```
-⏸ paused at 02:13, resumed at 07:45 (gap: 5h 32m), processing N queued messages
+⏸ paused at 02:13, resumed at 07:45 (gap: 5h 32m)
 ```
 
-Telegram message backlog is then drained in `update_id` order. The Telegram
-offset and chat bindings persist to `termbot-state.json` (adjacent to
-`termbot.toml` by default) so a restart during sleep still delivers the
-banner and drains the backlog.
+Telegram polling is paused until each banner is confirmed delivered (per-chat
+oneshot ack, 5s timeout); then the backlog drains in `update_id` order. If a
+banner fails to deliver within the timeout (e.g., rate-limit or network blip),
+termbot falls back to prepending `[gap: Xm Ys] ` inline to the first outbound
+message for that chat so the gap is never silently hidden.
+
+The Telegram offset and chat bindings persist atomically to
+`termbot-state.json` (adjacent to `termbot.toml` by default). A restart
+during sleep still delivers a banner and drains the backlog, guarded by a
+compound gate: wall-gap > 30s **AND** the previous shutdown was unclean
+(so `cargo build`-and-restart cycles don't fire spurious banners).
 
 Verify the assertion with:
 
@@ -460,8 +505,10 @@ Verify the assertion with:
 ```
 src/
   main.rs              Core event loop (tokio::select!, biased priority order)
-  app.rs               Application state, command dispatch, delivery tasks,
-                       sleep/wake handling, StateStore owner
+  app.rs               Application state, command dispatch, sleep/wake handling,
+                       StateStore owner
+  delivery.rs          Per-platform delivery tasks, gap-banner rendering,
+                       inline-prefix fallback, StreamEvent dispatch
   config.rs            TOML config with validation
   command.rs           Command parser + blocklist + evasion normalization
   session.rs           Session manager (foreground/background state machine)

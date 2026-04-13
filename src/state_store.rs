@@ -193,20 +193,39 @@ impl StateStore {
     pub fn persist(&self) -> Result<()> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
 
-        // Create parent dirs if they don't exist, with 0700 perms on Unix
-        // applied at creation time (no umask window).
+        // Create parent dirs if they don't exist, applying 0700 to every
+        // ancestor we create — DirBuilder::recursive(true) applies the mode
+        // only to the leaf directory; intermediates would get umask defaults
+        // (security review MEDIUM finding).  Walk ancestors shallowest-first
+        // so parents are created before children.
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            if !parent.exists() {
+            builder.mode(0o700);
+            // Collect missing ancestors from deepest to shallowest, then
+            // reverse so we create shallowest (parents) first.
+            let mut missing: Vec<&Path> = Vec::new();
+            let mut cur: &Path = parent;
+            loop {
+                if cur.as_os_str().is_empty() || cur.exists() {
+                    break;
+                }
+                missing.push(cur);
+                match cur.parent() {
+                    Some(p) => cur = p,
+                    None => break,
+                }
+            }
+            missing.reverse();
+            for dir in missing {
                 builder
-                    .create(parent)
-                    .with_context(|| format!("creating state dir {}", parent.display()))?;
-            } else {
-                // Parent already exists — make sure perms are 0700 so we
-                // don't leak the file to group/other on re-use.
+                    .create(dir)
+                    .with_context(|| format!("creating state dir {}", dir.display()))?;
+            }
+            // Parent now exists — make sure perms are 0700 in case it was
+            // created by an older run with loose permissions.
+            if parent.exists() {
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = std::fs::metadata(parent) {
                     let current = meta.permissions().mode() & 0o777;
@@ -223,11 +242,6 @@ impl StateStore {
                     }
                 }
             }
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating state dir {}", parent.display()))?;
         }
 
         let json =
@@ -275,9 +289,7 @@ impl StateStore {
     /// Used when `power.state_file` is `None`.
     #[allow(dead_code)]
     pub fn resolve_default_path(config_path: &Path) -> PathBuf {
-        let parent = config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
+        let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
         parent.join("termbot-state.json")
     }
 }
@@ -332,11 +344,9 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        let has_quarantine = entries.iter().any(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .contains(".corrupt-")
-        });
+        let has_quarantine = entries
+            .iter()
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
         assert!(has_quarantine, "expected a .corrupt-* quarantine file");
 
         // Returned state must be the default.

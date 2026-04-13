@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -35,7 +35,7 @@ pub struct TelegramAdapter {
     #[allow(dead_code)]
     last_edit: Arc<tokio::sync::Mutex<Option<Instant>>>,
     /// Telegram getUpdates offset to seed on startup (loaded from persisted state).
-    initial_offset: Arc<AtomicI64>,
+    initial_offset: i64,
     /// Watch channel sender: `true` = polling paused, `false` = polling active.
     pause_tx: Arc<tokio::sync::watch::Sender<bool>>,
     /// Receiver clone stored so `start()` can move one into the polling task.
@@ -56,7 +56,7 @@ impl TelegramAdapter {
             connected: Arc::new(AtomicBool::new(false)),
             rate_limit_ms,
             last_edit: Arc::new(tokio::sync::Mutex::new(None)),
-            initial_offset: Arc::new(AtomicI64::new(0)),
+            initial_offset: 0,
             pause_tx: Arc::new(pause_tx),
             pause_rx,
         }
@@ -64,8 +64,8 @@ impl TelegramAdapter {
 
     /// Seed the initial polling offset from persisted state.
     /// Must be called before `start()`.
-    pub fn with_initial_offset(self, offset: i64) -> Self {
-        self.initial_offset.store(offset, Ordering::SeqCst);
+    pub fn with_initial_offset(mut self, offset: i64) -> Self {
+        self.initial_offset = offset;
         self
     }
 
@@ -98,7 +98,7 @@ impl TelegramAdapter {
         let authorized_user_id = self.authorized_user_id;
         let connected = Arc::clone(&self.connected);
         let bot = self.bot.clone();
-        let initial_offset = Arc::clone(&self.initial_offset);
+        let initial_offset = self.initial_offset;
         let mut pause_rx = self.pause_rx.clone();
 
         tokio::spawn(async move {
@@ -120,7 +120,7 @@ impl TelegramAdapter {
             // parameter is i32.  Silently truncating with `as i32` could
             // wrap long-running offsets into negative territory (code-review
             // finding).  Clamp explicitly with a loud log.
-            let raw_offset = initial_offset.load(Ordering::SeqCst);
+            let raw_offset = initial_offset;
             let mut offset: i32 = if raw_offset < 0 {
                 tracing::warn!(
                     "Telegram: persisted offset {} is negative, resetting to 0",
@@ -381,8 +381,7 @@ impl TelegramAdapter {
                 // Persist the offset after each successful batch that advanced it.
                 // Non-blocking: if the receiver is gone (App shut down) we just skip.
                 if offset > 0 {
-                    let _ = state_tx
-                        .try_send(StateUpdate::TelegramOffset(offset as i64));
+                    let _ = state_tx.try_send(StateUpdate::TelegramOffset(offset as i64));
                 }
 
                 if cmd_tx.is_closed() {
@@ -551,7 +550,7 @@ mod tests {
     fn backoff_zero_failures_does_not_panic() {
         // Edge case: should not be called with 0, but must not panic
         let result = polling_backoff_secs(0);
-        assert!(result >= 1 && result <= 60);
+        assert!((1..=60).contains(&result));
     }
 
     #[test]
@@ -562,15 +561,15 @@ mod tests {
 
     #[test]
     fn with_initial_offset_stores_value() {
-        let adapter = TelegramAdapter::new("token".to_string(), 12345, 2000)
-            .with_initial_offset(42);
-        assert_eq!(adapter.initial_offset.load(Ordering::SeqCst), 42);
+        let adapter =
+            TelegramAdapter::new("token".to_string(), 12345, 2000).with_initial_offset(42);
+        assert_eq!(adapter.initial_offset, 42);
     }
 
     #[test]
     fn with_initial_offset_default_is_zero() {
         let adapter = TelegramAdapter::new("token".to_string(), 12345, 2000);
-        assert_eq!(adapter.initial_offset.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.initial_offset, 0);
     }
 
     #[test]

@@ -1,7 +1,6 @@
 //! OS-agnostic sleep-gap detection via wall/monotonic clock divergence.
 //! Per AD-3: ticks every 1s, compares SystemTime vs Instant deltas,
 //! emits PowerSignal::GapDetected when the difference exceeds the threshold.
-#![allow(dead_code)]
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -9,23 +8,21 @@ use tracing::warn;
 
 use super::types::PowerSignal;
 
-pub const GAP_THRESHOLD: Duration = Duration::from_secs(30);
-pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const GAP_THRESHOLD: Duration = Duration::from_secs(30);
+pub(crate) const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Pure inner function for testability.
 ///
 /// Returns `Some((paused_at, resumed_at, gap))` when
 /// `wall_delta - monotonic_delta > GAP_THRESHOLD`, otherwise `None`.
-pub fn detect_gap(
+pub(crate) fn detect_gap(
     last_mono: Instant,
     last_wall: SystemTime,
     now_mono: Instant,
     now_wall: SystemTime,
 ) -> Option<(SystemTime, SystemTime, Duration)> {
     let mono_delta = now_mono.duration_since(last_mono);
-    let wall_delta = now_wall
-        .duration_since(last_wall)
-        .unwrap_or(Duration::ZERO);
+    let wall_delta = now_wall.duration_since(last_wall).unwrap_or(Duration::ZERO);
 
     if wall_delta > mono_delta + GAP_THRESHOLD {
         let gap = wall_delta - mono_delta;
@@ -113,7 +110,10 @@ mod tests {
         let now_wall = base_wall; // zero wall advance
 
         let result = detect_gap(base_mono, base_wall, now_mono, now_wall);
-        assert!(result.is_none(), "identical timestamps should produce no gap");
+        assert!(
+            result.is_none(),
+            "identical timestamps should produce no gap"
+        );
     }
 
     #[test]
@@ -140,7 +140,10 @@ mod tests {
         let now_wall = wall_plus(base_wall, Duration::from_secs(90));
 
         let result = detect_gap(base_mono, base_wall, now_mono, now_wall);
-        assert!(result.is_some(), "90s wall jump with ~0s mono should trigger a gap");
+        assert!(
+            result.is_some(),
+            "90s wall jump with ~0s mono should trigger a gap"
+        );
 
         let (_paused, _resumed, gap) = result.unwrap();
         // gap ≈ 90s (wall_delta=90s minus mono_delta≈0s)
@@ -161,7 +164,10 @@ mod tests {
         let now_wall = wall_plus(base_wall, Duration::from_secs(29));
 
         let result = detect_gap(base_mono, base_wall, now_mono, now_wall);
-        assert!(result.is_none(), "29s wall advance should be below the 30s threshold");
+        assert!(
+            result.is_none(),
+            "29s wall advance should be below the 30s threshold"
+        );
     }
 
     #[test]
@@ -174,7 +180,10 @@ mod tests {
         let now_wall = wall_plus(base_wall, Duration::from_secs(31));
 
         let result = detect_gap(base_mono, base_wall, now_mono, now_wall);
-        assert!(result.is_some(), "31s wall advance should exceed the 30s threshold");
+        assert!(
+            result.is_some(),
+            "31s wall advance should exceed the 30s threshold"
+        );
 
         let (_paused, _resumed, gap) = result.unwrap();
         assert!(

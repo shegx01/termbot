@@ -1,6 +1,5 @@
 //! Test double for `PowerManager`. Publicly accessible so integration-style
 //! tests in other modules can construct one without feature flags.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -22,6 +21,7 @@ pub struct FakePowerManager {
     inner: Arc<Mutex<FakeState>>,
 }
 
+#[allow(dead_code)]
 impl FakePowerManager {
     pub fn new(lid: LidState, power: PowerSource) -> Self {
         Self {

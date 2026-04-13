@@ -1,6 +1,5 @@
 //! OS-agnostic policy: derives the desired inhibit state from current
 //! lid/power readings and the user's configuration.
-#![allow(dead_code)]
 
 use crate::power::types::{LidState, PowerSource};
 
@@ -37,26 +36,116 @@ mod tests {
 
         let cases = [
             // --- Lid::Open ---
-            Case { lid: Open, power: Ac,      battery_ok: false, expected: true  },
-            Case { lid: Open, power: Ac,      battery_ok: true,  expected: true  },
-            Case { lid: Open, power: Battery, battery_ok: false, expected: false },
-            Case { lid: Open, power: Battery, battery_ok: true,  expected: true  },
-            Case { lid: Open, power: Unknown, battery_ok: false, expected: true  },
-            Case { lid: Open, power: Unknown, battery_ok: true,  expected: true  },
+            Case {
+                lid: Open,
+                power: Ac,
+                battery_ok: false,
+                expected: true,
+            },
+            Case {
+                lid: Open,
+                power: Ac,
+                battery_ok: true,
+                expected: true,
+            },
+            Case {
+                lid: Open,
+                power: Battery,
+                battery_ok: false,
+                expected: false,
+            },
+            Case {
+                lid: Open,
+                power: Battery,
+                battery_ok: true,
+                expected: true,
+            },
+            Case {
+                lid: Open,
+                power: Unknown,
+                battery_ok: false,
+                expected: true,
+            },
+            Case {
+                lid: Open,
+                power: Unknown,
+                battery_ok: true,
+                expected: true,
+            },
             // --- Lid::Absent (desktop) ---
-            Case { lid: Absent, power: Ac,      battery_ok: false, expected: true  },
-            Case { lid: Absent, power: Ac,      battery_ok: true,  expected: true  },
-            Case { lid: Absent, power: Battery, battery_ok: false, expected: false },
-            Case { lid: Absent, power: Battery, battery_ok: true,  expected: true  },
-            Case { lid: Absent, power: Unknown, battery_ok: false, expected: true  },
-            Case { lid: Absent, power: Unknown, battery_ok: true,  expected: true  },
+            Case {
+                lid: Absent,
+                power: Ac,
+                battery_ok: false,
+                expected: true,
+            },
+            Case {
+                lid: Absent,
+                power: Ac,
+                battery_ok: true,
+                expected: true,
+            },
+            Case {
+                lid: Absent,
+                power: Battery,
+                battery_ok: false,
+                expected: false,
+            },
+            Case {
+                lid: Absent,
+                power: Battery,
+                battery_ok: true,
+                expected: true,
+            },
+            Case {
+                lid: Absent,
+                power: Unknown,
+                battery_ok: false,
+                expected: true,
+            },
+            Case {
+                lid: Absent,
+                power: Unknown,
+                battery_ok: true,
+                expected: true,
+            },
             // --- Lid::Closed — inhibit must never be held ---
-            Case { lid: Closed, power: Ac,      battery_ok: false, expected: false },
-            Case { lid: Closed, power: Ac,      battery_ok: true,  expected: false },
-            Case { lid: Closed, power: Battery, battery_ok: false, expected: false },
-            Case { lid: Closed, power: Battery, battery_ok: true,  expected: false },
-            Case { lid: Closed, power: Unknown, battery_ok: false, expected: false },
-            Case { lid: Closed, power: Unknown, battery_ok: true,  expected: false },
+            Case {
+                lid: Closed,
+                power: Ac,
+                battery_ok: false,
+                expected: false,
+            },
+            Case {
+                lid: Closed,
+                power: Ac,
+                battery_ok: true,
+                expected: false,
+            },
+            Case {
+                lid: Closed,
+                power: Battery,
+                battery_ok: false,
+                expected: false,
+            },
+            Case {
+                lid: Closed,
+                power: Battery,
+                battery_ok: true,
+                expected: false,
+            },
+            Case {
+                lid: Closed,
+                power: Unknown,
+                battery_ok: false,
+                expected: false,
+            },
+            Case {
+                lid: Closed,
+                power: Unknown,
+                battery_ok: true,
+                expected: false,
+            },
         ];
 
         for (i, c) in cases.iter().enumerate() {

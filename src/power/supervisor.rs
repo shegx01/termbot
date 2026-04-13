@@ -2,7 +2,6 @@
 //! PowerManager trait, applies the desired_inhibit policy, and calls
 //! set_inhibit on transitions.  Emits PowerEvent on an optional
 //! broadcast channel for observability.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -12,7 +11,7 @@ use super::policy;
 use super::types::{LidState, PowerEvent, PowerSource};
 use super::PowerManager;
 
-pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Spawn the periodic power-state supervisor task.  Returns its JoinHandle.
 ///
@@ -120,7 +119,11 @@ mod tests {
         let _handle = spawn_power_supervisor(pm.clone(), false, Some(tx));
 
         let history = wait_for_history(&pm, Duration::from_secs(4), |h| !h.is_empty()).await;
-        assert_eq!(history, vec![true], "Open+Ac should cause a single inhibit=true call");
+        assert_eq!(
+            history,
+            vec![true],
+            "Open+Ac should cause a single inhibit=true call"
+        );
     }
 
     #[tokio::test]
@@ -138,8 +141,7 @@ mod tests {
         pm.set_lid(LidState::Closed).await;
 
         // Wait for inhibit=false to be appended.
-        let history =
-            wait_for_history(&pm, Duration::from_secs(4), |h| h == [true, false]).await;
+        let history = wait_for_history(&pm, Duration::from_secs(4), |h| h == [true, false]).await;
         assert_eq!(
             history,
             vec![true, false],
@@ -151,10 +153,7 @@ mod tests {
     async fn open_battery_no_stayawake_sets_inhibit_false() {
         // (Open, Battery, stayawake=false) → desired=false → set_inhibit(false) called once.
         // On startup prev_inhibit=None, desired=false → transitions and calls set_inhibit(false).
-        let pm = Arc::new(FakePowerManager::new(
-            LidState::Open,
-            PowerSource::Battery,
-        ));
+        let pm = Arc::new(FakePowerManager::new(LidState::Open, PowerSource::Battery));
         let (tx, _rx) = broadcast::channel(8);
 
         let _handle = spawn_power_supervisor(pm.clone(), false, Some(tx));
@@ -170,10 +169,7 @@ mod tests {
     #[tokio::test]
     async fn open_battery_stayawake_holds_inhibit() {
         // (Open, Battery, stayawake=true) → desired=true → set_inhibit(true) called.
-        let pm = Arc::new(FakePowerManager::new(
-            LidState::Open,
-            PowerSource::Battery,
-        ));
+        let pm = Arc::new(FakePowerManager::new(LidState::Open, PowerSource::Battery));
         let (tx, _rx) = broadcast::channel(8);
 
         let _handle = spawn_power_supervisor(pm.clone(), true, Some(tx));

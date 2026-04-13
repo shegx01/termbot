@@ -2,6 +2,7 @@ mod app;
 mod buffer;
 mod command;
 mod config;
+mod delivery;
 mod harness;
 mod platform;
 mod power;
@@ -74,10 +75,11 @@ async fn main() -> Result<()> {
         adapter
             .start_with_state(cmd_tx.clone(), state_tx.clone())
             .await?;
-        app::spawn_delivery_task(
+        delivery::spawn_delivery_task(
             Arc::clone(&adapter) as Arc<dyn ChatPlatform>,
             app.subscribe_stream(),
             app.pending_banner_acks_handle(),
+            app.gap_prefix_handle(),
         );
         // Give App a handle to the concrete adapter for pause/resume.
         app.set_telegram_adapter(Arc::clone(&adapter));
@@ -109,10 +111,11 @@ async fn main() -> Result<()> {
                 tracing::error!("Slack adapter error: {}", e);
             }
         });
-        app::spawn_delivery_task(
+        delivery::spawn_delivery_task(
             Arc::clone(&adapter) as Arc<dyn ChatPlatform>,
             app.subscribe_stream(),
             app.pending_banner_acks_handle(),
+            app.gap_prefix_handle(),
         );
         tracing::info!("Slack adapter started (user_id={})", sl_user_id);
         Some(adapter)
@@ -136,11 +139,9 @@ async fn main() -> Result<()> {
     // ── Power subsystem ───────────────────────────────────────────────────────
     if config.power.enabled {
         #[cfg(target_os = "macos")]
-        let pm: Arc<dyn power::PowerManager> =
-            Arc::new(power::macos::MacOsPowerManager::new());
+        let pm: Arc<dyn power::PowerManager> = Arc::new(power::macos::MacOsPowerManager::new());
         #[cfg(target_os = "linux")]
-        let pm: Arc<dyn power::PowerManager> =
-            Arc::new(power::linux::LinuxPowerManager::new());
+        let pm: Arc<dyn power::PowerManager> = Arc::new(power::linux::LinuxPowerManager::new());
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let pm: Arc<dyn power::PowerManager> = Arc::new(power::fake::FakePowerManager::new(
             power::types::LidState::Open,
