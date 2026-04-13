@@ -5,6 +5,7 @@ mod config;
 mod harness;
 mod platform;
 mod session;
+mod state_store;
 mod tmux;
 
 use std::sync::Arc;
