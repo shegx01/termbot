@@ -20,7 +20,6 @@ use crate::config::DiscordConfig;
 /// Maximum file upload size for Discord (25 MB).
 const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 
-#[allow(dead_code)]
 pub struct DiscordAdapter {
     config: DiscordConfig,
     authorized_user_id: UserId,
@@ -32,7 +31,6 @@ pub struct DiscordAdapter {
     shard_manager: Arc<Mutex<Option<Arc<ShardManager>>>>,
 }
 
-#[allow(dead_code)]
 impl DiscordAdapter {
     pub fn new(
         config: DiscordConfig,

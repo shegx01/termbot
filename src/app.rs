@@ -30,6 +30,7 @@ pub struct App {
     stream_tx: broadcast::Sender<StreamEvent>,
     telegram: Option<Arc<dyn ChatPlatform>>,
     slack: Option<Arc<dyn ChatPlatform>>,
+    discord: Option<Arc<dyn ChatPlatform>>,
     offline_buffer_max: usize,
     trigger: char,
 
@@ -102,6 +103,7 @@ impl App {
             stream_tx,
             telegram: None,
             slack: None,
+            discord: None,
             offline_buffer_max: config.streaming.offline_buffer_max_bytes,
             trigger,
             store,
@@ -129,9 +131,11 @@ impl App {
         &mut self,
         telegram: Option<Arc<dyn ChatPlatform>>,
         slack: Option<Arc<dyn ChatPlatform>>,
+        discord: Option<Arc<dyn ChatPlatform>>,
     ) {
         self.telegram = telegram;
         self.slack = slack;
+        self.discord = discord;
     }
 
     pub fn subscribe_stream(&self) -> broadcast::Receiver<StreamEvent> {
@@ -287,7 +291,10 @@ impl App {
         } = signal;
 
         // 1. Pause all adapters via trait method.
-        for p in [&self.telegram, &self.slack].into_iter().flatten() {
+        for p in [&self.telegram, &self.slack, &self.discord]
+            .into_iter()
+            .flatten()
+        {
             p.pause().await;
         }
         tracing::info!(
@@ -374,7 +381,10 @@ impl App {
         }
 
         // 3. Resume all adapters via trait method.
-        for p in [&self.telegram, &self.slack].into_iter().flatten() {
+        for p in [&self.telegram, &self.slack, &self.discord]
+            .into_iter()
+            .flatten()
+        {
             p.resume().await;
         }
         tracing::info!("Adapters resumed after gap handling");
