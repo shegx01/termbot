@@ -182,46 +182,52 @@ impl StateStore {
     }
 
     /// Atomically persist state to disk:
-    /// 1. Write to a `NamedTempFile` in the same directory (same filesystem — rename is atomic).
-    /// 2. `persist()` (atomic rename).
-    /// 3. fsync the parent directory so the directory entry is durable.
-    /// 4. On first-ever create (Unix), chmod parent dir to 0700 (best-effort).
+    /// 1. Ensure parent directory exists with `0700` perms in a single syscall
+    ///    on Unix (`DirBuilder::mode`) — closes the brief umask window a
+    ///    `create_dir_all` → `set_permissions` sequence would leave open.
+    /// 2. Write JSON to a `NamedTempFile` in the same directory (rename is
+    ///    atomic on a single filesystem).
+    /// 3. `persist()` (atomic rename).
+    /// 4. fsync the parent directory so the directory entry is durable.
     #[allow(dead_code)]
     pub fn persist(&self) -> Result<()> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
 
-        // Create parent dirs if they don't exist.
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating state dir {}", parent.display()))?;
-
-        // Best-effort: restrict permissions on the parent directory (Unix only).
+        // Create parent dirs if they don't exist, with 0700 perms on Unix
+        // applied at creation time (no umask window).
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let meta = std::fs::metadata(parent);
-            match meta {
-                Ok(m) => {
-                    let current = m.permissions().mode() & 0o777;
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            if !parent.exists() {
+                builder
+                    .create(parent)
+                    .with_context(|| format!("creating state dir {}", parent.display()))?;
+            } else {
+                // Parent already exists — make sure perms are 0700 so we
+                // don't leak the file to group/other on re-use.
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(parent) {
+                    let current = meta.permissions().mode() & 0o777;
                     if current != 0o700 {
-                        let mut perms = m.permissions();
+                        let mut perms = meta.permissions();
                         perms.set_mode(0o700);
                         if let Err(e) = std::fs::set_permissions(parent, perms) {
                             tracing::warn!(
                                 dir = %parent.display(),
                                 error = %e,
-                                "could not set 0700 on state directory"
+                                "could not tighten permissions on existing state directory"
                             );
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        dir = %parent.display(),
-                        error = %e,
-                        "could not stat state directory for chmod"
-                    );
-                }
             }
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating state dir {}", parent.display()))?;
         }
 
         let json =

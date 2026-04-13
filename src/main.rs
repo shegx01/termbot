@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use app::{App, DeliveryAck};
+use app::App;
 use config::Config;
 use platform::slack::SlackPlatform;
 use platform::telegram::TelegramAdapter;
@@ -37,7 +37,6 @@ async fn main() -> Result<()> {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<IncomingMessage>(100);
     let (state_tx, mut state_rx) = mpsc::channel::<StateUpdate>(64);
     let (power_tx, mut power_rx) = mpsc::channel::<PowerSignal>(32);
-    let (delivery_ack_tx, mut delivery_ack_rx) = mpsc::channel::<DeliveryAck>(16);
 
     // ── State store ───────────────────────────────────────────────────────────
     let config_path_buf = std::path::PathBuf::from(&config_path);
@@ -50,7 +49,7 @@ async fn main() -> Result<()> {
     tracing::info!("State loaded from {}", state_path.display());
 
     // ── App ───────────────────────────────────────────────────────────────────
-    let mut app = App::new(&config, store, state_tx.clone(), delivery_ack_tx.clone())?;
+    let mut app = App::new(&config, store, state_tx.clone())?;
 
     // Startup reconciliation — reconnect surviving sessions
     app.reconcile_startup().await;
@@ -78,7 +77,7 @@ async fn main() -> Result<()> {
         app::spawn_delivery_task(
             Arc::clone(&adapter) as Arc<dyn ChatPlatform>,
             app.subscribe_stream(),
-            delivery_ack_tx.clone(),
+            app.pending_banner_acks_handle(),
         );
         // Give App a handle to the concrete adapter for pause/resume.
         app.set_telegram_adapter(Arc::clone(&adapter));
@@ -113,7 +112,7 @@ async fn main() -> Result<()> {
         app::spawn_delivery_task(
             Arc::clone(&adapter) as Arc<dyn ChatPlatform>,
             app.subscribe_stream(),
-            delivery_ack_tx.clone(),
+            app.pending_banner_acks_handle(),
         );
         tracing::info!("Slack adapter started (user_id={})", sl_user_id);
         Some(adapter)
@@ -177,14 +176,11 @@ async fn main() -> Result<()> {
             }
 
             // State updates — persist before processing commands so chat
-            // bindings are durable if we crash immediately after.
+            // bindings are durable if we crash immediately after.  Delivery
+            // tasks resolve banner-ack oneshots directly via the shared
+            // `pending_banner_acks` map — no ack mpsc needed.
             Some(update) = state_rx.recv() => {
                 app.apply_state_update(update).await;
-            }
-
-            // Delivery acks — wake up pending banner waiters.
-            Some(ack) = delivery_ack_rx.recv() => {
-                app.record_delivery_ack(ack).await;
             }
 
             msg = cmd_rx.recv() => {

@@ -115,7 +115,28 @@ impl TelegramAdapter {
                 authorized_user_id
             );
 
-            let mut offset: i32 = initial_offset.load(Ordering::SeqCst) as i32;
+            // Bounds-check the persisted offset on the way back in.  The
+            // state store uses i64 for API parity, but teloxide's offset
+            // parameter is i32.  Silently truncating with `as i32` could
+            // wrap long-running offsets into negative territory (code-review
+            // finding).  Clamp explicitly with a loud log.
+            let raw_offset = initial_offset.load(Ordering::SeqCst);
+            let mut offset: i32 = if raw_offset < 0 {
+                tracing::warn!(
+                    "Telegram: persisted offset {} is negative, resetting to 0",
+                    raw_offset
+                );
+                0
+            } else if raw_offset > i32::MAX as i64 {
+                tracing::error!(
+                    "Telegram: persisted offset {} exceeds i32::MAX — backlog \
+                     will be lost on this run. Resetting to 0.",
+                    raw_offset
+                );
+                0
+            } else {
+                raw_offset as i32
+            };
             let mut consecutive_failures: u32 = 0;
 
             loop {

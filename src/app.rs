@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{Local, Utc};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::{OutputBuffer, StreamEvent};
 use crate::command::{CommandBlocklist, ParsedCommand};
@@ -19,15 +19,20 @@ use crate::state_store::{StateStore, StateUpdate};
 use crate::tmux::TmuxClient;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// DeliveryAck — sent by the delivery task back to App when a GapBanner is sent
+// Banner-ack map — shared between App (writer/waiter) and delivery tasks (resolver)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Acknowledgement messages that delivery tasks send back to `App`.
-#[derive(Debug)]
-pub enum DeliveryAck {
-    /// The GapBanner for the given chat was successfully delivered.
-    BannerSent { chat_id: String },
-}
+/// Shared registry of pending banner-delivery notifications.
+/// `App::handle_gap` inserts a oneshot sender keyed by chat_id before
+/// broadcasting a `StreamEvent::GapBanner`.  The delivery task removes
+/// and fires it immediately on successful send so `handle_gap`'s await
+/// unblocks without routing through the main `tokio::select!` loop.
+///
+/// This direct-resolution pattern is required because `handle_gap` runs
+/// inline on the main select branch — routing the ack through a separate
+/// mpsc would deadlock (the main loop can't process the ack channel
+/// while blocked inside `handle_gap`).
+pub type PendingBannerAcks = Arc<AsyncMutex<HashMap<String, oneshot::Sender<()>>>>;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // GapInfo — stored for the fallback inline-prefix path
@@ -69,9 +74,11 @@ pub struct App {
     active_telegram_chats: HashSet<i64>,
     /// Active Slack channel IDs (hydrated from persisted state on startup).
     active_slack_chats: HashSet<String>,
-    /// Pending oneshot senders waiting for a `DeliveryAck::BannerSent`.
-    /// Key = chat_id (string), value = sender to wake the timeout waiter.
-    pending_banner_acks: HashMap<String, oneshot::Sender<()>>,
+    /// Pending oneshot senders keyed by chat_id.  `handle_gap` inserts;
+    /// the delivery task resolves directly on successful banner send.
+    /// Shared via `Arc<AsyncMutex<_>>` so the map can be locked briefly
+    /// from either side without holding across await boundaries in `handle_gap`.
+    pending_banner_acks: PendingBannerAcks,
     /// Debounce counters for `store.persist()`.
     last_state_persist: Instant,
     updates_since_persist: u32,
@@ -86,9 +93,6 @@ pub struct App {
     /// applied `MarkDirty` on startup.  Used by `emit_startup_gap_banners`
     /// to check whether the previous run exited cleanly.
     startup_was_clean: bool,
-    /// mpsc sender for `DeliveryAck`s coming back from delivery tasks.
-    #[allow(dead_code)]
-    delivery_ack_tx: mpsc::Sender<DeliveryAck>,
 }
 
 impl App {
@@ -97,7 +101,6 @@ impl App {
         config: &Config,
         store: StateStore,
         state_tx: mpsc::Sender<StateUpdate>,
-        delivery_ack_tx: mpsc::Sender<DeliveryAck>,
     ) -> Result<Self> {
         let blocklist = CommandBlocklist::from_config(&config.blocklist.patterns)?;
         let trigger = config.commands.trigger;
@@ -134,14 +137,13 @@ impl App {
             state_tx,
             active_telegram_chats,
             active_slack_chats,
-            pending_banner_acks: HashMap::new(),
+            pending_banner_acks: Arc::new(AsyncMutex::new(HashMap::new())),
             last_state_persist: Instant::now(),
             updates_since_persist: 0,
             telegram_adapter: None,
             gap_prefix: HashMap::new(),
             dirty_sent: false,
             startup_was_clean,
-            delivery_ack_tx,
         };
 
         // Immediately mark state dirty in memory (sets last_clean_shutdown=false).
@@ -169,6 +171,12 @@ impl App {
 
     pub fn subscribe_stream(&self) -> broadcast::Receiver<StreamEvent> {
         self.stream_tx.subscribe()
+    }
+
+    /// Shared handle to the banner-ack map — passed into `spawn_delivery_task`
+    /// so delivery tasks can resolve pending oneshots directly.
+    pub fn pending_banner_acks_handle(&self) -> PendingBannerAcks {
+        Arc::clone(&self.pending_banner_acks)
     }
 
     /// Returns the initial Telegram offset from the persisted state snapshot.
@@ -316,11 +324,22 @@ impl App {
             .chain(slack_chats.iter().cloned())
             .collect();
 
-        // Spin up a per-chat wait future.  We use a timeout of 5s per chat.
+        // Register pending acks and broadcast banners.  The lock is held only
+        // for the duration of the inserts — never across `.await`.  The
+        // delivery task resolves each oneshot directly by locking the same
+        // map from its own task, so we can safely `.await` below without
+        // deadlocking the main `select!` loop.
         let mut ack_futures = Vec::new();
+        {
+            let mut pending = self.pending_banner_acks.lock().await;
+            for chat_id in &all_chats {
+                let (tx, rx) = oneshot::channel::<()>();
+                pending.insert(chat_id.clone(), tx);
+                ack_futures.push((chat_id.clone(), rx));
+            }
+        } // lock released
+
         for chat_id in &all_chats {
-            let (tx, rx) = oneshot::channel::<()>();
-            self.pending_banner_acks.insert(chat_id.clone(), tx);
             let _ = self.stream_tx.send(StreamEvent::GapBanner {
                 chat_id: chat_id.clone(),
                 paused_at,
@@ -328,19 +347,20 @@ impl App {
                 gap,
                 missed_count: 0,
             });
-            ack_futures.push((chat_id.clone(), rx));
         }
 
         for (chat_id, rx) in ack_futures {
             match tokio::time::timeout(Duration::from_secs(5), rx).await {
-                Ok(_) => {
+                Ok(Ok(())) => {
                     tracing::info!(
                         "GapBanner delivered for chat_id={} (gap={:.0}s)",
                         chat_id,
                         gap.as_secs_f64()
                     );
                 }
-                Err(_) => {
+                Ok(Err(_)) | Err(_) => {
+                    // `Ok(Err(_))` = sender dropped (delivery task died);
+                    // `Err(_)` = 5s elapsed without the delivery task acking.
                     tracing::error!(
                         "GapBanner delivery timed out for chat_id={} — \
                          using inline fallback prefix",
@@ -355,8 +375,8 @@ impl App {
                             resumed_at,
                         },
                     );
-                    // Remove the pending ack sender (it timed out).
-                    self.pending_banner_acks.remove(&chat_id);
+                    // Clean up the pending entry if still present (briefly lock).
+                    self.pending_banner_acks.lock().await.remove(&chat_id);
                 }
             }
         }
@@ -392,17 +412,6 @@ impl App {
             }
             self.last_state_persist = Instant::now();
             self.updates_since_persist = 0;
-        }
-    }
-
-    /// Process a `DeliveryAck` from a delivery task.
-    pub async fn record_delivery_ack(&mut self, ack: DeliveryAck) {
-        match ack {
-            DeliveryAck::BannerSent { ref chat_id } => {
-                if let Some(tx) = self.pending_banner_acks.remove(chat_id) {
-                    let _ = tx.send(());
-                }
-            }
         }
     }
 
@@ -907,12 +916,14 @@ impl App {
 // --- Free functions (used by delivery tasks, not tied to App state) ---
 
 /// Spawn a delivery task that consumes `StreamEvent`s from the broadcast
-/// channel and sends them via `platform`.  `delivery_ack_tx` is used to
-/// notify `App` when a `GapBanner` has been successfully sent.
+/// channel and sends them via `platform`.  `pending_banner_acks` is the
+/// shared map used to resolve `handle_gap`'s per-chat oneshot waiters
+/// directly (avoids the main-loop deadlock that an mpsc ack channel would
+/// have introduced).
 pub fn spawn_delivery_task(
     platform: Arc<dyn ChatPlatform>,
     mut rx: broadcast::Receiver<StreamEvent>,
-    delivery_ack_tx: mpsc::Sender<DeliveryAck>,
+    pending_banner_acks: PendingBannerAcks,
 ) {
     tokio::spawn(async move {
         let mut session_chat_ids: HashMap<String, String> = HashMap::new();
@@ -926,7 +937,7 @@ pub fn spawn_delivery_task(
                         event,
                         &mut session_chat_ids,
                         &mut session_thread_ts,
-                        &delivery_ack_tx,
+                        &pending_banner_acks,
                     )
                     .await;
                 }
@@ -951,7 +962,7 @@ async fn handle_stream_event(
     event: StreamEvent,
     session_chat_ids: &mut HashMap<String, String>,
     session_thread_ts: &mut HashMap<String, Option<String>>,
-    delivery_ack_tx: &mpsc::Sender<DeliveryAck>,
+    pending_banner_acks: &PendingBannerAcks,
 ) {
     match event {
         StreamEvent::SessionStarted {
@@ -1032,13 +1043,15 @@ async fn handle_stream_event(
                     chat_id,
                     e
                 );
+                // Do NOT resolve the oneshot on failure — let handle_gap's
+                // 5s timeout fire so the inline-prefix fallback engages.
             } else {
-                // Notify App that the banner was delivered.
-                let _ = delivery_ack_tx
-                    .send(DeliveryAck::BannerSent {
-                        chat_id: chat_id.clone(),
-                    })
-                    .await;
+                // Directly resolve the waiter in App::handle_gap.  Lock held
+                // only for the remove+send; never across `.await` of outgoing
+                // I/O.
+                if let Some(tx) = pending_banner_acks.lock().await.remove(&chat_id) {
+                    let _ = tx.send(());
+                }
             }
         }
     }
@@ -1114,20 +1127,13 @@ patterns = []
         Config::load(&toml_path).expect("test config load")
     }
 
-    fn make_app(
-        dir: &std::path::Path,
-    ) -> (
-        App,
-        mpsc::Receiver<StateUpdate>,
-        mpsc::Receiver<DeliveryAck>,
-    ) {
+    fn make_app(dir: &std::path::Path) -> (App, mpsc::Receiver<StateUpdate>) {
         let config = make_test_config(dir);
         let state_path = dir.join("termbot-state.json");
         let store = StateStore::load(&state_path).expect("load state");
         let (state_tx, state_rx) = mpsc::channel::<StateUpdate>(64);
-        let (delivery_ack_tx, delivery_ack_rx) = mpsc::channel::<DeliveryAck>(16);
-        let app = App::new(&config, store, state_tx, delivery_ack_tx).expect("App::new");
-        (app, state_rx, delivery_ack_rx)
+        let app = App::new(&config, store, state_tx).expect("App::new");
+        (app, state_rx)
     }
 
     // ─── split_message tests (preserved from original) ──────────────────────
@@ -1182,7 +1188,7 @@ patterns = []
     #[tokio::test]
     async fn apply_state_update_debounces_below_threshold() {
         let dir = tempdir().unwrap();
-        let (mut app, _state_rx, _ack_rx) = make_app(dir.path());
+        let (mut app, _state_rx) = make_app(dir.path());
 
         // Apply 5 updates — below the 10-update threshold and under 5s.
         for i in 0..5i64 {
@@ -1195,7 +1201,7 @@ patterns = []
     #[tokio::test]
     async fn apply_state_update_persists_at_threshold() {
         let dir = tempdir().unwrap();
-        let (mut app, _state_rx, _ack_rx) = make_app(dir.path());
+        let (mut app, _state_rx) = make_app(dir.path());
 
         // Apply exactly 10 updates — should trigger a persist.
         for i in 0..10i64 {
@@ -1210,7 +1216,7 @@ patterns = []
     #[tokio::test]
     async fn mark_clean_shutdown_persists_true() {
         let dir = tempdir().unwrap();
-        let (mut app, _state_rx, _ack_rx) = make_app(dir.path());
+        let (mut app, _state_rx) = make_app(dir.path());
 
         // Trigger some activity.
         app.apply_state_update(StateUpdate::TelegramOffset(1)).await;
@@ -1227,7 +1233,7 @@ patterns = []
     #[tokio::test]
     async fn app_new_marks_dirty_in_memory() {
         let dir = tempdir().unwrap();
-        let (app, _state_rx, _ack_rx) = make_app(dir.path());
+        let (app, _state_rx) = make_app(dir.path());
         // App::new applies MarkDirty immediately.
         assert!(
             !app.store.snapshot().last_clean_shutdown,
@@ -1254,8 +1260,7 @@ patterns = []
         let config = make_test_config(dir.path());
         let store = StateStore::load(&state_path).unwrap();
         let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
-        let (delivery_ack_tx, _ack_rx) = mpsc::channel::<DeliveryAck>(16);
-        let mut app = App::new(&config, store, state_tx, delivery_ack_tx).unwrap();
+        let mut app = App::new(&config, store, state_tx).unwrap();
 
         // Subscribe before emitting.
         let mut sub = app.subscribe_stream();
@@ -1297,8 +1302,7 @@ patterns = []
         let config = make_test_config(dir.path());
         let store = StateStore::load(dir.path().join("termbot-state.json")).unwrap();
         let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
-        let (delivery_ack_tx, _ack_rx) = mpsc::channel::<DeliveryAck>(16);
-        let mut app = App::new(&config, store, state_tx, delivery_ack_tx).unwrap();
+        let mut app = App::new(&config, store, state_tx).unwrap();
 
         let mut sub = app.subscribe_stream();
         app.emit_startup_gap_banners();
@@ -1326,8 +1330,7 @@ patterns = []
         let config = make_test_config(dir.path());
         let store = StateStore::load(dir.path().join("termbot-state.json")).unwrap();
         let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
-        let (delivery_ack_tx, _ack_rx) = mpsc::channel::<DeliveryAck>(16);
-        let mut app = App::new(&config, store, state_tx, delivery_ack_tx).unwrap();
+        let mut app = App::new(&config, store, state_tx).unwrap();
 
         let mut sub = app.subscribe_stream();
         app.emit_startup_gap_banners();
@@ -1337,41 +1340,104 @@ patterns = []
     }
 
     #[tokio::test]
-    async fn record_delivery_ack_resolves_pending() {
+    async fn delivery_resolves_banner_ack_directly() {
+        // Regression test for the Architect-identified deadlock: the delivery
+        // task must resolve the pending oneshot *directly* via the shared
+        // map, not via an mpsc the main loop drains.  We simulate that here
+        // by taking the handle and resolving a pending oneshot through it.
         let dir = tempdir().unwrap();
-        let (mut app, _state_rx, _ack_rx) = make_app(dir.path());
+        let (app, _state_rx) = make_app(dir.path());
 
         let (tx, rx) = oneshot::channel::<()>();
-        app.pending_banner_acks
-            .insert("chat123".to_string(), tx);
+        let acks = app.pending_banner_acks_handle();
+        acks.lock().await.insert("chat123".to_string(), tx);
 
-        app.record_delivery_ack(DeliveryAck::BannerSent {
-            chat_id: "chat123".to_string(),
-        })
-        .await;
+        // Delivery-task-style resolution: lock briefly, remove, send.
+        {
+            let removed = acks.lock().await.remove("chat123");
+            assert!(removed.is_some(), "sender should be registered");
+            let _ = removed.unwrap().send(());
+        }
 
-        // The oneshot should now be resolved.
+        // The handle_gap waiter would see this without the main loop ever
+        // running.  We assert the same here.
+        assert!(rx.await.is_ok(), "oneshot should be resolved directly");
         assert!(
-            rx.await.is_ok(),
-            "oneshot should be resolved after record_delivery_ack"
-        );
-        assert!(
-            app.pending_banner_acks.is_empty(),
+            acks.lock().await.is_empty(),
             "pending_banner_acks should be cleared"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_gap_completes_when_delivery_resolves_directly() {
+        // End-to-end regression test for the Architect-identified deadlock.
+        // Before the fix: handle_gap awaited on a oneshot whose sender could
+        // only be produced by a main-loop branch the awaiting task itself was
+        // blocking — so every gap hit the 5s timeout and engaged the inline
+        // fallback unconditionally.  After the fix: a simulated delivery task
+        // resolves the oneshot directly via the shared map handle, and
+        // handle_gap should return in ~milliseconds, well under the 5s bound.
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx) = make_app(dir.path());
+
+        // Seed an active Telegram chat so handle_gap has a chat to emit for.
+        app.active_telegram_chats.insert(7777i64);
+
+        // A background task imitating the delivery task: subscribe to the
+        // stream, and whenever a GapBanner arrives, resolve the matching
+        // pending-ack oneshot via the shared handle.
+        let acks = app.pending_banner_acks_handle();
+        let mut rx = app.subscribe_stream();
+        let delivery_task = tokio::spawn(async move {
+            while let Ok(event) = rx.recv().await {
+                if let StreamEvent::GapBanner { chat_id, .. } = event {
+                    // Brief lock + remove + resolve — the pattern the real
+                    // delivery task uses on a successful send.
+                    if let Some(tx) = acks.lock().await.remove(&chat_id) {
+                        let _ = tx.send(());
+                    }
+                    return; // one banner is enough for this test
+                }
+            }
+        });
+
+        let signal = PowerSignal::GapDetected {
+            paused_at: Utc::now() - chrono::Duration::seconds(90),
+            resumed_at: Utc::now(),
+            gap: Duration::from_secs(90),
+        };
+
+        // Timebox the whole call — if deadlocked, this would hit 5s (the
+        // internal timeout) + some overhead.  We allow up to 1s for ample
+        // scheduling slack on slow CI; a deadlocked version would blow past.
+        let result = tokio::time::timeout(Duration::from_secs(1), app.handle_gap(signal)).await;
+        assert!(
+            result.is_ok(),
+            "handle_gap deadlocked or timed out beyond the 1s bound"
+        );
+
+        // And no gap_prefix fallback should have been engaged (meaning the
+        // ack was received cleanly, not via the timeout path).
+        assert!(
+            app.gap_prefix.is_empty(),
+            "gap_prefix should be empty when the ack resolved in time; got {:?}",
+            app.gap_prefix
+        );
+
+        // Clean up the delivery task.
+        let _ = tokio::time::timeout(Duration::from_millis(100), delivery_task).await;
     }
 
     #[test]
     fn consume_gap_prefix_returns_and_clears() {
         let dir = tempdir().unwrap();
-        let (mut app, _state_rx, _ack_rx) = {
+        let (mut app, _state_rx) = {
             let config = make_test_config(dir.path());
             let store =
                 StateStore::load(dir.path().join("termbot-state.json")).expect("load state");
             let (state_tx, state_rx) = mpsc::channel::<StateUpdate>(64);
-            let (delivery_ack_tx, delivery_ack_rx) = mpsc::channel::<DeliveryAck>(16);
-            let app = App::new(&config, store, state_tx, delivery_ack_tx).expect("App::new");
-            (app, state_rx, delivery_ack_rx)
+            let app = App::new(&config, store, state_tx).expect("App::new");
+            (app, state_rx)
         };
 
         let now = Utc::now();
