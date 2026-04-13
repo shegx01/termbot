@@ -8,18 +8,50 @@ termbot gives you remote access to terminal sessions and Claude Code from your p
 
 ## Quick start
 
-### Download a pre-built binary (recommended)
+### One-line install (recommended)
 
-Pre-built binaries are available for macOS and Linux on the [Releases](https://github.com/shegx01/termbot/releases/latest) page.
+The installer downloads the binary, walks you through configuration, installs dependencies, and sets up a system service with auto-restart and update notifications.
 
 ```bash
-# Download the binary for your platform
-# Options: termbot-aarch64-apple-darwin   (macOS Apple Silicon)
-#          termbot-x86_64-apple-darwin    (macOS Intel)
-#          termbot-aarch64-unknown-linux-gnu (Linux ARM64)
-#          termbot-x86_64-unknown-linux-gnu  (Linux x86_64)
+curl -sSL https://raw.githubusercontent.com/shegx01/termbot/main/install.sh | bash
+```
+
+That's it. Open Telegram or Slack and start typing.
+
+<details>
+<summary>What the installer does</summary>
+
+1. Detects your OS and architecture (macOS/Linux, x86_64/ARM64)
+2. Checks for tmux (offers to install if missing) and Claude Code CLI (required)
+3. Walks you through Telegram/Slack configuration with inline help
+4. Downloads the correct binary to `~/.local/bin/termbot`
+5. Writes config to `~/.config/termbot/termbot.toml`
+6. Registers a system service (systemd on Linux, launchd on macOS) with auto-restart
+7. Sets up a daily update check with OS-native notifications
+8. Starts termbot
+
+**Flags:**
+- `--quick` — skip inline help text during setup
+- `--upgrade` — download latest binary, restart service (config untouched)
+- `--uninstall` — stop service, remove files (config preserved by default)
+
+```bash
+# Upgrade
+curl -sSL https://raw.githubusercontent.com/shegx01/termbot/main/install.sh | bash -s -- --upgrade
+
+# Uninstall
+curl -sSL https://raw.githubusercontent.com/shegx01/termbot/main/install.sh | bash -s -- --uninstall
+```
+</details>
+
+### Download a pre-built binary
+
+Pre-built binaries are also available directly on the [Releases](https://github.com/shegx01/termbot/releases/latest) page if you prefer manual setup.
+
+```bash
+# Download for your platform (macOS Apple Silicon shown)
 curl -L -o termbot \
-  https://github.com/shegx01/termbot/releases/latest/download/termbot-$(uname -m)-apple-darwin
+  https://github.com/shegx01/termbot/releases/latest/download/termbot-aarch64-apple-darwin
 
 chmod +x termbot
 cp termbot.example.toml termbot.toml   # edit with your tokens
@@ -35,8 +67,6 @@ cp termbot.example.toml termbot.toml   # edit with your tokens
 cargo build --release
 ./target/release/termbot
 ```
-
-Then open Telegram or Slack and start typing.
 
 To use a config file at a custom path, set `TERMBOT_CONFIG`:
 
