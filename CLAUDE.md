@@ -24,22 +24,70 @@ src/
   session.rs        Foreground/background session state machine
   tmux.rs           tmux CLI wrapper (create, kill, send-keys, capture-pane)
   buffer.rs         Scrollback-offset output capture + streaming
+  state_store.rs    Atomic JSON state file (Telegram offset, chat bindings, wake
+                    watermarks) owned exclusively by App; adapters send updates
+                    via mpsc::Sender<StateUpdate>
   claude.rs         Claude Code SDK integration (claude-agent-sdk-rust crate)
   platform/
     mod.rs          ChatPlatform trait (async_trait)
-    telegram.rs     Telegram adapter (teloxide, long-polling)
+    telegram.rs     Telegram adapter (teloxide, long-polling, level-triggered
+                    watch-channel pause/resume for banner ordering)
     slack.rs        Slack adapter (Socket Mode via tokio-tungstenite)
+  power/
+    mod.rs          PowerManager trait (async_trait) + cfg-gated submod picks
+    types.rs        LidState, PowerSource, PowerEvent, PowerSignal
+    policy.rs       Pure desired_inhibit(lid, power, stayawake_on_battery) fn
+    gap_detector.rs 1s ticker comparing SystemTime/Instant; emits
+                    PowerSignal::GapDetected when divergence > 30s
+    supervisor.rs   Polls lid/power, applies policy, calls set_inhibit on
+                    transitions (broadcasts PowerEvent for observability)
+    macos.rs        #[cfg(target_os = "macos")] — caffeinate -i child + ioreg /
+                    pmset -g batt reads (hybrid per ADR)
+    linux.rs        #[cfg(target_os = "linux")] — systemd-inhibit child +
+                    /proc/acpi/button/lid/* + /sys/class/power_supply/AC* reads
+    fake.rs         FakePowerManager test double (OS-agnostic)
 ```
 
 ### Core loop (main.rs)
 
-Four `tokio::select!` branches:
-1. **cmd_rx** -- incoming messages from platform adapters (mpsc channel)
-2. **health_interval** -- 5s timer, detects crashed tmux sessions
-3. **poll_interval** -- 250ms timer, reads new output via capture-pane scrollback
-4. **ctrl_c** -- graceful shutdown (stops pipe-pane, cleans temp files, leaves tmux sessions alive)
+`tokio::select!` branches in biased priority order:
+1. **power_rx** -- gap-detector `PowerSignal::GapDetected` (biased **above** cmd_rx
+   so the gap banner is dispatched before any queued platform message races it)
+2. **state_rx** -- `StateUpdate` mpsc from adapters and App internals; debounced
+   persist (≥10 updates OR ≥5s)
+3. **delivery_ack_rx** -- `DeliveryAck::BannerSent` confirmation from per-platform
+   delivery tasks (enables the banner-sent wait in `handle_gap`)
+4. **cmd_rx** -- incoming messages from platform adapters
+5. **health_interval** -- 5s timer, crashed-session detection + `StateUpdate::Tick`
+6. **poll_interval** -- 250ms timer, capture-pane scrollback read
+7. **ctrl_c** -- graceful shutdown; calls `App::mark_clean_shutdown()` to flip
+   `last_clean_shutdown=true` before cleanup so restarts don't fire false banners
 
-Output events flow through `broadcast::channel<StreamEvent>` to per-platform delivery tasks.
+Output events flow through `broadcast::channel<StreamEvent>` (capacity 256) to
+per-platform delivery tasks. `StreamEvent::GapBanner` is rendered by the
+delivery task and acked back via `DeliveryAck::BannerSent`.
+
+### Sleep/wake behavior
+
+Cross-platform (macOS + Linux) per the consensus plan:
+- **Idle sleep is prevented** while the lid is open (or the device has no lid)
+  and the host is on AC. Set `power.stayawake_on_battery = true` in
+  `termbot.toml` to prevent idle sleep on battery too.
+- **Closed-lid sleep is never blocked** — this is intentional. macOS clamshell
+  and Linux `systemd-inhibit --what=idle:sleep` are both idle-sleep-only.
+- **Wake recovery**: a 1s ticker compares `SystemTime` (wall) vs `Instant`
+  (monotonic). A >30s divergence signals that the host slept. On wake, the
+  Telegram polling loop is paused via a `tokio::sync::watch::channel<bool>`
+  (level-triggered — required so a busy poll doesn't miss the signal), a
+  `⏸ paused at HH:MM, resumed at HH:MM (gap: Xm Ys), processing N queued
+  messages` banner is broadcast per active chat, the banner-sent ack is
+  awaited (5s timeout with inline-prefix fallback), then polling resumes.
+- **Restart durability**: Telegram offset and chat IDs are persisted to
+  `<termbot.toml parent>/termbot-state.json` (or the `power.state_file`
+  override). The restart-banner gate requires `last_clean_shutdown == false`
+  AND `wall_gap > 30s` so graceful restarts don't trigger spurious banners.
+- Verify the assertion is held with `pmset -g assertions` (macOS) or
+  `systemd-inhibit --list` (Linux).
 
 ### Output capture
 

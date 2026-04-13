@@ -421,8 +421,37 @@ Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. termbo
 | `streaming.chunk_size` | integer | Max chars per message (default: 4000) |
 | `streaming.offline_buffer_max_bytes` | integer | Max offline buffer (default: 1048576) |
 | `streaming.max_sessions` | integer | Max concurrent terminal sessions (default: 10) |
+| `power.enabled` | bool | Enable the power-management subsystem (default: true) |
+| `power.stayawake_on_battery` | bool | Prevent idle sleep on battery power too (default: false; AC-only) |
+| `power.state_file` | string | Override for the persisted-state JSON file (default: adjacent to `termbot.toml`) |
 
 Override the config file path with `TERMBOT_CONFIG=/path/to/file.toml`.
+
+### Sleep/wake behavior
+
+termbot holds a platform-appropriate idle-sleep assertion while the lid is
+open (or the device has no lid) and the host is on AC. On macOS this is a
+supervised `caffeinate -i` child; on Linux it's `systemd-inhibit --what=idle:sleep`.
+Closed-lid sleep is **never** blocked — macOS clamshell and Linux
+lid-close suspend continue to work normally.
+
+When the host does sleep (lid close, forced suspend, overnight), termbot
+detects the gap on wake via monotonic/wall-clock divergence and emits a
+one-time banner per active chat:
+
+```
+⏸ paused at 02:13, resumed at 07:45 (gap: 5h 32m), processing N queued messages
+```
+
+Telegram message backlog is then drained in `update_id` order. The Telegram
+offset and chat bindings persist to `termbot-state.json` (adjacent to
+`termbot.toml` by default) so a restart during sleep still delivers the
+banner and drains the backlog.
+
+Verify the assertion with:
+
+- macOS: `pmset -g assertions | grep PreventUserIdleSystem`
+- Linux: `systemd-inhibit --list | grep termbot`
 
 ---
 
@@ -430,13 +459,25 @@ Override the config file path with `TERMBOT_CONFIG=/path/to/file.toml`.
 
 ```
 src/
-  main.rs              Core event loop (tokio::select!)
-  app.rs               Application state, command dispatch, delivery tasks
+  main.rs              Core event loop (tokio::select!, biased priority order)
+  app.rs               Application state, command dispatch, delivery tasks,
+                       sleep/wake handling, StateStore owner
   config.rs            TOML config with validation
   command.rs           Command parser + blocklist + evasion normalization
   session.rs           Session manager (foreground/background state machine)
   tmux.rs              tmux CLI wrapper (capture-pane, send-keys, smart quotes)
-  buffer.rs            Output diffing via scrollback line tracking
+  buffer.rs            Output diffing via scrollback line tracking; StreamEvent enum
+  state_store.rs       Atomic JSON persistence (Telegram offset, chat bindings,
+                       last_seen_wall, last_clean_shutdown) — owned by App only
+  power/               Cross-platform sleep-inhibit + gap detection
+    mod.rs             PowerManager async-trait + submod registration
+    types.rs           LidState, PowerSource, PowerEvent, PowerSignal
+    policy.rs          Pure desired_inhibit() policy function
+    gap_detector.rs    SystemTime vs Instant divergence → PowerSignal::GapDetected
+    supervisor.rs      Periodic lid/power poller; applies policy, calls set_inhibit
+    macos.rs           caffeinate -i child + ioreg/pmset reads (hybrid ADR)
+    linux.rs           systemd-inhibit child + sysfs/procfs reads
+    fake.rs            Test double for OS-agnostic unit tests
   harness/
     mod.rs             Harness trait, event types, streaming driver
     claude.rs          Claude Code SDK integration (streaming, images, file delivery)

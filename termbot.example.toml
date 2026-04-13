@@ -30,3 +30,20 @@ edit_throttle_ms = 2000
 poll_interval_ms = 250
 chunk_size = 4000
 offline_buffer_max_bytes = 1048576
+
+[power]
+# Whether to spawn the power-management subsystem at all.
+# Disable (set to false) in CI or headless environments that have
+# no caffeinate / systemd-inhibit available. Default: true.
+enabled = true
+
+# Hold the idle-sleep assertion while the lid is open and the host is
+# on battery power. Default is false to preserve battery life — the
+# assertion is held only on AC. Set to true if you want the host to
+# stay awake on battery too (it will drain faster).
+stayawake_on_battery = false
+
+# Optional override for the persisted-state file location. Defaults to
+# `<termbot.toml's directory>/termbot-state.json`. Set this to e.g.
+# `~/.local/share/termbot/state.json` for an XDG-style location.
+# state_file = "/absolute/or/~-prefixed/path/to/termbot-state.json"
