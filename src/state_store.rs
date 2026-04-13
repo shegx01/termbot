@@ -191,7 +191,13 @@ impl StateStore {
     /// 4. fsync the parent directory so the directory entry is durable.
     #[allow(dead_code)]
     pub fn persist(&self) -> Result<()> {
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        // `Path::parent()` returns `Some("")` for a bare filename like
+        // `termbot-state.json`, which then propagates into `File::open("")`
+        // and fails with ENOENT on directory fsync. Collapse empty → ".".
+        let parent = match self.path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
 
         // Create parent dirs if they don't exist, applying 0700 to every
         // ancestor we create — DirBuilder::recursive(true) applies the mode
@@ -289,7 +295,10 @@ impl StateStore {
     /// Used when `power.state_file` is `None`.
     #[allow(dead_code)]
     pub fn resolve_default_path(config_path: &Path) -> PathBuf {
-        let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = match config_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
         parent.join("termbot-state.json")
     }
 }
@@ -444,6 +453,40 @@ mod tests {
         let config_path = Path::new("/tmp/x/termbot.toml");
         let state_path = StateStore::resolve_default_path(config_path);
         assert_eq!(state_path, PathBuf::from("/tmp/x/termbot-state.json"));
+    }
+
+    #[test]
+    fn resolve_default_path_bare_filename_uses_cwd() {
+        // A bare config filename (no directory component) used to produce a
+        // bare state filename, which in turn made `persist()` call
+        // `File::open("")` for the directory fsync and log ENOENT every time.
+        let config_path = Path::new("termbot.toml");
+        let state_path = StateStore::resolve_default_path(config_path);
+        assert_eq!(state_path, PathBuf::from("./termbot-state.json"));
+    }
+
+    #[test]
+    fn persist_succeeds_with_relative_bare_state_path() {
+        // Regression: persisting to a bare filename must not warn about
+        // "could not open state directory for fsync dir=".
+        let dir = tempdir().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let result = (|| -> Result<()> {
+            let mut store = StateStore::load(PathBuf::from("termbot-state.json"))?;
+            store.apply(StateUpdate::TelegramOffset(7));
+            store.persist()?;
+            let on_disk: State = serde_json::from_str(&std::fs::read_to_string(
+                dir.path().join("termbot-state.json"),
+            )?)?;
+            assert_eq!(on_disk.telegram.offset, 7);
+            Ok(())
+        })();
+
+        // Restore cwd before propagating any panic.
+        std::env::set_current_dir(cwd).unwrap();
+        result.expect("persist with bare filename should succeed");
     }
 
     #[test]
