@@ -12,7 +12,6 @@ use crate::config::Config;
 use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
 use crate::harness::{drive_harness, Harness, HarnessKind};
-use crate::chat_adapters::telegram::TelegramAdapter;
 use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
 use crate::power::types::PowerSignal;
 use crate::session::{self, SessionManager};
@@ -44,6 +43,8 @@ pub struct App {
     active_telegram_chats: HashSet<i64>,
     /// Active Slack channel IDs (hydrated from persisted state on startup).
     active_slack_chats: HashSet<String>,
+    /// Active Discord channel IDs (hydrated from persisted state on startup).
+    active_discord_chats: HashSet<String>,
     /// Pending oneshot senders keyed by chat_id.  `handle_gap` inserts;
     /// the delivery task resolves directly on successful banner send.
     /// Shared via `Arc<AsyncMutex<_>>` so the map can be locked briefly
@@ -52,8 +53,6 @@ pub struct App {
     /// Debounce counters for `store.persist()`.
     last_state_persist: Instant,
     updates_since_persist: u32,
-    /// Concrete Telegram adapter (for pause/resume on gap).
-    telegram_adapter: Option<Arc<TelegramAdapter>>,
     /// Inline fallback gap prefixes: if banner delivery times out, store here
     /// and prepend `[gap: Xm Ys]` to the next message for that chat.
     /// Shared via `Arc<AsyncMutex<_>>` so delivery tasks can consume entries
@@ -89,6 +88,8 @@ impl App {
         let snapshot = store.snapshot();
         let active_telegram_chats: HashSet<i64> = snapshot.chats.telegram.iter().copied().collect();
         let active_slack_chats: HashSet<String> = snapshot.chats.slack.iter().cloned().collect();
+        let active_discord_chats: HashSet<String> =
+            snapshot.chats.discord.iter().cloned().collect();
         // Capture this BEFORE applying MarkDirty, so emit_startup_gap_banners
         // knows whether the *previous* run exited cleanly.
         let startup_was_clean = snapshot.last_clean_shutdown;
@@ -107,10 +108,10 @@ impl App {
             state_tx,
             active_telegram_chats,
             active_slack_chats,
+            active_discord_chats,
             pending_banner_acks: Arc::new(AsyncMutex::new(HashMap::new())),
             last_state_persist: Instant::now(),
             updates_since_persist: 0,
-            telegram_adapter: None,
             gap_prefix: Arc::new(AsyncMutex::new(HashMap::new())),
             dirty_sent: false,
             startup_was_clean,
@@ -131,12 +132,6 @@ impl App {
     ) {
         self.telegram = telegram;
         self.slack = slack;
-    }
-
-    /// Store the concrete `TelegramAdapter` so we can call `pause_polling` /
-    /// `resume_polling` during gap handling.
-    pub fn set_telegram_adapter(&mut self, adapter: Arc<TelegramAdapter>) {
-        self.telegram_adapter = Some(adapter);
     }
 
     pub fn subscribe_stream(&self) -> broadcast::Receiver<StreamEvent> {
@@ -233,7 +228,9 @@ impl App {
             return;
         }
 
-        let chat_count = self.active_telegram_chats.len() + self.active_slack_chats.len();
+        let chat_count = self.active_telegram_chats.len()
+            + self.active_slack_chats.len()
+            + self.active_discord_chats.len();
         if chat_count == 0 {
             return;
         }
@@ -267,6 +264,16 @@ impl App {
                 missed_count: 0,
             });
         }
+        // Emit one GapBanner per active Discord chat.
+        for chat_id in &self.active_discord_chats {
+            let _ = self.stream_tx.send(StreamEvent::GapBanner {
+                chat_id: chat_id.clone(),
+                paused_at: last_seen,
+                resumed_at: now,
+                gap: wall_gap,
+                missed_count: 0,
+            });
+        }
     }
 
     /// Handle a `PowerSignal::GapDetected`: pause polling, broadcast a
@@ -279,26 +286,28 @@ impl App {
             gap,
         } = signal;
 
-        // 1. Pause Telegram polling.
-        if let Some(adapter) = &self.telegram_adapter {
-            adapter.pause_polling();
-            tracing::info!(
-                "Telegram polling paused for gap handling \
-                 (paused_at={}, resumed_at={}, gap={:.0}s)",
-                paused_at,
-                resumed_at,
-                gap.as_secs_f64()
-            );
+        // 1. Pause all adapters via trait method.
+        for p in [&self.telegram, &self.slack].into_iter().flatten() {
+            p.pause().await;
         }
+        tracing::info!(
+            "Adapters paused for gap handling \
+             (paused_at={}, resumed_at={}, gap={:.0}s)",
+            paused_at,
+            resumed_at,
+            gap.as_secs_f64()
+        );
 
         // 2. Broadcast a GapBanner and wait for delivery ack per chat.
         let telegram_chats: Vec<i64> = self.active_telegram_chats.iter().copied().collect();
         let slack_chats: Vec<String> = self.active_slack_chats.iter().cloned().collect();
+        let discord_chats: Vec<String> = self.active_discord_chats.iter().cloned().collect();
 
         let all_chats: Vec<String> = telegram_chats
             .iter()
             .map(|id| id.to_string())
             .chain(slack_chats.iter().cloned())
+            .chain(discord_chats.iter().cloned())
             .collect();
 
         // Register pending acks and broadcast banners.  The lock is held only
@@ -364,11 +373,11 @@ impl App {
             }
         }
 
-        // 3. Resume Telegram polling.
-        if let Some(adapter) = &self.telegram_adapter {
-            adapter.resume_polling();
-            tracing::info!("Telegram polling resumed after gap handling");
+        // 3. Resume all adapters via trait method.
+        for p in [&self.telegram, &self.slack].into_iter().flatten() {
+            p.resume().await;
         }
+        tracing::info!("Adapters resumed after gap handling");
     }
 
     /// Apply a `StateUpdate` to in-memory state and debounce persists.
@@ -382,6 +391,9 @@ impl App {
             }
             StateUpdate::BindSlackChat(id) => {
                 self.active_slack_chats.insert(id.clone());
+            }
+            StateUpdate::BindDiscordChat(id) => {
+                self.active_discord_chats.insert(id.clone());
             }
             _ => {}
         }
@@ -437,6 +449,12 @@ impl App {
                 let id = msg.reply_context.chat_id.clone();
                 if self.active_slack_chats.insert(id.clone()) {
                     let _ = self.state_tx.try_send(StateUpdate::BindSlackChat(id));
+                }
+            }
+            PlatformType::Discord => {
+                let id = msg.reply_context.chat_id.clone();
+                if self.active_discord_chats.insert(id.clone()) {
+                    let _ = self.state_tx.try_send(StateUpdate::BindDiscordChat(id));
                 }
             }
         }
@@ -880,6 +898,7 @@ impl App {
         let platform: Option<&dyn ChatPlatform> = match ctx.platform {
             PlatformType::Telegram => self.telegram.as_deref(),
             PlatformType::Slack => self.slack.as_deref(),
+            PlatformType::Discord => None, // Discord adapter not yet wired
         };
         if let Some(p) = platform {
             if let Err(e) = p
@@ -1185,5 +1204,46 @@ patterns = []
         assert_eq!(prefix.unwrap().gap, Duration::from_secs(90));
         // Second call: cleared.
         assert!(app.consume_gap_prefix("chat42").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_command_discord_binds_chat_and_emits_state_update() {
+        let dir = tempdir().unwrap();
+        let (mut app, mut state_rx) = make_app(dir.path());
+
+        let msg = IncomingMessage {
+            user_id: "999".to_string(),
+            text: ": ls".to_string(),
+            platform: PlatformType::Discord,
+            reply_context: ReplyContext {
+                platform: PlatformType::Discord,
+                chat_id: "discord_channel_42".to_string(),
+                thread_ts: None,
+            },
+            attachments: vec![],
+        };
+
+        app.handle_command(&msg).await;
+
+        // Check in-memory set was updated.
+        assert!(
+            app.active_discord_chats.contains("discord_channel_42"),
+            "active_discord_chats should contain the chat ID"
+        );
+
+        // Drain state_rx to find BindDiscordChat.
+        // First update is MarkDirty (from handle_command's dirty_sent guard).
+        let mut found_bind = false;
+        while let Ok(update) = state_rx.try_recv() {
+            if let StateUpdate::BindDiscordChat(id) = update {
+                assert_eq!(id, "discord_channel_42");
+                found_bind = true;
+                break;
+            }
+        }
+        assert!(
+            found_bind,
+            "expected StateUpdate::BindDiscordChat to be emitted"
+        );
     }
 }

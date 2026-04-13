@@ -11,6 +11,8 @@ use tokio::sync::mpsc;
 pub enum PlatformType {
     Telegram,
     Slack,
+    #[allow(dead_code)]
+    Discord,
 }
 
 #[derive(Debug, Clone)]
@@ -18,6 +20,7 @@ pub enum PlatformType {
 pub enum PlatformMessageId {
     Telegram(i32),
     Slack(String), // message ts
+    Discord(u64),
 }
 
 /// An image or file attachment downloaded to a temp file.
@@ -83,4 +86,10 @@ pub trait ChatPlatform: Send + Sync {
     #[allow(dead_code)]
     fn is_connected(&self) -> bool;
     fn platform_type(&self) -> PlatformType;
+
+    /// Pause user-visible message processing. Default no-op; adapters that
+    /// support sleep/wake handling override this.
+    async fn pause(&self) {}
+    /// Resume user-visible message processing. Default no-op.
+    async fn resume(&self) {}
 }
