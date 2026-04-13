@@ -17,6 +17,16 @@ pub enum StreamEvent {
         chat_id: String,
         thread_ts: Option<String>,
     },
+    /// Emitted once per active chat when a sleep/wake gap is detected or an
+    /// unclean restart is detected.  The delivery task renders a human-readable
+    /// banner and sends `DeliveryAck::BannerSent` when done.
+    GapBanner {
+        chat_id: String,
+        paused_at: chrono::DateTime<chrono::Utc>,
+        resumed_at: chrono::DateTime<chrono::Utc>,
+        gap: std::time::Duration,
+        missed_count: u32,
+    },
 }
 
 /// Captures terminal output by diffing tmux pane content between polls.

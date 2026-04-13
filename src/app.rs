@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::broadcast;
+use chrono::{Local, Utc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::buffer::{OutputBuffer, StreamEvent};
 use crate::command::{CommandBlocklist, ParsedCommand};
@@ -10,8 +12,41 @@ use crate::config::Config;
 use crate::harness::claude::ClaudeHarness;
 use crate::harness::{drive_harness, Harness, HarnessKind};
 use crate::platform::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
+use crate::platform::telegram::TelegramAdapter;
+use crate::power::types::PowerSignal;
 use crate::session::{self, SessionManager};
+use crate::state_store::{StateStore, StateUpdate};
 use crate::tmux::TmuxClient;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DeliveryAck — sent by the delivery task back to App when a GapBanner is sent
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Acknowledgement messages that delivery tasks send back to `App`.
+#[derive(Debug)]
+pub enum DeliveryAck {
+    /// The GapBanner for the given chat was successfully delivered.
+    BannerSent { chat_id: String },
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GapInfo — stored for the fallback inline-prefix path
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Retained gap information for the fallback inline-prefix path.
+/// When `handle_gap` banner delivery times out, we store this and prepend
+/// `[gap: Xm Ys]` to the next outbound message for the chat.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct GapInfo {
+    pub gap: Duration,
+    pub paused_at: chrono::DateTime<Utc>,
+    pub resumed_at: chrono::DateTime<Utc>,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// App
+// ──────────────────────────────────────────────────────────────────────────────
 
 pub struct App {
     blocklist: CommandBlocklist,
@@ -23,10 +58,47 @@ pub struct App {
     slack: Option<Arc<dyn ChatPlatform>>,
     offline_buffer_max: usize,
     trigger: char,
+
+    // ── Sleep/wake recovery state ─────────────────────────────────────────────
+    /// Owned state store (single owner — adapters send updates via mpsc).
+    store: StateStore,
+    /// mpsc sender to push `StateUpdate`s into the App's `state_rx` channel.
+    /// Kept here so `App` itself can send updates (e.g. `MarkDirty`, `Tick`).
+    state_tx: mpsc::Sender<StateUpdate>,
+    /// Active Telegram chat IDs (hydrated from persisted state on startup).
+    active_telegram_chats: HashSet<i64>,
+    /// Active Slack channel IDs (hydrated from persisted state on startup).
+    active_slack_chats: HashSet<String>,
+    /// Pending oneshot senders waiting for a `DeliveryAck::BannerSent`.
+    /// Key = chat_id (string), value = sender to wake the timeout waiter.
+    pending_banner_acks: HashMap<String, oneshot::Sender<()>>,
+    /// Debounce counters for `store.persist()`.
+    last_state_persist: Instant,
+    updates_since_persist: u32,
+    /// Concrete Telegram adapter (for pause/resume on gap).
+    telegram_adapter: Option<Arc<TelegramAdapter>>,
+    /// Inline fallback gap prefixes: if banner delivery times out, store here
+    /// and prepend `[gap: Xm Ys]` to the next message for that chat.
+    gap_prefix: HashMap<String, GapInfo>,
+    /// Whether we have already sent a `MarkDirty` update to state.
+    dirty_sent: bool,
+    /// Snapshot of `last_clean_shutdown` from the state file *before* we
+    /// applied `MarkDirty` on startup.  Used by `emit_startup_gap_banners`
+    /// to check whether the previous run exited cleanly.
+    startup_was_clean: bool,
+    /// mpsc sender for `DeliveryAck`s coming back from delivery tasks.
+    #[allow(dead_code)]
+    delivery_ack_tx: mpsc::Sender<DeliveryAck>,
 }
 
 impl App {
-    pub fn new(config: &Config) -> Result<Self> {
+    /// Construct `App`, hydrating active chats and initial state from `store`.
+    pub fn new(
+        config: &Config,
+        store: StateStore,
+        state_tx: mpsc::Sender<StateUpdate>,
+        delivery_ack_tx: mpsc::Sender<DeliveryAck>,
+    ) -> Result<Self> {
         let blocklist = CommandBlocklist::from_config(&config.blocklist.patterns)?;
         let trigger = config.commands.trigger;
         let session_mgr =
@@ -38,7 +110,17 @@ impl App {
         harnesses.insert(HarnessKind::Claude, Box::new(ClaudeHarness::new(cwd)));
         let (stream_tx, _) = broadcast::channel::<StreamEvent>(256);
 
-        Ok(Self {
+        // Hydrate active chat sets from persisted state.
+        let snapshot = store.snapshot();
+        let active_telegram_chats: HashSet<i64> =
+            snapshot.chats.telegram.iter().copied().collect();
+        let active_slack_chats: HashSet<String> =
+            snapshot.chats.slack.iter().cloned().collect();
+        // Capture this BEFORE applying MarkDirty, so emit_startup_gap_banners
+        // knows whether the *previous* run exited cleanly.
+        let startup_was_clean = snapshot.last_clean_shutdown;
+
+        let mut app = Self {
             blocklist,
             session_mgr,
             buffers: HashMap::new(),
@@ -48,7 +130,26 @@ impl App {
             slack: None,
             offline_buffer_max: config.streaming.offline_buffer_max_bytes,
             trigger,
-        })
+            store,
+            state_tx,
+            active_telegram_chats,
+            active_slack_chats,
+            pending_banner_acks: HashMap::new(),
+            last_state_persist: Instant::now(),
+            updates_since_persist: 0,
+            telegram_adapter: None,
+            gap_prefix: HashMap::new(),
+            dirty_sent: false,
+            startup_was_clean,
+            delivery_ack_tx,
+        };
+
+        // Immediately mark state dirty in memory (sets last_clean_shutdown=false).
+        // This ensures that a crash before `mark_clean_shutdown()` is called
+        // will correctly fire a restart banner on the next boot.
+        app.store.apply(StateUpdate::MarkDirty);
+
+        Ok(app)
     }
 
     pub fn set_platforms(
@@ -60,8 +161,21 @@ impl App {
         self.slack = slack;
     }
 
+    /// Store the concrete `TelegramAdapter` so we can call `pause_polling` /
+    /// `resume_polling` during gap handling.
+    pub fn set_telegram_adapter(&mut self, adapter: Arc<TelegramAdapter>) {
+        self.telegram_adapter = Some(adapter);
+    }
+
     pub fn subscribe_stream(&self) -> broadcast::Receiver<StreamEvent> {
         self.stream_tx.subscribe()
+    }
+
+    /// Returns the initial Telegram offset from the persisted state snapshot.
+    /// Call this before constructing the `TelegramAdapter` with
+    /// `.with_initial_offset(...)`.
+    pub fn initial_telegram_offset(&self) -> i64 {
+        self.store.snapshot().telegram.offset
     }
 
     pub async fn reconcile_startup(&mut self) {
@@ -113,7 +227,228 @@ impl App {
         }
     }
 
+    /// Emit gap banners for any active chats if we detect an unclean restart
+    /// with a wall gap > 30s.  Call this once after `reconcile_startup()`.
+    pub fn emit_startup_gap_banners(&mut self) {
+        let snapshot = self.store.snapshot().clone();
+        let now = Utc::now();
+        let last_seen = match snapshot.last_seen_wall {
+            Some(t) => t,
+            None => return, // first ever run — no gap
+        };
+        let wall_gap = now
+            .signed_duration_since(last_seen)
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+
+        // Only fire if the gap exceeds 30s AND last shutdown was not clean.
+        // Use `startup_was_clean` (captured before MarkDirty) rather than the
+        // current store value (which is always false after MarkDirty).
+        if wall_gap <= Duration::from_secs(30) || self.startup_was_clean {
+            return;
+        }
+
+        let chat_count = self.active_telegram_chats.len() + self.active_slack_chats.len();
+        if chat_count == 0 {
+            return;
+        }
+
+        tracing::info!(
+            "Detected unclean restart — emitting gap banners for {} chat(s) \
+             (gap={:.0}s, paused_at={}, resumed_at={})",
+            chat_count,
+            wall_gap.as_secs_f64(),
+            last_seen,
+            now,
+        );
+
+        // Emit one GapBanner per active Telegram chat.
+        for &chat_id in &self.active_telegram_chats {
+            let _ = self.stream_tx.send(StreamEvent::GapBanner {
+                chat_id: chat_id.to_string(),
+                paused_at: last_seen,
+                resumed_at: now,
+                gap: wall_gap,
+                missed_count: 0,
+            });
+        }
+        // Emit one GapBanner per active Slack chat.
+        for chat_id in &self.active_slack_chats {
+            let _ = self.stream_tx.send(StreamEvent::GapBanner {
+                chat_id: chat_id.clone(),
+                paused_at: last_seen,
+                resumed_at: now,
+                gap: wall_gap,
+                missed_count: 0,
+            });
+        }
+    }
+
+    /// Handle a `PowerSignal::GapDetected`: pause polling, broadcast a
+    /// GapBanner per active chat, wait for delivery acks (5s timeout),
+    /// then resume polling.
+    pub async fn handle_gap(&mut self, signal: PowerSignal) {
+        let PowerSignal::GapDetected {
+            paused_at,
+            resumed_at,
+            gap,
+        } = signal;
+
+        // 1. Pause Telegram polling.
+        if let Some(adapter) = &self.telegram_adapter {
+            adapter.pause_polling();
+            tracing::info!(
+                "Telegram polling paused for gap handling \
+                 (paused_at={}, resumed_at={}, gap={:.0}s)",
+                paused_at,
+                resumed_at,
+                gap.as_secs_f64()
+            );
+        }
+
+        // 2. Broadcast a GapBanner and wait for delivery ack per chat.
+        let telegram_chats: Vec<i64> = self.active_telegram_chats.iter().copied().collect();
+        let slack_chats: Vec<String> = self.active_slack_chats.iter().cloned().collect();
+
+        let all_chats: Vec<String> = telegram_chats
+            .iter()
+            .map(|id| id.to_string())
+            .chain(slack_chats.iter().cloned())
+            .collect();
+
+        // Spin up a per-chat wait future.  We use a timeout of 5s per chat.
+        let mut ack_futures = Vec::new();
+        for chat_id in &all_chats {
+            let (tx, rx) = oneshot::channel::<()>();
+            self.pending_banner_acks.insert(chat_id.clone(), tx);
+            let _ = self.stream_tx.send(StreamEvent::GapBanner {
+                chat_id: chat_id.clone(),
+                paused_at,
+                resumed_at,
+                gap,
+                missed_count: 0,
+            });
+            ack_futures.push((chat_id.clone(), rx));
+        }
+
+        for (chat_id, rx) in ack_futures {
+            match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                Ok(_) => {
+                    tracing::info!(
+                        "GapBanner delivered for chat_id={} (gap={:.0}s)",
+                        chat_id,
+                        gap.as_secs_f64()
+                    );
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "GapBanner delivery timed out for chat_id={} — \
+                         using inline fallback prefix",
+                        chat_id
+                    );
+                    // Store for inline fallback on next outbound message.
+                    self.gap_prefix.insert(
+                        chat_id.clone(),
+                        GapInfo {
+                            gap,
+                            paused_at,
+                            resumed_at,
+                        },
+                    );
+                    // Remove the pending ack sender (it timed out).
+                    self.pending_banner_acks.remove(&chat_id);
+                }
+            }
+        }
+
+        // 3. Resume Telegram polling.
+        if let Some(adapter) = &self.telegram_adapter {
+            adapter.resume_polling();
+            tracing::info!("Telegram polling resumed after gap handling");
+        }
+    }
+
+    /// Apply a `StateUpdate` to in-memory state and debounce persists.
+    ///
+    /// Persists when: >= 10 updates accumulated OR >= 5s since last persist.
+    pub async fn apply_state_update(&mut self, update: StateUpdate) {
+        // Track active chat IDs as they bind.
+        match &update {
+            StateUpdate::BindTelegramChat(id) => {
+                self.active_telegram_chats.insert(*id);
+            }
+            StateUpdate::BindSlackChat(id) => {
+                self.active_slack_chats.insert(id.clone());
+            }
+            _ => {}
+        }
+        self.store.apply(update);
+        self.updates_since_persist += 1;
+        if self.updates_since_persist >= 10
+            || self.last_state_persist.elapsed() >= Duration::from_secs(5)
+        {
+            if let Err(e) = self.store.persist() {
+                tracing::error!("Failed to persist state: {}", e);
+            }
+            self.last_state_persist = Instant::now();
+            self.updates_since_persist = 0;
+        }
+    }
+
+    /// Process a `DeliveryAck` from a delivery task.
+    pub async fn record_delivery_ack(&mut self, ack: DeliveryAck) {
+        match ack {
+            DeliveryAck::BannerSent { ref chat_id } => {
+                if let Some(tx) = self.pending_banner_acks.remove(chat_id) {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    }
+
+    /// Mark last_clean_shutdown=true and force-persist.  Called on graceful
+    /// ctrl-c before `cleanup()`.
+    pub async fn mark_clean_shutdown(&mut self) {
+        self.store.apply(StateUpdate::SetCleanShutdown(true));
+        if let Err(e) = self.store.persist() {
+            tracing::error!("Failed to persist clean-shutdown state: {}", e);
+        } else {
+            tracing::info!("Clean shutdown persisted");
+        }
+    }
+
+    /// Consume and return the inline gap prefix for `chat_id` if one is
+    /// pending.  The delivery task can call this to prepend `[gap: Xm Ys]`
+    /// to the next outbound message when banner delivery timed out.
+    #[allow(dead_code)]
+    pub fn consume_gap_prefix(&mut self, chat_id: &str) -> Option<GapInfo> {
+        self.gap_prefix.remove(chat_id)
+    }
+
     pub async fn handle_command(&mut self, msg: &IncomingMessage) {
+        // Ensure MarkDirty is sent on the first real user interaction.
+        if !self.dirty_sent {
+            let _ = self.state_tx.try_send(StateUpdate::MarkDirty);
+            self.dirty_sent = true;
+        }
+
+        // Bind chat IDs for active platform (so we know which chats to banner).
+        match msg.reply_context.platform {
+            PlatformType::Telegram => {
+                if let Ok(id) = msg.reply_context.chat_id.parse::<i64>() {
+                    if self.active_telegram_chats.insert(id) {
+                        let _ = self.state_tx.try_send(StateUpdate::BindTelegramChat(id));
+                    }
+                }
+            }
+            PlatformType::Slack => {
+                let id = msg.reply_context.chat_id.clone();
+                if self.active_slack_chats.insert(id.clone()) {
+                    let _ = self.state_tx.try_send(StateUpdate::BindSlackChat(id));
+                }
+            }
+        }
+
         let cmd = match ParsedCommand::parse(&msg.text, self.trigger) {
             Ok(cmd) => cmd,
             Err(e) => {
@@ -473,6 +808,8 @@ impl App {
                 code,
             });
         }
+        // Emit a Tick to keep last_seen_wall fresh for restart-gap computation.
+        let _ = self.state_tx.try_send(StateUpdate::Tick);
     }
 
     pub async fn poll_output(&mut self) {
@@ -569,9 +906,13 @@ impl App {
 
 // --- Free functions (used by delivery tasks, not tied to App state) ---
 
+/// Spawn a delivery task that consumes `StreamEvent`s from the broadcast
+/// channel and sends them via `platform`.  `delivery_ack_tx` is used to
+/// notify `App` when a `GapBanner` has been successfully sent.
 pub fn spawn_delivery_task(
     platform: Arc<dyn ChatPlatform>,
     mut rx: broadcast::Receiver<StreamEvent>,
+    delivery_ack_tx: mpsc::Sender<DeliveryAck>,
 ) {
     tokio::spawn(async move {
         let mut session_chat_ids: HashMap<String, String> = HashMap::new();
@@ -585,6 +926,7 @@ pub fn spawn_delivery_task(
                         event,
                         &mut session_chat_ids,
                         &mut session_thread_ts,
+                        &delivery_ack_tx,
                     )
                     .await;
                 }
@@ -609,6 +951,7 @@ async fn handle_stream_event(
     event: StreamEvent,
     session_chat_ids: &mut HashMap<String, String>,
     session_thread_ts: &mut HashMap<String, Option<String>>,
+    delivery_ack_tx: &mpsc::Sender<DeliveryAck>,
 ) {
     match event {
         StreamEvent::SessionStarted {
@@ -652,6 +995,51 @@ async fn handle_stream_event(
             let _ = platform.send_message(&msg, &chat_id, thread_ts).await;
             session_chat_ids.remove(&session);
             session_thread_ts.remove(&session);
+        }
+        StreamEvent::GapBanner {
+            chat_id,
+            paused_at,
+            resumed_at,
+            gap,
+            missed_count,
+        } => {
+            // Format timestamps in local time for readability.
+            let paused_local = paused_at.with_timezone(&Local);
+            let resumed_local = resumed_at.with_timezone(&Local);
+            let gap_mins = gap.as_secs() / 60;
+            let gap_secs = gap.as_secs() % 60;
+            let msg = if missed_count > 0 {
+                format!(
+                    "\u{23f8} paused at {}, resumed at {} (gap: {}m {}s), processing {} queued messages",
+                    paused_local.format("%H:%M"),
+                    resumed_local.format("%H:%M"),
+                    gap_mins,
+                    gap_secs,
+                    missed_count,
+                )
+            } else {
+                format!(
+                    "\u{23f8} paused at {}, resumed at {} (gap: {}m {}s)",
+                    paused_local.format("%H:%M"),
+                    resumed_local.format("%H:%M"),
+                    gap_mins,
+                    gap_secs,
+                )
+            };
+            if let Err(e) = platform.send_message(&msg, &chat_id, None).await {
+                tracing::error!(
+                    "Failed to send GapBanner for chat_id={}: {}",
+                    chat_id,
+                    e
+                );
+            } else {
+                // Notify App that the banner was delivered.
+                let _ = delivery_ack_tx
+                    .send(DeliveryAck::BannerSent {
+                        chat_id: chat_id.clone(),
+                    })
+                    .await;
+            }
         }
     }
 }
@@ -702,6 +1090,47 @@ async fn cleanup_attachments(attachments: &[Attachment]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::state_store::StateStore;
+    use tempfile::tempdir;
+
+    fn make_test_config(dir: &std::path::Path) -> Config {
+        // Write a minimal valid termbot.toml to the temp dir.
+        let toml_path = dir.join("termbot.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[auth]
+telegram_user_id = 12345
+
+[telegram]
+bot_token = "test_token_that_is_not_real"
+
+[blocklist]
+patterns = []
+"#,
+        )
+        .unwrap();
+        Config::load(&toml_path).expect("test config load")
+    }
+
+    fn make_app(
+        dir: &std::path::Path,
+    ) -> (
+        App,
+        mpsc::Receiver<StateUpdate>,
+        mpsc::Receiver<DeliveryAck>,
+    ) {
+        let config = make_test_config(dir);
+        let state_path = dir.join("termbot-state.json");
+        let store = StateStore::load(&state_path).expect("load state");
+        let (state_tx, state_rx) = mpsc::channel::<StateUpdate>(64);
+        let (delivery_ack_tx, delivery_ack_rx) = mpsc::channel::<DeliveryAck>(16);
+        let app = App::new(&config, store, state_tx, delivery_ack_tx).expect("App::new");
+        (app, state_rx, delivery_ack_rx)
+    }
+
+    // ─── split_message tests (preserved from original) ──────────────────────
 
     #[test]
     fn split_short_message() {
@@ -746,5 +1175,219 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), 4000);
         assert_eq!(chunks[1].len(), 1);
+    }
+
+    // ─── New sleep/wake recovery tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn apply_state_update_debounces_below_threshold() {
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx, _ack_rx) = make_app(dir.path());
+
+        // Apply 5 updates — below the 10-update threshold and under 5s.
+        for i in 0..5i64 {
+            app.apply_state_update(StateUpdate::TelegramOffset(i)).await;
+        }
+        // persist should NOT have been called yet (5 < 10, and < 5s elapsed).
+        assert_eq!(app.updates_since_persist, 5);
+    }
+
+    #[tokio::test]
+    async fn apply_state_update_persists_at_threshold() {
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx, _ack_rx) = make_app(dir.path());
+
+        // Apply exactly 10 updates — should trigger a persist.
+        for i in 0..10i64 {
+            app.apply_state_update(StateUpdate::TelegramOffset(i)).await;
+        }
+        // After persist, counter resets to 0.
+        assert_eq!(app.updates_since_persist, 0);
+        // State file should exist.
+        assert!(dir.path().join("termbot-state.json").exists());
+    }
+
+    #[tokio::test]
+    async fn mark_clean_shutdown_persists_true() {
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx, _ack_rx) = make_app(dir.path());
+
+        // Trigger some activity.
+        app.apply_state_update(StateUpdate::TelegramOffset(1)).await;
+        app.mark_clean_shutdown().await;
+
+        // Reload from disk and check.
+        let reloaded = StateStore::load(dir.path().join("termbot-state.json")).unwrap();
+        assert!(
+            reloaded.snapshot().last_clean_shutdown,
+            "mark_clean_shutdown should persist last_clean_shutdown=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_new_marks_dirty_in_memory() {
+        let dir = tempdir().unwrap();
+        let (app, _state_rx, _ack_rx) = make_app(dir.path());
+        // App::new applies MarkDirty immediately.
+        assert!(
+            !app.store.snapshot().last_clean_shutdown,
+            "App::new should mark store dirty (last_clean_shutdown=false)"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_banner_gate_fires_on_unclean_gap() {
+        let dir = tempdir().unwrap();
+
+        // Write a state file with last_clean_shutdown=false and old last_seen_wall.
+        let old_time = Utc::now() - chrono::Duration::seconds(120);
+        let state = serde_json::json!({
+            "schema_version": 1,
+            "telegram": { "offset": 0 },
+            "chats": { "telegram": [111i64], "slack": [] },
+            "last_seen_wall": old_time.to_rfc3339(),
+            "last_clean_shutdown": false
+        });
+        let state_path = dir.path().join("termbot-state.json");
+        std::fs::write(&state_path, state.to_string()).unwrap();
+
+        let config = make_test_config(dir.path());
+        let store = StateStore::load(&state_path).unwrap();
+        let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
+        let (delivery_ack_tx, _ack_rx) = mpsc::channel::<DeliveryAck>(16);
+        let mut app = App::new(&config, store, state_tx, delivery_ack_tx).unwrap();
+
+        // Subscribe before emitting.
+        let mut sub = app.subscribe_stream();
+
+        app.emit_startup_gap_banners();
+
+        // Should receive a GapBanner for chat 111.
+        let event = tokio::time::timeout(
+            Duration::from_millis(100),
+            sub.recv(),
+        )
+        .await
+        .expect("timeout waiting for GapBanner")
+        .expect("channel error");
+
+        match event {
+            StreamEvent::GapBanner { chat_id, .. } => {
+                assert_eq!(chat_id, "111");
+            }
+            other => panic!("expected GapBanner, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_banner_gate_no_fire_on_clean_shutdown() {
+        let dir = tempdir().unwrap();
+
+        // Write a state file with last_clean_shutdown=true.
+        let old_time = Utc::now() - chrono::Duration::seconds(120);
+        let state = serde_json::json!({
+            "schema_version": 1,
+            "telegram": { "offset": 0 },
+            "chats": { "telegram": [111i64], "slack": [] },
+            "last_seen_wall": old_time.to_rfc3339(),
+            "last_clean_shutdown": true
+        });
+        std::fs::write(dir.path().join("termbot-state.json"), state.to_string()).unwrap();
+
+        let config = make_test_config(dir.path());
+        let store = StateStore::load(dir.path().join("termbot-state.json")).unwrap();
+        let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
+        let (delivery_ack_tx, _ack_rx) = mpsc::channel::<DeliveryAck>(16);
+        let mut app = App::new(&config, store, state_tx, delivery_ack_tx).unwrap();
+
+        let mut sub = app.subscribe_stream();
+        app.emit_startup_gap_banners();
+
+        // Should NOT receive any GapBanner.
+        let result = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await;
+        assert!(result.is_err(), "no GapBanner expected for clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn restart_banner_gate_no_fire_on_small_gap() {
+        let dir = tempdir().unwrap();
+
+        // last_seen_wall only 10s ago — below 30s threshold.
+        let recent = Utc::now() - chrono::Duration::seconds(10);
+        let state = serde_json::json!({
+            "schema_version": 1,
+            "telegram": { "offset": 0 },
+            "chats": { "telegram": [111i64], "slack": [] },
+            "last_seen_wall": recent.to_rfc3339(),
+            "last_clean_shutdown": false
+        });
+        std::fs::write(dir.path().join("termbot-state.json"), state.to_string()).unwrap();
+
+        let config = make_test_config(dir.path());
+        let store = StateStore::load(dir.path().join("termbot-state.json")).unwrap();
+        let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
+        let (delivery_ack_tx, _ack_rx) = mpsc::channel::<DeliveryAck>(16);
+        let mut app = App::new(&config, store, state_tx, delivery_ack_tx).unwrap();
+
+        let mut sub = app.subscribe_stream();
+        app.emit_startup_gap_banners();
+
+        let result = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await;
+        assert!(result.is_err(), "no GapBanner expected for gap < 30s");
+    }
+
+    #[tokio::test]
+    async fn record_delivery_ack_resolves_pending() {
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx, _ack_rx) = make_app(dir.path());
+
+        let (tx, rx) = oneshot::channel::<()>();
+        app.pending_banner_acks
+            .insert("chat123".to_string(), tx);
+
+        app.record_delivery_ack(DeliveryAck::BannerSent {
+            chat_id: "chat123".to_string(),
+        })
+        .await;
+
+        // The oneshot should now be resolved.
+        assert!(
+            rx.await.is_ok(),
+            "oneshot should be resolved after record_delivery_ack"
+        );
+        assert!(
+            app.pending_banner_acks.is_empty(),
+            "pending_banner_acks should be cleared"
+        );
+    }
+
+    #[test]
+    fn consume_gap_prefix_returns_and_clears() {
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx, _ack_rx) = {
+            let config = make_test_config(dir.path());
+            let store =
+                StateStore::load(dir.path().join("termbot-state.json")).expect("load state");
+            let (state_tx, state_rx) = mpsc::channel::<StateUpdate>(64);
+            let (delivery_ack_tx, delivery_ack_rx) = mpsc::channel::<DeliveryAck>(16);
+            let app = App::new(&config, store, state_tx, delivery_ack_tx).expect("App::new");
+            (app, state_rx, delivery_ack_rx)
+        };
+
+        let now = Utc::now();
+        app.gap_prefix.insert(
+            "chat42".to_string(),
+            GapInfo {
+                gap: Duration::from_secs(90),
+                paused_at: now - chrono::Duration::seconds(90),
+                resumed_at: now,
+            },
+        );
+
+        let prefix = app.consume_gap_prefix("chat42");
+        assert!(prefix.is_some(), "should return the gap info");
+        assert_eq!(prefix.unwrap().gap, Duration::from_secs(90));
+        // Second call: cleared.
+        assert!(app.consume_gap_prefix("chat42").is_none());
     }
 }

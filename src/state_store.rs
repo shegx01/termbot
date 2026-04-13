@@ -67,6 +67,9 @@ pub enum StateUpdate {
     MarkDirty,
     /// Update last_seen_wall to now (UTC).
     Tick,
+    /// Explicitly set last_clean_shutdown to the given value.
+    /// Used by `App::mark_clean_shutdown()` on graceful shutdown.
+    SetCleanShutdown(bool),
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -171,6 +174,9 @@ impl StateStore {
             }
             StateUpdate::Tick => {
                 self.state.last_seen_wall = Some(Utc::now());
+            }
+            StateUpdate::SetCleanShutdown(val) => {
+                self.state.last_clean_shutdown = val;
             }
         }
     }

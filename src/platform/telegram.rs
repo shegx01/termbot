@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -15,6 +15,7 @@ use uuid::Uuid;
 use super::{
     Attachment, ChatPlatform, IncomingMessage, PlatformMessageId, PlatformType, ReplyContext,
 };
+use crate::state_store::StateUpdate;
 
 /// Compute exponential backoff delay in seconds for polling retries.
 /// Starts at 5s, doubles each consecutive failure, capped at 60s.
@@ -33,6 +34,12 @@ pub struct TelegramAdapter {
     rate_limit_ms: u64,
     #[allow(dead_code)]
     last_edit: Arc<tokio::sync::Mutex<Option<Instant>>>,
+    /// Telegram getUpdates offset to seed on startup (loaded from persisted state).
+    initial_offset: Arc<AtomicI64>,
+    /// Watch channel sender: `true` = polling paused, `false` = polling active.
+    pause_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Receiver clone stored so `start()` can move one into the polling task.
+    pause_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl TelegramAdapter {
@@ -42,13 +49,36 @@ impl TelegramAdapter {
             .build()
             .expect("Failed to build reqwest client");
         let bot = teloxide::Bot::with_client(token, client);
+        let (pause_tx, pause_rx) = tokio::sync::watch::channel(false);
         Self {
             bot,
             authorized_user_id,
             connected: Arc::new(AtomicBool::new(false)),
             rate_limit_ms,
             last_edit: Arc::new(tokio::sync::Mutex::new(None)),
+            initial_offset: Arc::new(AtomicI64::new(0)),
+            pause_tx: Arc::new(pause_tx),
+            pause_rx,
         }
+    }
+
+    /// Seed the initial polling offset from persisted state.
+    /// Must be called before `start()`.
+    pub fn with_initial_offset(self, offset: i64) -> Self {
+        self.initial_offset.store(offset, Ordering::SeqCst);
+        self
+    }
+
+    /// Pause the polling loop (level-triggered via watch channel).
+    /// Safe to call from any thread / task.
+    pub fn pause_polling(&self) {
+        let _ = self.pause_tx.send(true);
+    }
+
+    /// Resume the polling loop.
+    /// Safe to call from any thread / task.
+    pub fn resume_polling(&self) {
+        let _ = self.pause_tx.send(false);
     }
 
     fn parse_chat_id(chat_id: &str) -> Result<i64> {
@@ -56,14 +86,20 @@ impl TelegramAdapter {
             .parse::<i64>()
             .map_err(|_| anyhow!("Invalid chat_id: {}", chat_id))
     }
-}
 
-#[async_trait]
-impl ChatPlatform for TelegramAdapter {
-    async fn start(&self, cmd_tx: mpsc::Sender<IncomingMessage>) -> Result<()> {
+    /// Start polling, injecting a state update sender so the adapter can persist
+    /// the Telegram offset after each successful batch.  This is a concrete-type
+    /// extension method — it does not change the `ChatPlatform` trait signature.
+    pub async fn start_with_state(
+        &self,
+        cmd_tx: mpsc::Sender<IncomingMessage>,
+        state_tx: mpsc::Sender<StateUpdate>,
+    ) -> Result<()> {
         let authorized_user_id = self.authorized_user_id;
         let connected = Arc::clone(&self.connected);
         let bot = self.bot.clone();
+        let initial_offset = Arc::clone(&self.initial_offset);
+        let mut pause_rx = self.pause_rx.clone();
 
         tokio::spawn(async move {
             // Delete any existing webhook so long-polling works
@@ -79,10 +115,20 @@ impl ChatPlatform for TelegramAdapter {
                 authorized_user_id
             );
 
-            let mut offset: i32 = 0;
+            let mut offset: i32 = initial_offset.load(Ordering::SeqCst) as i32;
             let mut consecutive_failures: u32 = 0;
 
             loop {
+                // Pause gate — block until unpaused (level-triggered watch channel).
+                while *pause_rx.borrow() {
+                    tracing::debug!("Telegram: polling paused — waiting for resume");
+                    if pause_rx.changed().await.is_err() {
+                        // Sender dropped — shutdown
+                        connected.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
+
                 let updates = bot
                     .get_updates()
                     .offset(offset)
@@ -311,6 +357,13 @@ impl ChatPlatform for TelegramAdapter {
                     }
                 }
 
+                // Persist the offset after each successful batch that advanced it.
+                // Non-blocking: if the receiver is gone (App shut down) we just skip.
+                if offset > 0 {
+                    let _ = state_tx
+                        .try_send(StateUpdate::TelegramOffset(offset as i64));
+                }
+
                 if cmd_tx.is_closed() {
                     tracing::info!("Telegram: command channel closed, stopping");
                     break;
@@ -322,6 +375,17 @@ impl ChatPlatform for TelegramAdapter {
         });
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl ChatPlatform for TelegramAdapter {
+    /// Start long-polling without state persistence.  Callers that need
+    /// offset persistence should use `start_with_state` instead.
+    async fn start(&self, cmd_tx: mpsc::Sender<IncomingMessage>) -> Result<()> {
+        // Use a throw-away channel; offset updates are silently discarded.
+        let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(1);
+        self.start_with_state(cmd_tx, state_tx).await
     }
 
     async fn send_message(
@@ -473,5 +537,39 @@ mod tests {
     fn backoff_u32_max_does_not_overflow() {
         let result = polling_backoff_secs(u32::MAX);
         assert_eq!(result, 60);
+    }
+
+    #[test]
+    fn with_initial_offset_stores_value() {
+        let adapter = TelegramAdapter::new("token".to_string(), 12345, 2000)
+            .with_initial_offset(42);
+        assert_eq!(adapter.initial_offset.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn with_initial_offset_default_is_zero() {
+        let adapter = TelegramAdapter::new("token".to_string(), 12345, 2000);
+        assert_eq!(adapter.initial_offset.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pause_resume_no_panic() {
+        let adapter = TelegramAdapter::new("token".to_string(), 12345, 2000);
+        // Initially not paused
+        assert!(!*adapter.pause_rx.borrow());
+        adapter.pause_polling();
+        assert!(*adapter.pause_rx.borrow());
+        adapter.resume_polling();
+        assert!(!*adapter.pause_rx.borrow());
+        // Multiple resume calls are safe
+        adapter.resume_polling();
+        adapter.resume_polling();
+        assert!(!*adapter.pause_rx.borrow());
+        // Interleaved pause/resume
+        adapter.pause_polling();
+        adapter.pause_polling(); // idempotent
+        assert!(*adapter.pause_rx.borrow());
+        adapter.resume_polling();
+        assert!(!*adapter.pause_rx.borrow());
     }
 }
