@@ -4,6 +4,7 @@ mod command;
 mod config;
 mod harness;
 mod platform;
+mod power;
 mod session;
 mod state_store;
 mod tmux;
