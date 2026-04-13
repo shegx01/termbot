@@ -4,7 +4,9 @@
 //! Platform implementations (macOS, Linux) are added in Step 3.
 
 pub mod fake;
+pub mod gap_detector;
 pub mod policy;
+pub mod supervisor;
 pub mod types;
 
 #[cfg(target_os = "macos")]
