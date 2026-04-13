@@ -521,6 +521,14 @@ impl ChatPlatform for TelegramAdapter {
     fn platform_type(&self) -> PlatformType {
         PlatformType::Telegram
     }
+
+    async fn pause(&self) {
+        self.pause_polling();
+    }
+
+    async fn resume(&self) {
+        self.resume_polling();
+    }
 }
 
 #[cfg(test)]

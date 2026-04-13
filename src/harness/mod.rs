@@ -248,6 +248,7 @@ async fn send_reply(
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
         PlatformType::Slack => slack,
+        PlatformType::Discord => None, // Discord adapter not yet wired into harness
     };
     if let Some(p) = platform {
         if let Err(e) = p
@@ -279,6 +280,7 @@ async fn send_photo_reply(
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
         PlatformType::Slack => slack,
+        PlatformType::Discord => None,
     };
     if let Some(p) = platform {
         if let Err(e) = p
@@ -307,6 +309,7 @@ async fn send_document_reply(
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
         PlatformType::Slack => slack,
+        PlatformType::Discord => None,
     };
     if let Some(p) = platform {
         if let Err(e) = p

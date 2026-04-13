@@ -81,8 +81,6 @@ async fn main() -> Result<()> {
             app.pending_banner_acks_handle(),
             app.gap_prefix_handle(),
         );
-        // Give App a handle to the concrete adapter for pause/resume.
-        app.set_telegram_adapter(Arc::clone(&adapter));
         tracing::info!(
             "Telegram adapter started (user_id={}, initial_offset={})",
             tg_user_id,
