@@ -896,6 +896,7 @@ impl App {
                     ctx,
                     self.telegram.as_deref(),
                     self.slack.as_deref(),
+                    self.discord.as_deref(),
                 )
                 .await;
                 if let Some(sid) = session_id {
@@ -917,7 +918,7 @@ impl App {
         let platform: Option<&dyn ChatPlatform> = match ctx.platform {
             PlatformType::Telegram => self.telegram.as_deref(),
             PlatformType::Slack => self.slack.as_deref(),
-            PlatformType::Discord => None, // Discord adapter not yet wired
+            PlatformType::Discord => self.discord.as_deref(),
         };
         if let Some(p) = platform {
             if let Err(e) = p

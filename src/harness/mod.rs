@@ -117,6 +117,7 @@ pub async fn drive_harness(
     ctx: &ReplyContext,
     telegram: Option<&dyn ChatPlatform>,
     slack: Option<&dyn ChatPlatform>,
+    discord: Option<&dyn ChatPlatform>,
 ) -> (bool, Option<String>) {
     let mut tool_lines: Vec<String> = Vec::new();
     let mut last_tool_flush = tokio::time::Instant::now();
@@ -154,7 +155,7 @@ pub async fn drive_harness(
                         }
                         consecutive_count = 0;
                     }
-                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
+                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack, discord).await;
                     tool_lines.clear();
                     last_tool_flush = tokio::time::Instant::now();
                 }
@@ -169,13 +170,13 @@ pub async fn drive_harness(
                         }
                         consecutive_count = 0;
                     }
-                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
+                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack, discord).await;
                     tool_lines.clear();
                     last_tool_name = None;
                 }
                 if !text.is_empty() {
                     for chunk in split_message(&text, 4000) {
-                        send_reply(ctx, &chunk, telegram, slack).await;
+                        send_reply(ctx, &chunk, telegram, slack, discord).await;
                     }
                 }
             }
@@ -186,7 +187,7 @@ pub async fn drive_harness(
                             *last = format!("{} (+{} more)", last, consecutive_count);
                         }
                     }
-                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
+                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack, discord).await;
                 }
                 got_any_output = true;
                 if !session_id.is_empty() {
@@ -208,15 +209,15 @@ pub async fn drive_harness(
                         }
                         consecutive_count = 0;
                     }
-                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
+                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack, discord).await;
                     tool_lines.clear();
                     last_tool_name = None;
                 }
                 // Route images to send_photo (native preview), documents to send_document
                 if media_type.starts_with("image/") {
-                    send_photo_reply(ctx, &data, filename, None, telegram, slack).await;
+                    send_photo_reply(ctx, &data, filename, None, telegram, slack, discord).await;
                 } else {
-                    send_document_reply(ctx, &data, filename, None, telegram, slack).await;
+                    send_document_reply(ctx, &data, filename, None, telegram, slack, discord).await;
                 }
             }
             HarnessEvent::Error(e) => {
@@ -226,9 +227,9 @@ pub async fn drive_harness(
                             *last = format!("{} (+{} more)", last, consecutive_count);
                         }
                     }
-                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
+                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack, discord).await;
                 }
-                send_error(ctx, &e, telegram, slack).await;
+                send_error(ctx, &e, telegram, slack, discord).await;
                 got_any_output = true;
                 break;
             }
@@ -243,12 +244,13 @@ async fn send_reply(
     text: &str,
     telegram: Option<&dyn ChatPlatform>,
     slack: Option<&dyn ChatPlatform>,
+    discord: Option<&dyn ChatPlatform>,
 ) {
     use crate::chat_adapters::PlatformType;
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
         PlatformType::Slack => slack,
-        PlatformType::Discord => None, // Discord adapter not yet wired into harness
+        PlatformType::Discord => discord,
     };
     if let Some(p) = platform {
         if let Err(e) = p
@@ -265,8 +267,9 @@ async fn send_error(
     error: &str,
     telegram: Option<&dyn ChatPlatform>,
     slack: Option<&dyn ChatPlatform>,
+    discord: Option<&dyn ChatPlatform>,
 ) {
-    send_reply(ctx, &format!("Error: {}", error), telegram, slack).await;
+    send_reply(ctx, &format!("Error: {}", error), telegram, slack, discord).await;
 }
 
 async fn send_photo_reply(
@@ -276,11 +279,12 @@ async fn send_photo_reply(
     caption: Option<&str>,
     telegram: Option<&dyn ChatPlatform>,
     slack: Option<&dyn ChatPlatform>,
+    discord: Option<&dyn ChatPlatform>,
 ) {
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
         PlatformType::Slack => slack,
-        PlatformType::Discord => None,
+        PlatformType::Discord => discord,
     };
     if let Some(p) = platform {
         if let Err(e) = p
@@ -305,11 +309,12 @@ async fn send_document_reply(
     caption: Option<&str>,
     telegram: Option<&dyn ChatPlatform>,
     slack: Option<&dyn ChatPlatform>,
+    discord: Option<&dyn ChatPlatform>,
 ) {
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
         PlatformType::Slack => slack,
-        PlatformType::Discord => None,
+        PlatformType::Discord => discord,
     };
     if let Some(p) = platform {
         if let Err(e) = p
