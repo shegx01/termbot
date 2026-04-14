@@ -1,5 +1,6 @@
 use super::{Harness, HarnessEvent, HarnessKind};
 use crate::chat_adapters::Attachment;
+use crate::command::HarnessOptions;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
@@ -24,6 +25,7 @@ impl Harness for CodexHarness {
         _attachments: &[Attachment],
         _cwd: &Path,
         _session_id: Option<&str>,
+        _options: &HarnessOptions,
     ) -> Result<mpsc::Receiver<HarnessEvent>> {
         Err(anyhow::anyhow!("Codex harness not yet implemented"))
     }

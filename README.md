@@ -107,6 +107,14 @@ Show me the test gaps.           # still the same session
 : claude off                     # back to terminal
 ```
 
+**Claude mode with options** -- customize model, effort, context:
+
+```
+: claude on --model sonnet --effort high
+: claude on --add-dir ../shared-lib
+: claude on -m opus -n 10 --add-dir ../api
+```
+
 **Image support** -- send photos to Claude directly from chat:
 
 ```
@@ -328,6 +336,7 @@ Session names can contain letters, numbers, hyphens, and underscores (max 64 cha
 |---------|-------------|
 | `: claude <prompt>` | One-shot prompt with structured response |
 | `: claude on` | Enter interactive Claude mode |
+| `: claude on [options]` | Enter Claude mode with CLI options (see below) |
 | `: claude off` | Exit Claude mode, back to terminal |
 
 In Claude mode, plain text goes to Claude instead of the terminal. Multi-turn -- each message continues the same conversation.
@@ -335,6 +344,35 @@ In Claude mode, plain text goes to Claude instead of the terminal. Multi-turn --
 You can also send images (photos, screenshots, diagrams) in Claude mode. Attach a photo with an optional caption and Claude will see it. Photo-only messages default to "What is in this image?".
 
 Uses your **Claude subscription** (Pro/Max), not API credits.
+
+#### Claude mode options
+
+Options passed to `: claude on` persist for the entire session (until `: claude off`):
+
+| Option | Short | What it does |
+|--------|-------|-------------|
+| `--model <name>` | `-m` | Model override (e.g. `sonnet`, `opus`) |
+| `--effort <level>` | `-e` | Thinking effort: `low`, `medium`, `high`, `max` |
+| `--system-prompt <text>` | | Replace the default system prompt |
+| `--append-system-prompt <text>` | | Append to the default system prompt |
+| `--add-dir <path>` | `-d` | Add a directory for context (repeatable) |
+| `--max-turns <n>` | `-n` | Limit agentic turns per prompt |
+| `--settings <path>` | | Path to a Claude Code settings file or inline JSON |
+| `--mcp-config <path>` | | Path to an MCP server config file |
+
+Quote values that contain spaces: `--system-prompt "You are a Rust expert"` or `--system-prompt 'Be concise'`. Smart/curly quotes from mobile keyboards are normalized automatically.
+
+Paths (`--add-dir`, `--mcp-config`, `--settings`) are relative to termbot's working directory, not the terminal session's. Use absolute paths when in doubt.
+
+Examples:
+
+```
+: claude on --model sonnet                          # use Sonnet model
+: claude on --effort high --add-dir ../shared-lib   # deeper thinking + extra context
+: claude on -m opus -n 10                           # Opus model, max 10 turns per prompt
+: claude on --system-prompt "Focus on security"     # custom system prompt
+: claude on --mcp-config ./mcp.json --settings ./s.json
+```
 
 ### Two ways to use Claude
 

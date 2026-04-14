@@ -1,9 +1,11 @@
 use super::{truncate, Harness, HarnessEvent, HarnessKind};
 use crate::chat_adapters::Attachment;
+use crate::command::HarnessOptions;
 use anyhow::Result;
 use async_trait::async_trait;
 use claude_agent_sdk_rust::{
-    query, types::content::ContentBlock, ClaudeAgentOptions, Message, PermissionMode,
+    query, types::content::ContentBlock, types::options::Effort, types::options::SystemPrompt,
+    types::options::SystemPromptPreset, ClaudeAgentOptions, Message, PermissionMode,
 };
 use futures_util::{FutureExt, StreamExt};
 use std::collections::HashMap;
@@ -44,6 +46,7 @@ impl Harness for ClaudeHarness {
         attachments: &[Attachment],
         _cwd: &Path,
         session_id: Option<&str>,
+        options: &HarnessOptions,
     ) -> Result<mpsc::Receiver<HarnessEvent>> {
         let (event_tx, event_rx) = mpsc::channel::<HarnessEvent>(64);
 
@@ -53,14 +56,20 @@ impl Harness for ClaudeHarness {
         let cwd = self.cwd.clone();
         let resume_session = session_id.map(|s| s.to_string());
         let attachment_paths: Vec<PathBuf> = attachments.iter().map(|a| a.path.clone()).collect();
+        let harness_opts = options.clone();
 
         tokio::spawn(async move {
             // Catch panics so the channel always closes cleanly with an error event
-            let result: std::result::Result<(), Box<dyn std::any::Any + Send>> = AssertUnwindSafe(
-                run_claude_prompt_inner(full_prompt, cwd, resume_session, event_tx.clone()),
-            )
-            .catch_unwind()
-            .await;
+            let result: std::result::Result<(), Box<dyn std::any::Any + Send>> =
+                AssertUnwindSafe(run_claude_prompt_inner(
+                    full_prompt,
+                    cwd,
+                    resume_session,
+                    event_tx.clone(),
+                    harness_opts,
+                ))
+                .catch_unwind()
+                .await;
 
             match result {
                 Ok(()) => {} // events already sent
@@ -103,6 +112,7 @@ async fn run_claude_prompt_inner(
     cwd: PathBuf,
     resume_session: Option<String>,
     event_tx: mpsc::Sender<HarnessEvent>,
+    harness_opts: HarnessOptions,
 ) {
     let mut options = ClaudeAgentOptions::default();
     let prompt_start = std::time::SystemTime::now();
@@ -123,6 +133,50 @@ async fn run_claude_prompt_inner(
 
     if let Some(sid) = resume_session {
         options.resume = Some(sid);
+    }
+
+    // Apply user-supplied harness options
+    if let Some(ref model) = harness_opts.model {
+        options.model = Some(model.clone());
+    }
+    if let Some(ref effort_str) = harness_opts.effort {
+        options.effort = match effort_str.as_str() {
+            "low" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            "max" => Some(Effort::Max),
+            _ => None,
+        };
+    }
+    // System prompt handling: --system-prompt replaces, --append-system-prompt
+    // appends to the default Claude Code preset. If both are set, --system-prompt
+    // takes precedence (append is ignored — can't append to a replaced prompt).
+    if let Some(ref sp) = harness_opts.system_prompt {
+        options.system_prompt = Some(SystemPrompt::Text(sp.clone()));
+    } else if let Some(ref asp) = harness_opts.append_system_prompt {
+        // Use the SDK's Preset mechanism so the default Claude Code system prompt
+        // is preserved and the user's text is appended to it.
+        options.system_prompt = Some(SystemPrompt::Preset(SystemPromptPreset {
+            preset_type: "preset".to_string(),
+            preset: "claude_code".to_string(),
+            append: Some(asp.clone()),
+        }));
+    }
+    if !harness_opts.add_dirs.is_empty() {
+        options.add_dirs = harness_opts.add_dirs.clone();
+    }
+    if let Some(n) = harness_opts.max_turns {
+        options.max_turns = Some(n);
+    }
+    if let Some(ref s) = harness_opts.settings {
+        options.settings = Some(s.clone());
+    }
+    if let Some(ref mcp_path) = harness_opts.mcp_config {
+        // Load MCP config from the specified file path via extra_args
+        options.extra_args.insert(
+            "mcp-config".to_string(),
+            Some(mcp_path.to_string_lossy().to_string()),
+        );
     }
 
     let stream = match tokio::time::timeout(

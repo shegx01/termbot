@@ -1,7 +1,86 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use regex::Regex;
 
 use crate::harness::HarnessKind;
+use crate::tmux::normalize_quotes;
+
+/// CLI-style options that can be passed with `: claude on [options]`.
+///
+/// These options persist for the duration of the harness session (until
+/// `: claude off`) and are applied to every prompt sent in that session.
+///
+/// Only options that make sense for subscription-based Claude Code are
+/// included — billing options like `--max-budget-usd` are intentionally
+/// omitted.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HarnessOptions {
+    /// Model override (e.g. "sonnet", "opus").
+    pub model: Option<String>,
+    /// Thinking effort level: low, medium, high, max.
+    pub effort: Option<String>,
+    /// Custom system prompt (replaces default).
+    pub system_prompt: Option<String>,
+    /// Text appended to the default system prompt.
+    pub append_system_prompt: Option<String>,
+    /// Additional directories for context.
+    pub add_dirs: Vec<PathBuf>,
+    /// Maximum agentic turns per prompt.
+    pub max_turns: Option<u32>,
+    /// Path to a Claude Code settings file or inline JSON.
+    pub settings: Option<String>,
+    /// Path to an MCP server config file.
+    pub mcp_config: Option<PathBuf>,
+}
+
+impl HarnessOptions {
+    /// Returns true if no options were set.
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.effort.is_none()
+            && self.system_prompt.is_none()
+            && self.append_system_prompt.is_none()
+            && self.add_dirs.is_empty()
+            && self.max_turns.is_none()
+            && self.settings.is_none()
+            && self.mcp_config.is_none()
+    }
+
+    /// Build a human-readable summary of active options for the ON confirmation message.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(ref m) = self.model {
+            parts.push(format!("model={}", m));
+        }
+        if let Some(ref e) = self.effort {
+            parts.push(format!("effort={}", e));
+        }
+        if let Some(ref sp) = self.system_prompt {
+            let preview: String = sp.chars().take(30).collect();
+            let suffix = if sp.chars().count() > 30 { "..." } else { "" };
+            parts.push(format!("system-prompt=\"{}{}\"", preview, suffix));
+        }
+        if let Some(ref asp) = self.append_system_prompt {
+            let preview: String = asp.chars().take(30).collect();
+            let suffix = if asp.chars().count() > 30 { "..." } else { "" };
+            parts.push(format!("append-system-prompt=\"{}{}\"", preview, suffix));
+        }
+        for d in &self.add_dirs {
+            parts.push(format!("add-dir={}", d.display()));
+        }
+        if let Some(n) = self.max_turns {
+            parts.push(format!("max-turns={}", n));
+        }
+        if let Some(ref s) = self.settings {
+            parts.push(format!("settings={}", s));
+        }
+        if let Some(ref m) = self.mcp_config {
+            parts.push(format!("mcp-config={}", m.display()));
+        }
+        parts.join(", ")
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum ParsedCommand {
@@ -26,6 +105,7 @@ pub enum ParsedCommand {
     /// Enter interactive harness mode — plain text routes to the harness
     HarnessOn {
         harness: HarnessKind,
+        options: HarnessOptions,
     },
     /// Exit interactive harness mode — plain text routes back to tmux
     HarnessOff {
@@ -51,6 +131,8 @@ pub enum ParseError {
     SessionNameTooLong,
     #[error("Multi-line input is not supported — send one command at a time")]
     MultiLineNotAllowed,
+    #[error("Invalid harness option: {0}")]
+    InvalidHarnessOption(String),
 }
 
 const MAX_SESSION_NAME_LEN: usize = 64;
@@ -124,7 +206,18 @@ impl ParsedCommand {
             if let Some(kind) = HarnessKind::from_str(first_word) {
                 let after_harness = rest[first_word.len()..].trim();
                 if after_harness == "on" {
-                    return Ok(ParsedCommand::HarnessOn { harness: kind });
+                    return Ok(ParsedCommand::HarnessOn {
+                        harness: kind,
+                        options: HarnessOptions::default(),
+                    });
+                }
+                // `: claude on --model sonnet --add-dir ../lib`
+                if let Some(on_args) = after_harness.strip_prefix("on ") {
+                    let options = parse_harness_options(on_args.trim())?;
+                    return Ok(ParsedCommand::HarnessOn {
+                        harness: kind,
+                        options,
+                    });
                 }
                 if after_harness == "off" {
                     return Ok(ParsedCommand::HarnessOff { harness: kind });
@@ -166,6 +259,189 @@ impl ParsedCommand {
             })
         }
     }
+}
+
+/// Parse CLI-style options from the text after `on `.
+///
+/// Supported flags:
+///   --model <name>                  Model override
+///   --effort <low|medium|high|max>  Thinking effort level
+///   --system-prompt <text>          Replace default system prompt
+///   --append-system-prompt <text>   Append to default system prompt
+///   --add-dir <path>                Additional context directory (repeatable)
+///   --max-turns <n>                 Maximum agentic turns per prompt
+///   --settings <path|json>          Claude Code settings file or inline JSON
+///   --mcp-config <path>             MCP server config file
+fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, ParseError> {
+    let mut opts = HarnessOptions::default();
+    // Normalize smart/curly quotes from mobile keyboards before tokenizing
+    let normalized = normalize_quotes(input);
+    let tokens = shell_tokenize(&normalized);
+    let mut i = 0;
+
+    while i < tokens.len() {
+        // Support --flag=value syntax: split on first '=' if present
+        let (flag, eq_value) = if tokens[i].starts_with("--") {
+            if let Some(idx) = tokens[i].find('=') {
+                (&tokens[i][..idx], Some(tokens[i][idx + 1..].to_string()))
+            } else {
+                (tokens[i].as_str(), None)
+            }
+        } else {
+            (tokens[i].as_str(), None)
+        };
+        // Macro-like helper: use =value if present, otherwise consume next token
+        macro_rules! get_value {
+            () => {
+                match eq_value {
+                    Some(ref v) if !v.is_empty() => v.clone(),
+                    Some(_) => {
+                        return Err(ParseError::InvalidHarnessOption(format!(
+                            "{}= requires a value",
+                            flag
+                        )));
+                    }
+                    None => take_value(&tokens, &mut i, flag)?,
+                }
+            };
+        }
+        match flag {
+            "--model" | "-m" => {
+                let val = get_value!();
+                opts.model = Some(val);
+            }
+            "--effort" | "-e" => {
+                let val = get_value!();
+                match val.to_lowercase().as_str() {
+                    "low" | "medium" | "high" | "max" => {
+                        opts.effort = Some(val.to_lowercase());
+                    }
+                    _ => {
+                        return Err(ParseError::InvalidHarnessOption(format!(
+                            "Invalid effort level '{}' — expected low, medium, high, or max",
+                            val
+                        )));
+                    }
+                }
+            }
+            "--system-prompt" => {
+                let val = get_value!();
+                opts.system_prompt = Some(val);
+            }
+            "--append-system-prompt" => {
+                let val = get_value!();
+                opts.append_system_prompt = Some(val);
+            }
+            "--add-dir" | "-d" => {
+                let val = get_value!();
+                opts.add_dirs.push(PathBuf::from(val));
+            }
+            "--max-turns" | "-n" => {
+                let val = get_value!();
+                let n: u32 = val.parse().map_err(|_| {
+                    ParseError::InvalidHarnessOption(format!(
+                        "Invalid --max-turns value '{}' — expected a positive integer",
+                        val
+                    ))
+                })?;
+                if n == 0 {
+                    return Err(ParseError::InvalidHarnessOption(
+                        "--max-turns must be at least 1".to_string(),
+                    ));
+                }
+                opts.max_turns = Some(n);
+            }
+            "--settings" => {
+                let val = get_value!();
+                opts.settings = Some(val);
+            }
+            "--mcp-config" => {
+                let val = get_value!();
+                opts.mcp_config = Some(PathBuf::from(val));
+            }
+            other => {
+                // Better error for short-flag=value syntax (e.g. `-m=opus`)
+                if other.starts_with('-') && other.contains('=') {
+                    let key = other.split('=').next().unwrap_or(other);
+                    return Err(ParseError::InvalidHarnessOption(format!(
+                        "'=' syntax is only supported with long flags (use '{} value' instead of '{}')",
+                        key, other
+                    )));
+                }
+                return Err(ParseError::InvalidHarnessOption(format!(
+                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config",
+                    other
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    // Reject mutually exclusive options
+    if opts.system_prompt.is_some() && opts.append_system_prompt.is_some() {
+        return Err(ParseError::InvalidHarnessOption(
+            "Cannot use both --system-prompt and --append-system-prompt".to_string(),
+        ));
+    }
+
+    Ok(opts)
+}
+
+/// Extract the value after a flag, advancing the index.
+/// Rejects another flag (starts with `-`) as a value to catch cases like
+/// `--model --effort high` where the user forgot to provide the model name.
+fn take_value(
+    tokens: &[String],
+    i: &mut usize,
+    flag: &str,
+) -> std::result::Result<String, ParseError> {
+    if *i + 1 >= tokens.len() {
+        return Err(ParseError::InvalidHarnessOption(format!(
+            "{} requires a value",
+            flag
+        )));
+    }
+    let next = &tokens[*i + 1];
+    if next.starts_with('-') && next.len() > 1 {
+        return Err(ParseError::InvalidHarnessOption(format!(
+            "{} requires a value, but got '{}' (another flag?)",
+            flag, next
+        )));
+    }
+    *i += 1;
+    Ok(tokens[*i].clone())
+}
+
+/// Simple shell-like tokenizer that respects double and single quotes.
+/// Does not handle escapes inside quotes — good enough for chat input.
+fn shell_tokenize(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for ch in input.chars() {
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+            }
+            ' ' | '\t' if !in_single && !in_double => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 pub struct CommandBlocklist {
@@ -446,6 +722,7 @@ mod tests {
             ParsedCommand::parse(": claude on", ':').unwrap(),
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
+                options: HarnessOptions::default(),
             }
         );
     }
@@ -476,6 +753,7 @@ mod tests {
             ParsedCommand::parse(": gemini on", ':').unwrap(),
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Gemini,
+                options: HarnessOptions::default(),
             }
         );
     }
@@ -660,5 +938,425 @@ mod tests {
         let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
         assert!(bl.is_blocked("su\0do reboot")); // null stripped -> "sudo reboot"
         assert!(bl.is_blocked("sudo\r reboot")); // \r stripped -> "sudo reboot"
+    }
+
+    // ── Harness options parsing ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_claude_on_with_model() {
+        let cmd = ParsedCommand::parse(": claude on --model sonnet", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    model: Some("sonnet".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_with_short_model_flag() {
+        let cmd = ParsedCommand::parse(": claude on -m opus", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    model: Some("opus".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_with_effort() {
+        let cmd = ParsedCommand::parse(": claude on --effort high", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    effort: Some("high".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_invalid_effort_rejected() {
+        let err = ParsedCommand::parse(": claude on --effort turbo", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("turbo"));
+    }
+
+    #[test]
+    fn parse_claude_on_with_add_dir() {
+        let cmd = ParsedCommand::parse(": claude on --add-dir ../lib", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    add_dirs: vec![PathBuf::from("../lib")],
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_with_multiple_add_dirs() {
+        let cmd =
+            ParsedCommand::parse(": claude on --add-dir ../lib --add-dir ../shared", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    add_dirs: vec![PathBuf::from("../lib"), PathBuf::from("../shared")],
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_with_max_turns() {
+        let cmd = ParsedCommand::parse(": claude on -n 5", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    max_turns: Some(5),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_invalid_max_turns_rejected() {
+        let err = ParsedCommand::parse(": claude on --max-turns abc", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+    }
+
+    #[test]
+    fn parse_claude_on_with_system_prompt() {
+        let cmd =
+            ParsedCommand::parse(": claude on --system-prompt \"You are a Rust expert\"", ':')
+                .unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    system_prompt: Some("You are a Rust expert".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_with_multiple_options() {
+        let cmd = ParsedCommand::parse(
+            ": claude on --model sonnet --effort high --add-dir ../lib -n 10",
+            ':',
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    model: Some("sonnet".into()),
+                    effort: Some("high".into()),
+                    add_dirs: vec![PathBuf::from("../lib")],
+                    max_turns: Some(10),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_unknown_option_rejected() {
+        let err = ParsedCommand::parse(": claude on --max-budget-usd 5", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("Unknown option"));
+    }
+
+    #[test]
+    fn parse_claude_on_missing_value_rejected() {
+        let err = ParsedCommand::parse(": claude on --model", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("requires a value"));
+    }
+
+    #[test]
+    fn parse_claude_on_with_settings() {
+        let cmd = ParsedCommand::parse(": claude on --settings ./settings.json", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    settings: Some("./settings.json".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_with_mcp_config() {
+        let cmd = ParsedCommand::parse(": claude on --mcp-config ./mcp.json", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    mcp_config: Some(PathBuf::from("./mcp.json")),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_with_append_system_prompt() {
+        let cmd = ParsedCommand::parse(
+            ": claude on --append-system-prompt 'Always use TypeScript'",
+            ':',
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    append_system_prompt: Some("Always use TypeScript".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    // ── shell_tokenize ──────────────────────────────────────────────────────
+
+    #[test]
+    fn shell_tokenize_simple_words() {
+        assert_eq!(shell_tokenize("--model sonnet"), vec!["--model", "sonnet"]);
+    }
+
+    #[test]
+    fn shell_tokenize_double_quoted_string() {
+        assert_eq!(
+            shell_tokenize("--system-prompt \"You are a Rust expert\""),
+            vec!["--system-prompt", "You are a Rust expert"]
+        );
+    }
+
+    #[test]
+    fn shell_tokenize_single_quoted_string() {
+        assert_eq!(
+            shell_tokenize("--system-prompt 'Be concise'"),
+            vec!["--system-prompt", "Be concise"]
+        );
+    }
+
+    #[test]
+    fn shell_tokenize_mixed_quoted_and_plain() {
+        assert_eq!(
+            shell_tokenize("--model opus --system-prompt \"Be helpful\" --add-dir ../lib"),
+            vec![
+                "--model",
+                "opus",
+                "--system-prompt",
+                "Be helpful",
+                "--add-dir",
+                "../lib"
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_tokenize_empty_input_returns_empty() {
+        let result: Vec<String> = shell_tokenize("");
+        assert!(result.is_empty());
+    }
+
+    // ── HarnessOptions::summary ─────────────────────────────────────────────
+
+    #[test]
+    fn harness_options_summary_empty() {
+        assert_eq!(HarnessOptions::default().summary(), "");
+    }
+
+    #[test]
+    fn harness_options_summary_model_and_effort() {
+        let opts = HarnessOptions {
+            model: Some("sonnet".into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        };
+        assert_eq!(opts.summary(), "model=sonnet, effort=high");
+    }
+
+    #[test]
+    fn harness_options_is_empty_true_for_default() {
+        assert!(HarnessOptions::default().is_empty());
+    }
+
+    #[test]
+    fn harness_options_is_empty_false_when_model_set() {
+        let opts = HarnessOptions {
+            model: Some("sonnet".into()),
+            ..Default::default()
+        };
+        assert!(!opts.is_empty());
+    }
+
+    // ── Round 1 bug-fix tests ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_claude_on_key_equals_value_syntax() {
+        let cmd = ParsedCommand::parse(": claude on --model=sonnet", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    model: Some("sonnet".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_mixed_equals_and_space_syntax() {
+        let cmd = ParsedCommand::parse(": claude on --model=opus --effort high", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    model: Some("opus".into()),
+                    effort: Some("high".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_max_turns_zero_rejected() {
+        let err = ParsedCommand::parse(": claude on --max-turns 0", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("at least 1"));
+    }
+
+    #[test]
+    fn parse_claude_on_smart_quotes_normalized() {
+        // Curly double quotes: \u{201C} and \u{201D}
+        let input = format!(
+            ": claude on --system-prompt {}Be concise{}",
+            '\u{201C}', '\u{201D}'
+        );
+        let cmd = ParsedCommand::parse(&input, ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    system_prompt: Some("Be concise".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_smart_single_quotes_normalized() {
+        // Curly single quotes: \u{2018} and \u{2019}
+        let input = format!(
+            ": claude on --system-prompt {}Be concise{}",
+            '\u{2018}', '\u{2019}'
+        );
+        let cmd = ParsedCommand::parse(&input, ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    system_prompt: Some("Be concise".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn harness_options_summary_truncates_long_system_prompt() {
+        let long_prompt = "a".repeat(50);
+        let opts = HarnessOptions {
+            system_prompt: Some(long_prompt),
+            ..Default::default()
+        };
+        let summary = opts.summary();
+        assert!(summary.contains("..."));
+        // The preview should be exactly 30 chars of 'a'
+        assert!(summary.contains(&"a".repeat(30)));
+    }
+
+    // ── Round 2 bug-fix tests ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_claude_on_empty_equals_value_rejected() {
+        let err = ParsedCommand::parse(": claude on --model=", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("requires a value"));
+    }
+
+    #[test]
+    fn parse_claude_on_short_flag_equals_syntax_rejected_with_hint() {
+        let err = ParsedCommand::parse(": claude on -m=opus", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("long flags"));
+    }
+
+    #[test]
+    fn parse_claude_on_both_system_prompts_rejected() {
+        let err = ParsedCommand::parse(
+            ": claude on --system-prompt \"A\" --append-system-prompt \"B\"",
+            ':',
+        )
+        .unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("Cannot use both"));
+    }
+
+    #[test]
+    fn parse_claude_on_flag_consumed_as_value_rejected() {
+        // User forgot the model name — the next flag shouldn't be consumed as value
+        let err = ParsedCommand::parse(": claude on --model --effort high", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("another flag"));
+    }
+
+    #[test]
+    fn shell_tokenize_unterminated_quote_captures_rest() {
+        // Unterminated quote greedily captures the remainder
+        assert_eq!(
+            shell_tokenize("--system-prompt \"hello world"),
+            vec!["--system-prompt", "hello world"]
+        );
     }
 }

@@ -8,6 +8,7 @@ use std::path::Path;
 use tokio::sync::mpsc;
 
 use crate::chat_adapters::{Attachment, ChatPlatform, PlatformType, ReplyContext};
+use crate::command::HarnessOptions;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HarnessKind {
@@ -71,6 +72,7 @@ pub trait Harness: Send + Sync {
         attachments: &[Attachment],
         cwd: &Path,
         session_id: Option<&str>,
+        options: &HarnessOptions,
     ) -> Result<mpsc::Receiver<HarnessEvent>>;
 
     /// Get stored session ID for multi-turn resume.

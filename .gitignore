@@ -2,3 +2,4 @@
 termbot.toml
 /tmp/termbot-*.out
 .omc/
+.claude/worktrees/
