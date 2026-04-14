@@ -4,12 +4,8 @@ use crate::command::HarnessOptions;
 use anyhow::Result;
 use async_trait::async_trait;
 use claude_agent_sdk_rust::{
-    query,
-    types::content::ContentBlock,
-    types::options::Effort,
-    types::options::SystemPrompt,
-    types::options::SystemPromptPreset,
-    ClaudeAgentOptions, Message, PermissionMode,
+    query, types::content::ContentBlock, types::options::Effort, types::options::SystemPrompt,
+    types::options::SystemPromptPreset, ClaudeAgentOptions, Message, PermissionMode,
 };
 use futures_util::{FutureExt, StreamExt};
 use std::collections::HashMap;
@@ -64,17 +60,16 @@ impl Harness for ClaudeHarness {
 
         tokio::spawn(async move {
             // Catch panics so the channel always closes cleanly with an error event
-            let result: std::result::Result<(), Box<dyn std::any::Any + Send>> = AssertUnwindSafe(
-                run_claude_prompt_inner(
+            let result: std::result::Result<(), Box<dyn std::any::Any + Send>> =
+                AssertUnwindSafe(run_claude_prompt_inner(
                     full_prompt,
                     cwd,
                     resume_session,
                     event_tx.clone(),
                     harness_opts,
-                ),
-            )
-            .catch_unwind()
-            .await;
+                ))
+                .catch_unwind()
+                .await;
 
             match result {
                 Ok(()) => {} // events already sent

@@ -1152,10 +1152,7 @@ mod tests {
 
     #[test]
     fn shell_tokenize_simple_words() {
-        assert_eq!(
-            shell_tokenize("--model sonnet"),
-            vec!["--model", "sonnet"]
-        );
+        assert_eq!(shell_tokenize("--model sonnet"), vec!["--model", "sonnet"]);
     }
 
     #[test]
@@ -1178,7 +1175,14 @@ mod tests {
     fn shell_tokenize_mixed_quoted_and_plain() {
         assert_eq!(
             shell_tokenize("--model opus --system-prompt \"Be helpful\" --add-dir ../lib"),
-            vec!["--model", "opus", "--system-prompt", "Be helpful", "--add-dir", "../lib"]
+            vec![
+                "--model",
+                "opus",
+                "--system-prompt",
+                "Be helpful",
+                "--add-dir",
+                "../lib"
+            ]
         );
     }
 
@@ -1238,8 +1242,7 @@ mod tests {
 
     #[test]
     fn parse_claude_on_mixed_equals_and_space_syntax() {
-        let cmd =
-            ParsedCommand::parse(": claude on --model=opus --effort high", ':').unwrap();
+        let cmd = ParsedCommand::parse(": claude on --model=opus --effort high", ':').unwrap();
         assert_eq!(
             cmd,
             ParsedCommand::HarnessOn {

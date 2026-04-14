@@ -719,8 +719,7 @@ impl App {
                 } else {
                     format!("\nOptions: {}", options.summary())
                 };
-                self.session_mgr
-                    .set_harness(&fg, Some(kind), options);
+                self.session_mgr.set_harness(&fg, Some(kind), options);
                 self.send_reply(
                     &msg.reply_context,
                     &format!(
