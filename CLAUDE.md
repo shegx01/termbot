@@ -1,6 +1,6 @@
 # termbot
 
-Single-user Rust bot that controls tmux terminal sessions from Telegram and Slack. Built on tokio async runtime with `tokio::select!` main loop.
+Single-user Rust bot that controls tmux terminal sessions from Telegram, Slack, and Discord. Built on tokio async runtime with `tokio::select!` main loop.
 
 ## Quick reference
 
@@ -32,11 +32,12 @@ src/
                     watermarks) owned exclusively by App; adapters send updates
                     via mpsc::Sender<StateUpdate>
   claude.rs         Claude Code SDK integration (claude-agent-sdk-rust crate)
-  platform/
+  chat_adapters/
     mod.rs          ChatPlatform trait (async_trait)
     telegram.rs     Telegram adapter (teloxide, long-polling, level-triggered
                     watch-channel pause/resume for banner ordering)
     slack.rs        Slack adapter (Socket Mode via tokio-tungstenite)
+    discord.rs      Discord adapter (serenity gateway, handler-gate pause/resume)
   power/
     mod.rs          PowerManager trait (async_trait) + cfg-gated submod picks
     types.rs        LidState, PowerSource, PowerEvent, PowerSignal
@@ -97,6 +98,11 @@ Cross-platform (macOS + Linux) per the consensus plan:
   `<termbot.toml parent>/termbot-state.json` (or the `power.state_file`
   override). The restart-banner gate requires `last_clean_shutdown == false`
   AND `wall_gap > 30s` so graceful restarts don't trigger spurious banners.
+- **Discord pause** uses a handler-gate rather than a poll-gate. Gateway events
+  arriving during the pause window are discarded, unlike Telegram's server-side
+  update list which queues messages for drain on resume. The pause window is
+  bounded by gap-banner dispatch timing (typically <5s) and the `: ` command
+  protocol is self-recoverable, so this is an accepted v1 tradeoff.
 - Verify the assertion is held with `pmset -g assertions` (macOS) or
   `systemd-inhibit --list` (Linux).
 
@@ -114,7 +120,7 @@ Uses `claude-agent-sdk-rust` crate, not terminal scraping. Claude prompts spawn 
 
 ### Platform adapters
 
-Both implement `ChatPlatform` (async_trait). Auth is single-user: messages from non-authorized user IDs are silently dropped. Telegram uses manual `getUpdates` long-polling (not webhooks). Slack uses Socket Mode WebSocket with auto-reconnect.
+All three implement `ChatPlatform` (async_trait). Auth is single-user: messages from non-authorized user IDs are silently dropped. Telegram uses manual `getUpdates` long-polling (not webhooks). Slack uses Socket Mode WebSocket with auto-reconnect. Discord uses the serenity crate with gateway intents `DIRECT_MESSAGES | GUILD_MESSAGES | MESSAGE_CONTENT` (privileged). Inbound Discord attachments (images/files sent by the user to the bot) are not currently processed -- only `msg.content` text is forwarded to the main loop. Telegram-parity for inbound attachments is a follow-up.
 
 ## Conventions
 
@@ -127,7 +133,7 @@ Both implement `ChatPlatform` (async_trait). Auth is single-user: messages from 
 
 ## Key constraints
 
-- **Single-user only.** Auth checks are per-platform (telegram_user_id, slack_user_id in config).
+- **Single-user only.** Auth checks are per-platform (telegram_user_id, slack_user_id, discord_user_id in config).
 - **tmux must be on PATH.** All session operations shell out to `tmux`.
 - **No shared mutable state.** The main loop owns all mutable state directly; platform adapters only send/receive through channels.
 - **Rate limiting is per-platform.** `edit_throttle_ms` config controls minimum gap between message edits to stay within Telegram/Slack API limits.

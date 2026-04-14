@@ -13,7 +13,7 @@ use chrono::{DateTime, Local, Utc};
 use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::StreamEvent;
-use crate::platform::ChatPlatform;
+use crate::chat_adapters::ChatPlatform;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Shared type aliases
@@ -213,11 +213,16 @@ async fn handle_stream_event(
         }
         StreamEvent::GapBanner {
             chat_id,
+            platform: banner_platform,
             paused_at,
             resumed_at,
             gap,
             missed_count,
         } => {
+            // Skip banners that belong to a different platform's delivery task.
+            if banner_platform != platform.platform_type() {
+                return;
+            }
             let msg = format_gap_banner(paused_at, resumed_at, gap, missed_count);
             if let Err(e) = platform.send_message(&msg, &chat_id, None).await {
                 tracing::error!("Failed to send GapBanner for chat_id={}: {}", chat_id, e);
@@ -411,5 +416,148 @@ mod tests {
         // Prefix should be correctly formatted.
         let pfx = prefix.expect("prefix should have been produced");
         assert_eq!(pfx, "[gap: 1m 30s] ", "got '{}'", pfx);
+    }
+
+    // ─── GapBanner platform filter tests ───────────────────────────────────
+
+    use crate::chat_adapters::{IncomingMessage, PlatformMessageId, PlatformType};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimal mock adapter that tracks send_message call count.
+    struct MockPlatform {
+        ptype: PlatformType,
+        send_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::chat_adapters::ChatPlatform for MockPlatform {
+        async fn start(
+            &self,
+            _cmd_tx: tokio::sync::mpsc::Sender<IncomingMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_message(
+            &self,
+            _text: &str,
+            _chat_id: &str,
+            _thread_ts: Option<&str>,
+        ) -> anyhow::Result<PlatformMessageId> {
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+            Ok(PlatformMessageId::Telegram(1))
+        }
+        async fn edit_message(
+            &self,
+            _msg_id: &PlatformMessageId,
+            _chat_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_photo(
+            &self,
+            _data: &[u8],
+            _filename: &str,
+            _caption: Option<&str>,
+            _chat_id: &str,
+            _thread_ts: Option<&str>,
+        ) -> anyhow::Result<PlatformMessageId> {
+            Ok(PlatformMessageId::Telegram(1))
+        }
+        async fn send_document(
+            &self,
+            _data: &[u8],
+            _filename: &str,
+            _caption: Option<&str>,
+            _chat_id: &str,
+            _thread_ts: Option<&str>,
+        ) -> anyhow::Result<PlatformMessageId> {
+            Ok(PlatformMessageId::Telegram(1))
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn platform_type(&self) -> PlatformType {
+            self.ptype
+        }
+    }
+
+    #[tokio::test]
+    async fn gap_banner_skipped_for_wrong_platform() {
+        let send_count = Arc::new(AtomicUsize::new(0));
+        let mock = MockPlatform {
+            ptype: PlatformType::Telegram,
+            send_count: Arc::clone(&send_count),
+        };
+        let pending: PendingBannerAcks = Arc::new(AsyncMutex::new(HashMap::new()));
+        let gap_prefixes: GapPrefixes = Arc::new(AsyncMutex::new(HashMap::new()));
+        let mut session_chat_ids = HashMap::new();
+        let mut session_thread_ts = HashMap::new();
+
+        // Broadcast a GapBanner targeted at Discord to a Telegram delivery task.
+        let now = Utc::now();
+        let event = StreamEvent::GapBanner {
+            chat_id: "discord_chat_42".to_string(),
+            platform: PlatformType::Discord,
+            paused_at: now - chrono::Duration::seconds(60),
+            resumed_at: now,
+            gap: Duration::from_secs(60),
+            missed_count: 0,
+        };
+
+        handle_stream_event(
+            &mock,
+            event,
+            &mut session_chat_ids,
+            &mut session_thread_ts,
+            &pending,
+            &gap_prefixes,
+        )
+        .await;
+
+        assert_eq!(
+            send_count.load(Ordering::SeqCst),
+            0,
+            "Telegram delivery task should NOT send a Discord-targeted GapBanner"
+        );
+    }
+
+    #[tokio::test]
+    async fn gap_banner_sent_for_matching_platform() {
+        let send_count = Arc::new(AtomicUsize::new(0));
+        let mock = MockPlatform {
+            ptype: PlatformType::Telegram,
+            send_count: Arc::clone(&send_count),
+        };
+        let pending: PendingBannerAcks = Arc::new(AsyncMutex::new(HashMap::new()));
+        let gap_prefixes: GapPrefixes = Arc::new(AsyncMutex::new(HashMap::new()));
+        let mut session_chat_ids = HashMap::new();
+        let mut session_thread_ts = HashMap::new();
+
+        let now = Utc::now();
+        let event = StreamEvent::GapBanner {
+            chat_id: "tg_chat_111".to_string(),
+            platform: PlatformType::Telegram,
+            paused_at: now - chrono::Duration::seconds(60),
+            resumed_at: now,
+            gap: Duration::from_secs(60),
+            missed_count: 0,
+        };
+
+        handle_stream_event(
+            &mock,
+            event,
+            &mut session_chat_ids,
+            &mut session_thread_ts,
+            &pending,
+            &gap_prefixes,
+        )
+        .await;
+
+        assert_eq!(
+            send_count.load(Ordering::SeqCst),
+            1,
+            "Telegram delivery task should send a Telegram-targeted GapBanner"
+        );
     }
 }

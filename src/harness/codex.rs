@@ -1,5 +1,5 @@
 use super::{Harness, HarnessEvent, HarnessKind};
-use crate::platform::Attachment;
+use crate::chat_adapters::Attachment;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;

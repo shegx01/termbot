@@ -8,6 +8,7 @@ pub struct Config {
     pub auth: AuthConfig,
     pub telegram: Option<TelegramConfig>,
     pub slack: Option<SlackConfig>,
+    pub discord: Option<DiscordConfig>,
     pub blocklist: BlocklistConfig,
     #[serde(default)]
     pub streaming: StreamingConfig,
@@ -47,6 +48,7 @@ impl Default for PowerConfig {
 pub struct AuthConfig {
     pub telegram_user_id: Option<u64>,
     pub slack_user_id: Option<String>,
+    pub discord_user_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +76,32 @@ impl fmt::Debug for SlackConfig {
         f.debug_struct("SlackConfig")
             .field("bot_token", &"[REDACTED]")
             .field("app_token", &"[REDACTED]")
+            .field("channel_id", &self.channel_id)
+            .finish()
+    }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct DiscordConfig {
+    pub bot_token: String,
+    pub guild_id: Option<u64>,
+    pub channel_id: Option<u64>,
+}
+
+impl DiscordConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.channel_id.is_some() && self.guild_id.is_none() {
+            anyhow::bail!("discord.channel_id requires discord.guild_id to be set");
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DiscordConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DiscordConfig")
+            .field("bot_token", &"[REDACTED]")
+            .field("guild_id", &self.guild_id)
             .field("channel_id", &self.channel_id)
             .finish()
     }
@@ -163,11 +191,15 @@ impl Config {
         self.slack.is_some() && self.auth.slack_user_id.is_some()
     }
 
+    pub fn discord_enabled(&self) -> bool {
+        self.discord.is_some() && self.auth.discord_user_id.is_some()
+    }
+
     fn validate(&self) -> Result<()> {
-        if !self.telegram_enabled() && !self.slack_enabled() {
+        if !self.telegram_enabled() && !self.slack_enabled() && !self.discord_enabled() {
             anyhow::bail!(
                 "At least one platform must be configured. \
-                 Add a [telegram] or [slack] section to termbot.toml."
+                 Add a [telegram], [slack], or [discord] section to termbot.toml."
             );
         }
 
@@ -192,6 +224,16 @@ impl Config {
             }
         }
 
+        if let Some(ref dc) = self.discord {
+            dc.validate()?;
+            if dc.bot_token.is_empty() || dc.bot_token == "YOUR_BOT_TOKEN_HERE" {
+                anyhow::bail!("[discord] section present but bot_token is not set");
+            }
+            if self.auth.discord_user_id.is_none() {
+                anyhow::bail!("[discord] section present but auth.discord_user_id is not set");
+            }
+        }
+
         const SAFE_TRIGGERS: &[char] = &[
             ':', '!', '>', ';', '.', ',', '@', '~', '^', '-', '+', '=', '|', '%', '?',
         ];
@@ -210,5 +252,131 @@ impl Config {
             anyhow::bail!("streaming.chunk_size must be > 0");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// Helper to write a TOML string to a temp file and load it.
+    fn load_from_str(toml_str: &str) -> anyhow::Result<Config> {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        Config::load(f.path())
+    }
+
+    #[test]
+    fn discord_dm_only_config_valid() {
+        let toml = r#"
+[auth]
+discord_user_id = 123456789
+
+[discord]
+bot_token = "test-token"
+
+[blocklist]
+patterns = []
+"#;
+        let config = load_from_str(toml).expect("discord DM-only config should be valid");
+        assert!(config.discord_enabled());
+    }
+
+    #[test]
+    fn discord_guild_channel_config_valid() {
+        let toml = r#"
+[auth]
+discord_user_id = 123456789
+
+[discord]
+bot_token = "test-token"
+guild_id = 111111111
+channel_id = 222222222
+
+[blocklist]
+patterns = []
+"#;
+        load_from_str(toml).expect("discord guild+channel config should be valid");
+    }
+
+    #[test]
+    fn discord_channel_without_guild_fails() {
+        let toml = r#"
+[auth]
+discord_user_id = 123456789
+
+[discord]
+bot_token = "test-token"
+channel_id = 222222222
+
+[blocklist]
+patterns = []
+"#;
+        let err = load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("discord.channel_id requires discord.guild_id"),
+            "expected guild_id error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn discord_only_install_passes_validation() {
+        let toml = r#"
+[auth]
+discord_user_id = 123456789
+
+[discord]
+bot_token = "test-token"
+
+[blocklist]
+patterns = []
+"#;
+        load_from_str(toml).expect("discord-only install should pass validation");
+    }
+
+    #[test]
+    fn discord_enabled_requires_both_section_and_user_id() {
+        // Section present, user_id missing
+        let toml = r#"
+[auth]
+telegram_user_id = 99
+
+[telegram]
+bot_token = "tg-token"
+
+[discord]
+bot_token = "test-token"
+
+[blocklist]
+patterns = []
+"#;
+        let config = load_from_str(toml);
+        // Should fail because [discord] present but no discord_user_id
+        assert!(
+            config.is_err(),
+            "should fail when discord section present but no user_id"
+        );
+
+        // user_id present, section missing — discord_enabled returns false
+        let toml2 = r#"
+[auth]
+telegram_user_id = 99
+discord_user_id = 123
+
+[telegram]
+bot_token = "tg-token"
+
+[blocklist]
+patterns = []
+"#;
+        let config2 = load_from_str(toml2).expect("should load fine without [discord] section");
+        assert!(
+            !config2.discord_enabled(),
+            "discord_enabled should be false without [discord] section"
+        );
     }
 }

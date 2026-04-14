@@ -45,6 +45,8 @@ pub struct TelegramState {
 pub struct Chats {
     pub telegram: Vec<i64>,
     pub slack: Vec<String>,
+    #[serde(default)]
+    pub discord: Vec<String>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -63,6 +65,8 @@ pub enum StateUpdate {
     BindTelegramChat(i64),
     /// Record a Slack channel ID (deduplicates).
     BindSlackChat(String),
+    /// Record a Discord channel ID (deduplicates).
+    BindDiscordChat(String),
     /// Signal first activity after startup — sets last_clean_shutdown = false.
     MarkDirty,
     /// Update last_seen_wall to now (UTC).
@@ -167,6 +171,11 @@ impl StateStore {
             StateUpdate::BindSlackChat(id) => {
                 if !self.state.chats.slack.contains(&id) {
                     self.state.chats.slack.push(id);
+                }
+            }
+            StateUpdate::BindDiscordChat(id) => {
+                if !self.state.chats.discord.contains(&id) {
+                    self.state.chats.discord.push(id);
                 }
             }
             StateUpdate::MarkDirty => {
@@ -487,6 +496,42 @@ mod tests {
         // Restore cwd before propagating any panic.
         std::env::set_current_dir(cwd).unwrap();
         result.expect("persist with bare filename should succeed");
+    }
+
+    #[test]
+    fn backward_compat_deserialize_without_discord_field() {
+        // Old state files won't have the `discord` field — serde(default) should handle it.
+        let json = r#"{
+            "schema_version": 1,
+            "telegram": { "offset": 42 },
+            "chats": { "telegram": [100], "slack": ["C1"] },
+            "last_seen_wall": null,
+            "last_clean_shutdown": true
+        }"#;
+        let state: State = serde_json::from_str(json).expect("should deserialize old format");
+        assert!(
+            state.chats.discord.is_empty(),
+            "discord should default to empty vec"
+        );
+        assert_eq!(state.chats.telegram, vec![100]);
+        assert_eq!(state.chats.slack, vec!["C1"]);
+    }
+
+    #[test]
+    fn apply_bind_discord_chat_deduplicates() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("termbot-state.json");
+        let mut store = StateStore::load(&path).unwrap();
+
+        store.apply(StateUpdate::BindDiscordChat("123456".into()));
+        store.apply(StateUpdate::BindDiscordChat("123456".into()));
+        store.apply(StateUpdate::BindDiscordChat("789012".into()));
+
+        assert_eq!(
+            store.snapshot().chats.discord,
+            vec!["123456", "789012"],
+            "duplicate discord chat should not be added twice"
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 mod app;
 mod buffer;
+mod chat_adapters;
 mod command;
 mod config;
 mod delivery;
 mod harness;
-mod platform;
 mod power;
 mod session;
 mod state_store;
@@ -17,10 +17,10 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use app::App;
+use chat_adapters::slack::SlackPlatform;
+use chat_adapters::telegram::TelegramAdapter;
+use chat_adapters::{ChatPlatform, DiscordAdapter, IncomingMessage};
 use config::Config;
-use platform::slack::SlackPlatform;
-use platform::telegram::TelegramAdapter;
-use platform::{ChatPlatform, IncomingMessage};
 use power::types::PowerSignal;
 use state_store::{StateStore, StateUpdate};
 
@@ -81,8 +81,6 @@ async fn main() -> Result<()> {
             app.pending_banner_acks_handle(),
             app.gap_prefix_handle(),
         );
-        // Give App a handle to the concrete adapter for pause/resume.
-        app.set_telegram_adapter(Arc::clone(&adapter));
         tracing::info!(
             "Telegram adapter started (user_id={}, initial_offset={})",
             tg_user_id,
@@ -124,16 +122,42 @@ async fn main() -> Result<()> {
         None
     };
 
+    let discord: Option<Arc<dyn ChatPlatform>> = if config.discord_enabled() {
+        let dc_config = config.discord.clone().unwrap();
+        let dc_user_id = serenity::all::UserId::new(config.auth.discord_user_id.unwrap());
+        let throttle = config.streaming.edit_throttle_ms;
+        let adapter = Arc::new(DiscordAdapter::new(dc_config, dc_user_id, throttle)?);
+        let adapter_clone = Arc::clone(&adapter);
+        let cmd_tx_clone = cmd_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = adapter_clone.start(cmd_tx_clone).await {
+                tracing::error!("Discord adapter error: {}", e);
+            }
+        });
+        delivery::spawn_delivery_task(
+            Arc::clone(&adapter) as Arc<dyn ChatPlatform>,
+            app.subscribe_stream(),
+            app.pending_banner_acks_handle(),
+            app.gap_prefix_handle(),
+        );
+        tracing::info!("Discord adapter enabled");
+        Some(adapter)
+    } else {
+        tracing::info!("Discord not configured, skipping");
+        None
+    };
+
     // Log active platforms before moving them into App
     let platforms_desc: Vec<&str> = [
         telegram.as_ref().map(|_| "Telegram"),
         slack.as_ref().map(|_| "Slack"),
+        discord.as_ref().map(|_| "Discord"),
     ]
     .into_iter()
     .flatten()
     .collect();
 
-    app.set_platforms(telegram, slack);
+    app.set_platforms(telegram, slack, discord);
     drop(cmd_tx); // Drop our copy so channel closes when adapters stop
 
     // ── Power subsystem ───────────────────────────────────────────────────────

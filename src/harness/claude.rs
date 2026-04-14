@@ -1,5 +1,5 @@
 use super::{truncate, Harness, HarnessEvent, HarnessKind};
-use crate::platform::Attachment;
+use crate::chat_adapters::Attachment;
 use anyhow::Result;
 use async_trait::async_trait;
 use claude_agent_sdk_rust::{

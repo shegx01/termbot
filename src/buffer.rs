@@ -20,6 +20,7 @@ pub enum StreamEvent {
     /// banner and sends `DeliveryAck::BannerSent` when done.
     GapBanner {
         chat_id: String,
+        platform: crate::chat_adapters::PlatformType,
         paused_at: chrono::DateTime<chrono::Utc>,
         resumed_at: chrono::DateTime<chrono::Utc>,
         gap: std::time::Duration,

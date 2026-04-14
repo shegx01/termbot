@@ -1,8 +1,8 @@
 # termbot
 
-Control your terminal from Telegram or Slack. Built in Rust.
+Control your terminal from Telegram, Slack, or Discord. Built in Rust.
 
-termbot gives you remote access to terminal sessions and Claude Code from your phone. Run shell commands, manage tmux sessions, send images, and have multi-turn AI conversations -- all through chat.
+termbot gives you remote access to terminal sessions and Claude Code from your phone. Run shell commands, manage tmux sessions, send images, and have multi-turn AI conversations -- all through Telegram, Slack, or Discord.
 
 ---
 
@@ -16,7 +16,7 @@ The installer downloads the binary, walks you through configuration, installs de
 curl -sSL https://raw.githubusercontent.com/shegx01/termbot/main/install.sh | bash
 ```
 
-That's it. Open Telegram or Slack and start typing.
+That's it. Open Telegram, Slack, or Discord and start typing.
 
 <details>
 <summary>What the installer does</summary>
@@ -123,7 +123,7 @@ Show me the test gaps.           # still the same session
 - **Rust 1.70+** (for building)
 - **tmux** (for terminal sessions)
 - **Claude Code CLI** (for `: claude` commands -- `npm i -g @anthropic-ai/claude-code`)
-- At least one of: Telegram bot token, Slack bot + app tokens
+- At least one of: Telegram bot token, Slack bot + app tokens, Discord bot token
 
 ---
 
@@ -212,9 +212,52 @@ max_sessions = 10
 **For private channels**, also add `groups:history` and `groups:read` scopes, and subscribe to `message.groups`.
 </details>
 
-### Both platforms
+### Discord only
 
-Include both `[telegram]` and `[slack]` sections with both IDs in `[auth]`. Either platform can be omitted -- termbot starts with whatever is configured.
+```toml
+[auth]
+discord_user_id = 123456789012345678
+
+[discord]
+bot_token = "YOUR_BOT_TOKEN_HERE"
+# guild_id = 111222333444555666
+# channel_id = 666555444333222111
+
+[blocklist]
+patterns = [
+  "rm\\s+-[a-z]*f[a-z]*r[a-z]*\\s+/",
+  "sudo\\s+",
+  ":\\(\\)\\{\\s*:\\|:\\&\\s*\\};:",
+]
+
+[streaming]
+edit_throttle_ms = 2000
+poll_interval_ms = 250
+chunk_size = 4000
+offline_buffer_max_bytes = 1048576
+max_sessions = 10
+```
+
+<details>
+<summary>How to set up a Discord bot</summary>
+
+1. Go to [discord.com/developers/applications](https://discord.com/developers/applications), create a new application
+2. **Bot section**: click "Reset Token" to generate a bot token, copy it
+3. **Privileged Gateway Intents**: toggle ON **MESSAGE CONTENT INTENT** (required for reading message text). Also toggle ON **SERVER MEMBERS INTENT** if you plan to use guild channels
+4. **Generate an invite URL**: go to OAuth2 > URL Generator. Select the **bot** scope (no `applications.commands` needed). Under Bot Permissions select: **View Channels**, **Send Messages**, **Attach Files**, **Read Message History**. Copy the generated URL and open it in your browser to invite the bot to your server
+5. **DM-only mode**: omit `guild_id` and `channel_id` from the config. The bot will only respond to direct messages from the authorized user
+6. **Guild channel mode**: set both `guild_id` and `channel_id`. The bot will respond in that channel AND in DMs
+
+**How to get snowflake IDs:**
+1. In Discord, go to Settings > Advanced > toggle ON **Developer Mode**
+2. Right-click your username > **Copy User ID** (this is `discord_user_id`)
+3. Right-click a server > **Copy Server ID** (this is `guild_id`)
+4. Right-click a channel > **Copy Channel ID** (this is `channel_id`)
+</details>
+
+### Multiple platforms
+
+Include any combination of `[telegram]`, `[slack]`, and `[discord]` sections with their corresponding IDs in `[auth]`. Any platform can be omitted -- termbot starts with whatever is configured.
 
 ### Sleep/wake management (optional)
 
@@ -448,10 +491,14 @@ Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. termbo
 |-----|------|-------------|
 | `auth.telegram_user_id` | integer | Your Telegram numeric user ID |
 | `auth.slack_user_id` | string | Your Slack member ID |
+| `auth.discord_user_id` | integer | Your Discord user snowflake |
 | `telegram.bot_token` | string | Telegram Bot API token |
 | `slack.bot_token` | string | Slack bot token (`xoxb-`) |
 | `slack.app_token` | string | Slack app token for Socket Mode (`xapp-`) |
 | `slack.channel_id` | string | Slack channel to operate in |
+| `discord.bot_token` | string | Discord bot token |
+| `discord.guild_id` | integer | Discord server snowflake (optional; omit for DM-only) |
+| `discord.channel_id` | integer | Discord channel snowflake (optional; requires `guild_id`) |
 | `blocklist.patterns` | string[] | Regex patterns to block |
 | `streaming.edit_throttle_ms` | integer | Min ms between message edits (default: 2000) |
 | `streaming.poll_interval_ms` | integer | Terminal output poll interval (default: 250) |
@@ -481,11 +528,14 @@ a one-time banner per active chat:
 ⏸ paused at 02:13, resumed at 07:45 (gap: 5h 32m)
 ```
 
-Telegram polling is paused until each banner is confirmed delivered (per-chat
-oneshot ack, 5s timeout); then the backlog drains in `update_id` order. If a
-banner fails to deliver within the timeout (e.g., rate-limit or network blip),
-termbot falls back to prepending `[gap: Xm Ys] ` inline to the first outbound
-message for that chat so the gap is never silently hidden.
+Adapter polling/handling is paused until each banner is confirmed delivered
+(per-chat oneshot ack, 5s timeout); then the backlog drains. Telegram queues
+updates server-side and drains them in `update_id` order on resume. Discord
+uses a handler-gate (gateway events during the pause window are discarded --
+the pause is typically <5s and the `: ` command protocol is self-recoverable).
+If a banner fails to deliver within the timeout (e.g., rate-limit or network
+blip), termbot falls back to prepending `[gap: Xm Ys] ` inline to the first
+outbound message for that chat so the gap is never silently hidden.
 
 The Telegram offset and chat bindings persist atomically to
 `termbot-state.json` (adjacent to `termbot.toml` by default). A restart
@@ -530,14 +580,15 @@ src/
     claude.rs          Claude Code SDK integration (streaming, images, file delivery)
     gemini.rs          Gemini harness (planned)
     codex.rs           Codex harness (planned)
-  platform/
+  chat_adapters/
     mod.rs             ChatPlatform trait + Attachment type
     telegram.rs        Telegram adapter (teloxide, long-polling)
     slack.rs           Slack adapter (Socket Mode, tokio-tungstenite)
+    discord.rs         Discord adapter (serenity, gateway + handler-gate pause)
 ```
 
 ```
-Telegram/Slack
+Telegram/Slack/Discord
     |
     v
 cmd_tx (mpsc) ──> tokio::select! core loop (main.rs)
@@ -554,7 +605,8 @@ cmd_tx (mpsc) ──> tokio::select! core loop (main.rs)
                     broadcast::channel
                            |
                     ├── Telegram delivery task
-                    └── Slack delivery task
+                    ├── Slack delivery task
+                    └── Discord delivery task
 ```
 
 The harness system is extensible via the `Harness` trait. Currently only Claude is implemented; Gemini and Codex have stubs ready for future integration. Each harness supports streaming events (`ToolUse`, `Text`, `File`, `Done`, `Error`) and optional multi-turn session resume.

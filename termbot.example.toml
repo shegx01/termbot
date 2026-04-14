@@ -1,6 +1,7 @@
 [auth]
 telegram_user_id = 123456789
 slack_user_id = "U01ABCDEF"
+# discord_user_id = 123456789012345678  # Your Discord user snowflake (see README)
 
 [telegram]
 bot_token = "YOUR_BOT_TOKEN_HERE"
@@ -9,6 +10,15 @@ bot_token = "YOUR_BOT_TOKEN_HERE"
 bot_token = "xoxb-YOUR-BOT-TOKEN"
 app_token = "xapp-YOUR-APP-TOKEN"
 channel_id = "C01ABCDEF"
+
+# [discord]
+# IMPORTANT: enable the MESSAGE_CONTENT privileged intent for your bot in the
+# Discord Developer Portal (https://discord.com/developers/applications ->
+# your app -> Bot -> Privileged Gateway Intents).
+# bot_token = "YOUR_BOT_TOKEN_HERE"
+# guild_id = 123456789012345678    # omit guild_id and channel_id for DM-only mode
+# channel_id = 123456789012345678  # if channel_id is set, guild_id must also be set
+# edit_throttle_ms is shared with telegram/slack via [streaming]; not configured per-adapter.
 
 [blocklist]
 patterns = [
