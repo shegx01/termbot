@@ -1516,4 +1516,25 @@ mod tests {
         assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
         assert!(err.to_string().contains("requires at least one tool name"));
     }
+
+    #[test]
+    fn parse_claude_on_allowed_tools_combined_with_other_flags() {
+        let cmd = ParsedCommand::parse(
+            ": claude on --model sonnet --allowedTools \"Read,Edit\" --effort high",
+            ':',
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    model: Some("sonnet".into()),
+                    effort: Some("high".into()),
+                    allowed_tools: Some(vec!["Read".into(), "Edit".into()]),
+                    ..Default::default()
+                },
+            }
+        );
+    }
 }
