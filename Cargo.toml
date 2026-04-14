@@ -28,4 +28,6 @@ url = "2"
 tempfile = "3"
 dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache"] }
+# native_tls_backend avoids the vulnerable rustls-webpki 0.102.8 (RUSTSEC-2026-0049)
+# that rustls_backend pulls via tokio-tungstenite 0.21 → rustls 0.22.
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "native_tls_backend", "model", "cache"] }
