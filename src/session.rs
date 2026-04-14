@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use std::collections::HashMap;
 use tokio::time::Instant;
 
+use crate::command::HarnessOptions;
 use crate::harness::HarnessKind;
 use crate::tmux::TmuxClient;
 
@@ -17,6 +18,7 @@ pub struct SessionState {
     pub status: SessionStatus,
     pub created_at: Instant,
     pub active_harness: Option<HarnessKind>,
+    pub harness_options: HarnessOptions,
 }
 
 pub struct SessionManager {
@@ -63,6 +65,7 @@ impl SessionManager {
                 },
                 created_at: Instant::now(),
                 active_harness: None,
+                harness_options: HarnessOptions::default(),
             },
         );
         if is_first {
@@ -105,6 +108,7 @@ impl SessionManager {
                 status: SessionStatus::Foreground,
                 created_at: Instant::now(),
                 active_harness: None,
+                harness_options: HarnessOptions::default(),
             },
         );
         self.foreground = Some(name.to_string());
@@ -177,11 +181,31 @@ impl SessionManager {
             .and_then(|s| s.active_harness)
     }
 
-    /// Set the active harness for a named session.
-    pub fn set_harness(&mut self, session_name: &str, harness: Option<HarnessKind>) {
+    /// Set the active harness and options for a named session.
+    /// When `harness` is `None` (harness off), options are cleared.
+    pub fn set_harness(
+        &mut self,
+        session_name: &str,
+        harness: Option<HarnessKind>,
+        options: HarnessOptions,
+    ) {
         if let Some(session) = self.sessions.get_mut(session_name) {
             session.active_harness = harness;
+            session.harness_options = if harness.is_some() {
+                options
+            } else {
+                HarnessOptions::default()
+            };
         }
+    }
+
+    /// Get the harness options for the foreground session.
+    pub fn foreground_harness_options(&self) -> HarnessOptions {
+        self.foreground
+            .as_ref()
+            .and_then(|name| self.sessions.get(name))
+            .map(|s| s.harness_options.clone())
+            .unwrap_or_default()
     }
 
     pub async fn health_check(&mut self) -> Vec<(String, Option<i32>)> {

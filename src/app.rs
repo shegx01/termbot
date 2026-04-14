@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::{OutputBuffer, StreamEvent};
 use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
-use crate::command::{CommandBlocklist, ParsedCommand};
+use crate::command::{CommandBlocklist, HarnessOptions, ParsedCommand};
 use crate::config::Config;
 use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
@@ -648,7 +648,10 @@ impl App {
                     self.send_error(&msg.reply_context, &e.to_string()).await;
                 }
             },
-            ParsedCommand::HarnessOn { harness: kind } => {
+            ParsedCommand::HarnessOn {
+                harness: kind,
+                options,
+            } => {
                 // Verify the harness is actually registered (stubs are not)
                 if !self.harnesses.contains_key(&kind) {
                     self.send_error(
@@ -666,14 +669,22 @@ impl App {
                         return;
                     }
                 };
-                // Check if switching from another harness
+                // Check if switching from another harness or updating options
                 if let Some(current) = self.session_mgr.foreground_harness() {
                     if current == kind {
-                        self.send_reply(
-                            &msg.reply_context,
-                            &format!("{} mode already active", kind.name()),
-                        )
-                        .await;
+                        // Same harness re-activated — update options in-place
+                        self.session_mgr
+                            .set_harness(&fg, Some(kind), options.clone());
+                        let opts_msg = if options.is_empty() {
+                            format!("{} mode: options reset to defaults.", kind.name())
+                        } else {
+                            format!(
+                                "{} mode: options updated.\nOptions: {}",
+                                kind.name(),
+                                options.summary()
+                            )
+                        };
+                        self.send_reply(&msg.reply_context, &opts_msg).await;
                         return;
                     }
                     // Check resume support of the CURRENT harness before switching away
@@ -703,15 +714,22 @@ impl App {
                     )
                     .await;
                 }
-                self.session_mgr.set_harness(&fg, Some(kind));
+                let opts_summary = if options.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nOptions: {}", options.summary())
+                };
+                self.session_mgr
+                    .set_harness(&fg, Some(kind), options);
                 self.send_reply(
                     &msg.reply_context,
                     &format!(
-                        "{} mode ON. Plain text now goes to {}. Use `{} {} off` to switch back.",
+                        "{} mode ON. Plain text now goes to {}. Use `{} {} off` to switch back.{}",
                         kind.name(),
                         kind.name(),
                         self.trigger,
-                        kind.name().to_lowercase()
+                        kind.name().to_lowercase(),
+                        opts_summary
                     ),
                 )
                 .await;
@@ -741,7 +759,8 @@ impl App {
                     .await;
                     return;
                 }
-                self.session_mgr.set_harness(&fg, None);
+                self.session_mgr
+                    .set_harness(&fg, None, HarnessOptions::default());
                 self.send_reply(
                     &msg.reply_context,
                     &format!(
@@ -763,8 +782,16 @@ impl App {
                     )
                     .await;
                 } else {
-                    self.send_harness_prompt(&msg.reply_context, &kind, prompt, &msg.attachments)
-                        .await;
+                    // One-shot prompt (`: claude <prompt>`) — use default options
+                    let opts = HarnessOptions::default();
+                    self.send_harness_prompt(
+                        &msg.reply_context,
+                        &kind,
+                        prompt,
+                        &msg.attachments,
+                        &opts,
+                    )
+                    .await;
                 }
             }
             ParsedCommand::ShellCommand { cmd } => {
@@ -799,9 +826,16 @@ impl App {
                     return;
                 }
                 if let Some(kind) = self.session_mgr.foreground_harness() {
-                    // Route to active harness
-                    self.send_harness_prompt(&msg.reply_context, &kind, &text, &msg.attachments)
-                        .await;
+                    // Route to active harness with stored session options
+                    let opts = self.session_mgr.foreground_harness_options();
+                    self.send_harness_prompt(
+                        &msg.reply_context,
+                        &kind,
+                        &text,
+                        &msg.attachments,
+                        &opts,
+                    )
+                    .await;
                 } else {
                     // Images are only supported in harness mode
                     if !msg.attachments.is_empty() {
@@ -868,6 +902,7 @@ impl App {
         kind: &HarnessKind,
         prompt: &str,
         attachments: &[Attachment],
+        options: &HarnessOptions,
     ) {
         let session_name = self
             .session_mgr
@@ -887,7 +922,7 @@ impl App {
         let cwd = std::env::current_dir().unwrap_or_default();
 
         match harness
-            .run_prompt(prompt, attachments, &cwd, resume_id.as_deref())
+            .run_prompt(prompt, attachments, &cwd, resume_id.as_deref(), options)
             .await
         {
             Ok(event_rx) => {

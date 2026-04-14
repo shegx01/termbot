@@ -152,7 +152,7 @@ impl TmuxClient {
 /// Normalize Unicode smart/curly quotes into plain ASCII equivalents.
 /// Mobile keyboards (Telegram iOS/Android, Slack) auto-replace straight
 /// quotes with typographic variants that shells don't recognize.
-fn normalize_quotes(input: &str) -> String {
+pub(crate) fn normalize_quotes(input: &str) -> String {
     input
         .replace(['\u{201C}', '\u{201D}'], "\"") // left/right double quotation marks ""
         .replace(['\u{2018}', '\u{2019}'], "'") // left/right single quotation marks ''
