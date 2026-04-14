@@ -32,6 +32,8 @@ pub struct HarnessOptions {
     pub settings: Option<String>,
     /// Path to an MCP server config file.
     pub mcp_config: Option<PathBuf>,
+    /// Permission mode: default, acceptEdits, plan, bypassPermissions.
+    pub permission_mode: Option<String>,
 }
 
 impl HarnessOptions {
@@ -45,6 +47,7 @@ impl HarnessOptions {
             && self.max_turns.is_none()
             && self.settings.is_none()
             && self.mcp_config.is_none()
+            && self.permission_mode.is_none()
     }
 
     /// Build a human-readable summary of active options for the ON confirmation message.
@@ -77,6 +80,9 @@ impl HarnessOptions {
         }
         if let Some(ref m) = self.mcp_config {
             parts.push(format!("mcp-config={}", m.display()));
+        }
+        if let Some(ref pm) = self.permission_mode {
+            parts.push(format!("permission-mode={}", pm));
         }
         parts.join(", ")
     }
@@ -359,6 +365,20 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                 let val = get_value!();
                 opts.mcp_config = Some(PathBuf::from(val));
             }
+            "--permission-mode" | "-p" => {
+                let val = get_value!();
+                match val.as_str() {
+                    "default" | "acceptEdits" | "plan" | "bypassPermissions" => {
+                        opts.permission_mode = Some(val);
+                    }
+                    _ => {
+                        return Err(ParseError::InvalidHarnessOption(format!(
+                            "Invalid permission mode '{}' — expected default, acceptEdits, plan, or bypassPermissions",
+                            val
+                        )));
+                    }
+                }
+            }
             other => {
                 // Better error for short-flag=value syntax (e.g. `-m=opus`)
                 if other.starts_with('-') && other.contains('=') {
@@ -369,7 +389,7 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                     )));
                 }
                 return Err(ParseError::InvalidHarnessOption(format!(
-                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config",
+                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode",
                     other
                 )));
             }
@@ -1146,6 +1166,43 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn parse_claude_on_with_permission_mode() {
+        let cmd = ParsedCommand::parse(": claude on --permission-mode acceptEdits", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    permission_mode: Some("acceptEdits".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_with_short_permission_mode_flag() {
+        let cmd = ParsedCommand::parse(": claude on -p bypassPermissions", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    permission_mode: Some("bypassPermissions".into()),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_invalid_permission_mode_rejected() {
+        let err = ParsedCommand::parse(": claude on --permission-mode yolo", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("Invalid permission mode"));
     }
 
     // ── shell_tokenize ──────────────────────────────────────────────────────

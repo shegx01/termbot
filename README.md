@@ -359,6 +359,7 @@ Options passed to `: claude on` persist for the entire session (until `: claude 
 | `--max-turns <n>` | `-n` | Limit agentic turns per prompt |
 | `--settings <path>` | | Path to a Claude Code settings file or inline JSON |
 | `--mcp-config <path>` | | Path to an MCP server config file |
+| `--permission-mode <mode>` | `-p` | Permission mode: `default`, `acceptEdits`, `plan`, `bypassPermissions` (default: `bypassPermissions`) |
 
 Quote values that contain spaces: `--system-prompt "You are a Rust expert"` or `--system-prompt 'Be concise'`. Smart/curly quotes from mobile keyboards are normalized automatically.
 
@@ -372,6 +373,7 @@ Examples:
 : claude on -m opus -n 10                           # Opus model, max 10 turns per prompt
 : claude on --system-prompt "Focus on security"     # custom system prompt
 : claude on --mcp-config ./mcp.json --settings ./s.json
+: claude on -p acceptEdits                              # Claude can edit files but not run shell commands
 ```
 
 ### Two ways to use Claude

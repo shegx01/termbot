@@ -116,7 +116,13 @@ async fn run_claude_prompt_inner(
 ) {
     let mut options = ClaudeAgentOptions::default();
     let prompt_start = std::time::SystemTime::now();
-    options.permission_mode = Some(PermissionMode::BypassPermissions);
+    options.permission_mode = Some(match harness_opts.permission_mode.as_deref() {
+        Some("default") => PermissionMode::Default,
+        Some("acceptEdits") => PermissionMode::AcceptEdits,
+        Some("plan") => PermissionMode::Plan,
+        Some("bypassPermissions") | None => PermissionMode::BypassPermissions,
+        Some(_) => PermissionMode::BypassPermissions, // validated by parser
+    });
     let cwd_for_scan = cwd.clone();
     options.cwd = Some(cwd);
     options.allowed_tools = vec![
