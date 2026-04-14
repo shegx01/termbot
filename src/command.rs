@@ -32,6 +32,9 @@ pub struct HarnessOptions {
     pub settings: Option<String>,
     /// Path to an MCP server config file.
     pub mcp_config: Option<PathBuf>,
+    /// Explicit tool allowlist (comma-separated names).
+    /// When `None`, the SDK uses its full default tool set.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 impl HarnessOptions {
@@ -45,6 +48,7 @@ impl HarnessOptions {
             && self.max_turns.is_none()
             && self.settings.is_none()
             && self.mcp_config.is_none()
+            && self.allowed_tools.is_none()
     }
 
     /// Build a human-readable summary of active options for the ON confirmation message.
@@ -77,6 +81,9 @@ impl HarnessOptions {
         }
         if let Some(ref m) = self.mcp_config {
             parts.push(format!("mcp-config={}", m.display()));
+        }
+        if let Some(ref tools) = self.allowed_tools {
+            parts.push(format!("allowed-tools={}", tools.join(",")));
         }
         parts.join(", ")
     }
@@ -272,6 +279,7 @@ impl ParsedCommand {
 ///   --max-turns <n>                 Maximum agentic turns per prompt
 ///   --settings <path|json>          Claude Code settings file or inline JSON
 ///   --mcp-config <path>             MCP server config file
+///   --allowedTools <tools>          Comma-separated tool allowlist (e.g. "Read,Edit,Bash")
 fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, ParseError> {
     let mut opts = HarnessOptions::default();
     // Normalize smart/curly quotes from mobile keyboards before tokenizing
@@ -359,6 +367,20 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                 let val = get_value!();
                 opts.mcp_config = Some(PathBuf::from(val));
             }
+            "--allowedTools" | "--allowed-tools" | "-t" => {
+                let val = get_value!();
+                let tools: Vec<String> = val
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if tools.is_empty() {
+                    return Err(ParseError::InvalidHarnessOption(
+                        "--allowedTools requires at least one tool name".to_string(),
+                    ));
+                }
+                opts.allowed_tools = Some(tools);
+            }
             other => {
                 // Better error for short-flag=value syntax (e.g. `-m=opus`)
                 if other.starts_with('-') && other.contains('=') {
@@ -369,7 +391,7 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                     )));
                 }
                 return Err(ParseError::InvalidHarnessOption(format!(
-                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config",
+                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --allowedTools",
                     other
                 )));
             }
@@ -1358,5 +1380,140 @@ mod tests {
             shell_tokenize("--system-prompt \"hello world"),
             vec!["--system-prompt", "hello world"]
         );
+    }
+
+    // ── --allowedTools tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_claude_on_allowed_tools_basic() {
+        let cmd =
+            ParsedCommand::parse(": claude on --allowedTools \"Read,Edit,Bash\"", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    allowed_tools: Some(vec!["Read".into(), "Edit".into(), "Bash".into(),]),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_allowed_tools_with_spaces() {
+        let cmd =
+            ParsedCommand::parse(": claude on --allowedTools \"Read, Edit, Bash\"", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    allowed_tools: Some(vec!["Read".into(), "Edit".into(), "Bash".into(),]),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_allowed_tools_trailing_comma() {
+        let cmd = ParsedCommand::parse(": claude on --allowedTools \"Read,Edit,\"", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    allowed_tools: Some(vec!["Read".into(), "Edit".into()]),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_allowed_tools_kebab_case_alias() {
+        let cmd = ParsedCommand::parse(": claude on --allowed-tools \"Read,Grep\"", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    allowed_tools: Some(vec!["Read".into(), "Grep".into()]),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_allowed_tools_short_flag() {
+        let cmd = ParsedCommand::parse(": claude on -t \"Read,Edit\"", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    allowed_tools: Some(vec!["Read".into(), "Edit".into()]),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_allowed_tools_equals_syntax() {
+        let cmd = ParsedCommand::parse(": claude on --allowedTools=Read,Edit,Bash", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    allowed_tools: Some(vec!["Read".into(), "Edit".into(), "Bash".into(),]),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_claude_on_omitted_allowed_tools_is_none() {
+        let cmd = ParsedCommand::parse(": claude on --model sonnet", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    model: Some("sonnet".into()),
+                    allowed_tools: None,
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn harness_options_summary_shows_allowed_tools() {
+        let opts = HarnessOptions {
+            allowed_tools: Some(vec!["Read".into(), "Edit".into()]),
+            ..Default::default()
+        };
+        assert_eq!(opts.summary(), "allowed-tools=Read,Edit");
+    }
+
+    #[test]
+    fn harness_options_is_empty_false_when_allowed_tools_set() {
+        let opts = HarnessOptions {
+            allowed_tools: Some(vec!["Read".into()]),
+            ..Default::default()
+        };
+        assert!(!opts.is_empty());
+    }
+
+    #[test]
+    fn parse_claude_on_allowed_tools_all_commas_rejected() {
+        let err = ParsedCommand::parse(": claude on --allowedTools \",,\"", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("requires at least one tool name"));
     }
 }
