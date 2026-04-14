@@ -112,24 +112,18 @@ async fn run_claude_prompt_inner(
     cwd: PathBuf,
     resume_session: Option<String>,
     event_tx: mpsc::Sender<HarnessEvent>,
-    harness_opts: HarnessOptions,
+    mut harness_opts: HarnessOptions,
 ) {
     let mut options = ClaudeAgentOptions::default();
     let prompt_start = std::time::SystemTime::now();
     options.permission_mode = Some(PermissionMode::BypassPermissions);
     let cwd_for_scan = cwd.clone();
     options.cwd = Some(cwd);
-    options.allowed_tools = vec![
-        "Read".to_string(),
-        "Write".to_string(),
-        "Edit".to_string(),
-        "Bash".to_string(),
-        "Glob".to_string(),
-        "Grep".to_string(),
-        "Agent".to_string(),
-        "WebSearch".to_string(),
-        "WebFetch".to_string(),
-    ];
+    // When the user specifies --allowedTools, restrict to that list.
+    // Otherwise leave allowed_tools unset so the SDK uses its full default tool set.
+    if let Some(tools) = harness_opts.allowed_tools.take() {
+        options.allowed_tools = tools;
+    }
 
     if let Some(sid) = resume_session {
         options.resume = Some(sid);
