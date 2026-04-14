@@ -105,7 +105,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Download artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -131,7 +131,7 @@ jobs:
         run: echo "TAG=build-${COMMIT_SHA::8}" >> "$GITHUB_ENV"
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           name: "Build ${{ env.TAG }}"
