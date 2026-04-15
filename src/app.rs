@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -71,8 +72,13 @@ pub struct App {
     schema_registry: Arc<SchemaRegistry>,
     delivery_queue: Arc<DeliveryQueue>,
     webhook_client: Arc<WebhookClient>,
-    /// Shutdown signal for the retry worker.  Notified by `mark_clean_shutdown`.
+    /// Shutdown notify (async wakeup) for the retry worker.  Notified by
+    /// `mark_clean_shutdown` for immediate wakeup during idle/backoff sleeps.
     retry_worker_shutdown: Arc<tokio::sync::Notify>,
+    /// Shutdown flag (non-blocking poll) for the retry worker.  Flipped by
+    /// `mark_clean_shutdown` so the worker can check between-jobs and break out
+    /// of an active drain loop without waiting for the next await point.
+    retry_worker_shutdown_flag: Arc<AtomicBool>,
 }
 
 impl App {
@@ -96,6 +102,7 @@ impl App {
         )?);
         let webhook_client = Arc::new(WebhookClient::new(config.structured_output.timeout_ms));
         let retry_worker_shutdown = Arc::new(tokio::sync::Notify::new());
+        let retry_worker_shutdown_flag = Arc::new(AtomicBool::new(false));
 
         let mut harnesses: HashMap<HarnessKind, Box<dyn Harness>> = HashMap::new();
         harnesses.insert(
@@ -140,6 +147,7 @@ impl App {
             delivery_queue: Arc::clone(&delivery_queue),
             webhook_client: Arc::clone(&webhook_client),
             retry_worker_shutdown: Arc::clone(&retry_worker_shutdown),
+            retry_worker_shutdown_flag: Arc::clone(&retry_worker_shutdown_flag),
         };
 
         // Immediately mark state dirty in memory (sets last_clean_shutdown=false).
@@ -157,6 +165,7 @@ impl App {
                 Arc::clone(&schema_registry),
                 events_tx,
                 Arc::clone(&retry_worker_shutdown),
+                Arc::clone(&retry_worker_shutdown_flag),
                 config.structured_output.max_retry_age_hours,
             );
         }
@@ -476,6 +485,10 @@ impl App {
             tracing::info!("Clean shutdown persisted");
         }
         // Signal the retry worker to stop after completing its current job.
+        // Set the atomic flag FIRST so any next non-blocking poll sees `true`,
+        // then notify so an idle/backoff sleep wakes immediately.
+        self.retry_worker_shutdown_flag
+            .store(true, Ordering::SeqCst);
         self.retry_worker_shutdown.notify_one();
     }
 

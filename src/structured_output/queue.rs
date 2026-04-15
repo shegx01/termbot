@@ -63,6 +63,25 @@ impl DeliveryQueue {
         std::fs::create_dir_all(&dead_dir)
             .with_context(|| format!("Failed to create queue dead dir: {}", dead_dir.display()))?;
 
+        // Restrict directory permissions to owner-only (0o700) on Unix.
+        // Queue job files contain structured-output bodies that may include
+        // information derived from the user's code/context; limiting to the
+        // owner prevents other users on shared hosts from reading them.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [&tmp_dir, &pending_dir, &dead_dir] {
+                let perms = std::fs::Permissions::from_mode(0o700);
+                if let Err(e) = std::fs::set_permissions(dir, perms) {
+                    tracing::warn!(
+                        "Failed to set 0o700 perms on queue subdir {}: {} (continuing)",
+                        dir.display(),
+                        e
+                    );
+                }
+            }
+        }
+
         // Same-device check on Unix (atomic rename requires same filesystem).
         #[cfg(unix)]
         {
@@ -114,6 +133,21 @@ impl DeliveryQueue {
             .await
             .with_context(|| format!("Failed to write job to tmp: {}", tmp_path.display()))?;
 
+        // Restrict file permissions to owner-only (0o600) on Unix.  Job files
+        // contain structured-output bodies (derived from user code/context).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            if let Err(e) = tokio::fs::set_permissions(&tmp_path, perms).await {
+                tracing::warn!(
+                    "Failed to set 0o600 perms on {}: {} (continuing)",
+                    tmp_path.display(),
+                    e
+                );
+            }
+        }
+
         // fsync the file to ensure the write is durable before rename.
         let file = tokio::fs::File::open(&tmp_path).await.with_context(|| {
             format!("Failed to open tmp file for fsync: {}", tmp_path.display())
@@ -133,6 +167,27 @@ impl DeliveryQueue {
                     pending_path.display()
                 )
             })?;
+
+        // fsync the pending directory so the rename itself is durable.
+        // On Linux this is required: without it, a power loss after the rename
+        // but before the dirent write-back could leave the file on disk but
+        // unreachable via its pending/ path.  macOS handles this implicitly but
+        // the extra fsync is safe (at worst a no-op).
+        let pending_dir_file = tokio::fs::File::open(&self.pending_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to open pending dir for fsync: {}",
+                    self.pending_dir.display()
+                )
+            })?;
+        pending_dir_file.sync_all().await.with_context(|| {
+            format!(
+                "Failed to fsync pending dir: {}",
+                self.pending_dir.display()
+            )
+        })?;
+        drop(pending_dir_file);
 
         let count = self.pending_count().await.unwrap_or(0);
         tracing::info!(

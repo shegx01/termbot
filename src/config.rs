@@ -334,6 +334,19 @@ impl Config {
                 );
             }
 
+            // webhook URL must use https:// — plain http leaks the signature
+            // and full structured-output body over the wire.
+            if let Some(ref url) = entry.webhook {
+                if !url.starts_with("https://") {
+                    anyhow::bail!(
+                        "[schemas.{}] webhook URL must use https:// to protect HMAC \
+                         signature and body in transit (got: {})",
+                        name,
+                        url
+                    );
+                }
+            }
+
             // webhook_secret_env requires the env var to be resolvable.
             // (Actual loading into Secret<Vec<u8>> happens in SchemaRegistry::from_config.)
             if let Some(ref env_var) = entry.webhook_secret_env {
@@ -355,6 +368,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -531,6 +545,7 @@ webhook = "https://example.com/hook"
     }
 
     #[test]
+    #[serial(env_mutation)]
     fn missing_webhook_secret_env_fails_load() {
         let toml = minimal_telegram_toml_with_schemas(
             r#"
@@ -564,6 +579,7 @@ schema = '{"type": "object", "properties": {"todos": {"type": "array"}}}'
     }
 
     #[test]
+    #[serial(env_mutation)]
     fn valid_schema_with_webhook_and_set_env_var_loads() {
         std::env::set_var("TERMINUS_TESTS_WEBHOOK_SECRET", "mysecret");
         let toml = minimal_telegram_toml_with_schemas(

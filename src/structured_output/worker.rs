@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +55,7 @@ pub fn spawn_retry_worker(
     registry: Arc<SchemaRegistry>,
     events_tx: broadcast::Sender<StreamEvent>,
     shutdown: Arc<tokio::sync::Notify>,
+    shutdown_flag: Arc<AtomicBool>,
     max_retry_age_hours: u64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -65,7 +67,7 @@ pub fn spawn_retry_worker(
 
         loop {
             // Check for shutdown signal (non-blocking).
-            if shutdown.try_notify_waiters_is_ready_hack() {
+            if shutdown_flag.load(Ordering::Relaxed) {
                 tracing::info!("Retry worker: shutdown signal received, draining in-flight...");
                 break;
             }
@@ -95,7 +97,7 @@ pub fn spawn_retry_worker(
 
             for path in &paths {
                 // Re-check shutdown before each job.
-                if shutdown.try_notify_waiters_is_ready_hack() {
+                if shutdown_flag.load(Ordering::Relaxed) {
                     tracing::info!("Retry worker: shutdown during drain, stopping");
                     break;
                 }
@@ -124,7 +126,9 @@ pub fn spawn_retry_worker(
                 // Check max retry age.
                 if max_retry_age_hours > 0 {
                     if let Some(age) = job_age(&job) {
-                        if age > Duration::from_secs(max_retry_age_hours * 3600) {
+                        // saturating_mul prevents overflow if max_retry_age_hours
+                        // is misconfigured to an extreme value (>u64::MAX/3600).
+                        if age > Duration::from_secs(max_retry_age_hours.saturating_mul(3600)) {
                             tracing::warn!(
                                 schema = %job.schema,
                                 run_id = %job.run_id,
@@ -261,21 +265,6 @@ fn job_age(job: &super::queue::DeliveryJob) -> Option<Duration> {
         .as_millis() as u64;
     let age_ms = now_ms.saturating_sub(created_ms);
     Some(Duration::from_millis(age_ms))
-}
-
-// Extension trait to allow non-blocking check for shutdown notification.
-// tokio::sync::Notify does not expose a try_recv; we use a workaround.
-trait NotifyExt {
-    fn try_notify_waiters_is_ready_hack(&self) -> bool;
-}
-
-impl NotifyExt for tokio::sync::Notify {
-    /// This is not a real API — it always returns false since there is no
-    /// try-recv on tokio Notify. We use `tokio::select!` with `biased` + a
-    /// zero-duration timeout to achieve a non-blocking check in the actual loop.
-    fn try_notify_waiters_is_ready_hack(&self) -> bool {
-        false // We rely on tokio::select! with biased for shutdown checks.
-    }
 }
 
 #[cfg(test)]

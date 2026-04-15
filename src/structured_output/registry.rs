@@ -148,6 +148,7 @@ impl SchemaRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn make_entry(schema: &str, webhook: Option<&str>, env_var: Option<&str>) -> SchemaEntry {
         crate::config::SchemaEntry {
@@ -215,6 +216,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_mutation)]
     fn registry_webhook_with_set_env_var_succeeds() {
         std::env::set_var("TERMINUS_TEST_REGISTRY_SECRET", "mysecret");
         let mut entries = HashMap::new();
@@ -235,6 +237,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_mutation)]
     fn registry_debug_does_not_print_secret_bytes() {
         std::env::set_var("TERMINUS_TEST_REGISTRY_DEBUG_SECRET", "supersecret");
         let mut entries = HashMap::new();

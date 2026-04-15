@@ -34,5 +34,11 @@ wiremock = { version = "0.6", optional = true }
 # that rustls_backend pulls via tokio-tungstenite 0.21 → rustls 0.22.
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "native_tls_backend", "model", "cache"] }
 
+[dev-dependencies]
+# Serialize tests that mutate process-global env vars (std::env::set_var is
+# unsafe under parallel test execution in Rust 2024 edition and can race under
+# the 2021 default runner).
+serial_test = "3"
+
 [features]
 integration-tests = ["dep:wiremock"]
