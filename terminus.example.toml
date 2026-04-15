@@ -57,3 +57,60 @@ stayawake_on_battery = false
 # `<terminus.toml's directory>/terminus-state.json`. Set this to e.g.
 # `~/.local/share/terminus/state.json` for an XDG-style location.
 # state_file = "/absolute/or/~-prefixed/path/to/terminus-state.json"
+
+# ---------------------------------------------------------------------------
+# Structured Output (--schema)
+# ---------------------------------------------------------------------------
+# Named JSON schemas for `: harness --schema <name> <prompt>` commands.
+# Each schema entry defines a JSON Schema to validate Claude's output and
+# (optionally) a webhook endpoint to deliver it to.
+#
+# Usage: `: harness --schema todos summarize my open tasks as JSON`
+#
+# [schemas.todos]
+# # JSON Schema definition (use a TOML multi-line string for readability).
+# schema = '''
+# {
+#   "type": "object",
+#   "required": ["todos"],
+#   "properties": {
+#     "todos": {
+#       "type": "array",
+#       "items": {
+#         "type": "object",
+#         "required": ["title", "done"],
+#         "properties": {
+#           "title": { "type": "string" },
+#           "done":  { "type": "boolean" }
+#         }
+#       }
+#     }
+#   }
+# }
+# '''
+#
+# # Optional webhook delivery. If set, terminus will POST the structured
+# # output to this URL on every successful Claude run, with HMAC-SHA256
+# # authentication.
+# webhook = "https://your-server.example.com/webhooks/todos"
+#
+# # Name of the environment variable containing the HMAC signing secret.
+# # Required when `webhook` is set.
+# # Set the env var before starting terminus:
+# #   export TODOS_WEBHOOK_SECRET="your-32-byte-random-secret"
+# webhook_secret_env = "TODOS_WEBHOOK_SECRET"
+
+# [structured_output]
+# # HTTP timeout for webhook delivery attempts (milliseconds). Default: 5000.
+# timeout_ms = 5000
+#
+# # Directory for the write-ahead delivery queue.
+# # Defaults to the platform data directory:
+# #   macOS: ~/Library/Application Support/terminus/queue
+# #   Linux: ~/.local/share/terminus/queue
+# # queue_dir = "/absolute/path/to/queue"
+#
+# # Maximum age (in hours) for a queued delivery job. Jobs older than this
+# # are moved to the dead/ folder and a warning is broadcast to the chat.
+# # Set to 0 (the default) to retry indefinitely.
+# max_retry_age_hours = 0

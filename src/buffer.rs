@@ -1,4 +1,24 @@
+use crate::chat_adapters::ChatBinding;
 use crate::tmux::TmuxClient;
+
+/// Payload for a structured output result — schema name, validated value, run ID.
+#[derive(Debug, Clone)]
+pub struct StructuredOutputPayload {
+    pub schema: String,
+    pub value: serde_json::Value,
+    pub run_id: String,
+}
+
+/// Status kind for webhook delivery events emitted by the retry worker.
+#[derive(Debug, Clone)]
+pub enum WebhookStatusKind {
+    /// Webhook POST succeeded (2xx response).
+    Delivered,
+    /// Job exceeded `max_retry_age_hours` and was moved to `dead/`.
+    Abandoned,
+    /// An error occurred during delivery (surfaced for observability).
+    Error { msg: String },
+}
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
@@ -25,6 +45,26 @@ pub enum StreamEvent {
         resumed_at: chrono::DateTime<chrono::Utc>,
         gap: std::time::Duration,
         missed_count: u32,
+    },
+    /// Emitted when a structured output result is ready for chat-side rendering.
+    ///
+    /// The delivery task handles hybrid rendering (inline code block ≤ 3900 B,
+    /// attachment otherwise).  Carries a `ChatBinding` so the delivery task
+    /// can route without the session-keyed HashMap lookup.
+    StructuredOutputRendered {
+        payload: StructuredOutputPayload,
+        chat: ChatBinding,
+    },
+    /// Emitted by the retry worker when a queued job is delivered, abandoned,
+    /// or encounters a persistent error.
+    ///
+    /// Uses `ChatBinding` for routing (bypasses the session-keyed lookup used
+    /// for streaming terminal output).
+    WebhookStatus {
+        schema: String,
+        run_id: String,
+        status: WebhookStatusKind,
+        chat: ChatBinding,
     },
 }
 

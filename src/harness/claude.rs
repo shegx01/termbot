@@ -1,6 +1,7 @@
 use super::{truncate, Harness, HarnessEvent, HarnessKind};
 use crate::chat_adapters::Attachment;
 use crate::command::HarnessOptions;
+use crate::structured_output::SchemaRegistry;
 use anyhow::Result;
 use async_trait::async_trait;
 use claude_agent_sdk_rust::{
@@ -12,13 +13,14 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// Claude Code SDK harness with multi-turn session support.
 pub struct ClaudeHarness {
     sessions: Mutex<HashMap<String, String>>, // session_name -> claude session_id
     cwd: PathBuf,
+    schema_registry: Arc<SchemaRegistry>,
 }
 
 impl ClaudeHarness {
@@ -26,7 +28,14 @@ impl ClaudeHarness {
         Self {
             sessions: Mutex::new(HashMap::new()),
             cwd: PathBuf::from(cwd),
+            schema_registry: Arc::new(SchemaRegistry::default()),
         }
+    }
+
+    /// Set the schema registry for structured output resolution.
+    pub fn with_schema_registry(mut self, registry: Arc<SchemaRegistry>) -> Self {
+        self.schema_registry = registry;
+        self
     }
 }
 
@@ -57,6 +66,7 @@ impl Harness for ClaudeHarness {
         let resume_session = session_id.map(|s| s.to_string());
         let attachment_paths: Vec<PathBuf> = attachments.iter().map(|a| a.path.clone()).collect();
         let harness_opts = options.clone();
+        let schema_registry = Arc::clone(&self.schema_registry);
 
         tokio::spawn(async move {
             // Catch panics so the channel always closes cleanly with an error event
@@ -67,6 +77,7 @@ impl Harness for ClaudeHarness {
                     resume_session,
                     event_tx.clone(),
                     harness_opts,
+                    schema_registry,
                 ))
                 .catch_unwind()
                 .await;
@@ -113,6 +124,7 @@ async fn run_claude_prompt_inner(
     resume_session: Option<String>,
     event_tx: mpsc::Sender<HarnessEvent>,
     harness_opts: HarnessOptions,
+    schema_registry: Arc<SchemaRegistry>,
 ) {
     let mut options = ClaudeAgentOptions::default();
     let prompt_start = std::time::SystemTime::now();
@@ -184,6 +196,54 @@ async fn run_claude_prompt_inner(
             Some(mcp_path.to_string_lossy().to_string()),
         );
     }
+
+    // Structured output: --schema flag resolution.
+    // Resolved schema name is stored for later use when processing ResultMessage.
+    let resolved_schema_name: Option<String> = if let Some(ref schema_name) = harness_opts.schema {
+        // Validate schema exists in registry.
+        match schema_registry.schema_value(schema_name) {
+            Some(schema_value) => {
+                // Set output_format on the SDK options.
+                options.output_format = Some(serde_json::json!({
+                    "type": "json_schema",
+                    "schema": schema_value
+                }));
+
+                // Clamp max_turns to at least 2 (required for structured output).
+                if options.max_turns.map(|n| n < 2).unwrap_or(true) {
+                    if options.max_turns.is_some() {
+                        // Only warn if explicitly set too low.
+                        let _ = event_tx
+                            .send(HarnessEvent::Text(
+                                "⚠️ --schema requires max_turns ≥ 2; clamping to 2".to_string(),
+                            ))
+                            .await;
+                    }
+                    options.max_turns = Some(2);
+                }
+
+                Some(schema_name.clone())
+            }
+            None => {
+                // Unknown schema — emit error and return without SDK call.
+                let known = schema_registry.schema_names().join(", ");
+                let known_display = if known.is_empty() {
+                    "(none configured)".to_string()
+                } else {
+                    known
+                };
+                let _ = event_tx
+                    .send(HarnessEvent::Error(format!(
+                        "unknown schema '{}' (known: {})",
+                        schema_name, known_display
+                    )))
+                    .await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     let stream = match tokio::time::timeout(
         std::time::Duration::from_secs(300),
@@ -281,6 +341,34 @@ async fn run_claude_prompt_inner(
             }
             Ok(Message::Result(result)) => {
                 session_id = result.session_id.clone();
+
+                // Handle structured output from the SDK.
+                if let Some(ref schema_name) = resolved_schema_name {
+                    match result.subtype.as_str() {
+                        "success" => {
+                            if let Some(structured_value) = result.structured_output {
+                                let run_id = ulid::Ulid::new().to_string();
+                                let _ = event_tx
+                                    .send(HarnessEvent::StructuredOutput {
+                                        schema: schema_name.clone(),
+                                        value: structured_value,
+                                        run_id,
+                                    })
+                                    .await;
+                            }
+                        }
+                        "error_max_structured_output_retries" => {
+                            let _ = event_tx
+                                .send(HarnessEvent::Error(format!(
+                                    "Claude failed to produce valid JSON matching schema '{}' \
+                                     (max structured output retries exceeded)",
+                                    schema_name
+                                )))
+                                .await;
+                        }
+                        _ => {}
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => {

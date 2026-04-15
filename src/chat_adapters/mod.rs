@@ -8,13 +8,35 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PlatformType {
     Telegram,
     Slack,
     Discord,
+}
+
+/// Serializable chat routing context.
+///
+/// Carried in queue job files so the retry worker can send status messages
+/// to the correct chat across restarts (queue files are self-describing).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatBinding {
+    pub platform: PlatformType,
+    pub chat_id: String,
+    pub thread_ts: Option<String>,
+}
+
+impl From<&ReplyContext> for ChatBinding {
+    fn from(ctx: &ReplyContext) -> Self {
+        Self {
+            platform: ctx.platform,
+            chat_id: ctx.chat_id.clone(),
+            thread_ts: ctx.thread_ts.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -94,4 +116,56 @@ pub trait ChatPlatform: Send + Sync {
     async fn pause(&self) {}
     /// Resume user-visible message processing. Default no-op.
     async fn resume(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `PlatformType` variant must survive a serde JSON round-trip with
+    /// value equality.  This establishes the variant-name wire contract for
+    /// queue job files (which embed `ChatBinding.platform` as a serialized JSON
+    /// string).  Changing variant names would break existing queue files.
+    #[test]
+    fn platform_type_roundtrips_json() {
+        for variant in [PlatformType::Telegram, PlatformType::Slack, PlatformType::Discord] {
+            let serialized = serde_json::to_string(&variant)
+                .unwrap_or_else(|e| panic!("Failed to serialize {:?}: {}", variant, e));
+            let deserialized: PlatformType = serde_json::from_str(&serialized)
+                .unwrap_or_else(|e| {
+                    panic!("Failed to deserialize '{}' back to PlatformType: {}", serialized, e)
+                });
+            assert_eq!(
+                variant, deserialized,
+                "PlatformType::{:?} did not round-trip through JSON",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn chat_binding_from_reply_context_copies_fields() {
+        let ctx = ReplyContext {
+            platform: PlatformType::Telegram,
+            chat_id: "12345".to_string(),
+            thread_ts: Some("1234567890.123".to_string()),
+        };
+        let binding = ChatBinding::from(&ctx);
+        assert_eq!(binding.platform, PlatformType::Telegram);
+        assert_eq!(binding.chat_id, "12345");
+        assert_eq!(binding.thread_ts, Some("1234567890.123".to_string()));
+    }
+
+    #[test]
+    fn chat_binding_roundtrips_json() {
+        let binding = ChatBinding {
+            platform: PlatformType::Slack,
+            chat_id: "C123ABC".to_string(),
+            thread_ts: None,
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        let restored: ChatBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.chat_id, binding.chat_id);
+        assert!(matches!(restored.platform, PlatformType::Slack));
+    }
 }

@@ -8,6 +8,7 @@ mod harness;
 mod power;
 mod session;
 mod state_store;
+mod structured_output;
 mod tmux;
 
 use std::sync::Arc;

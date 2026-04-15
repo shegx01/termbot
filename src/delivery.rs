@@ -12,7 +12,7 @@ use std::time::Duration;
 use chrono::{DateTime, Local, Utc};
 use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
 
-use crate::buffer::StreamEvent;
+use crate::buffer::{StreamEvent, WebhookStatusKind};
 use crate::chat_adapters::ChatPlatform;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -237,8 +237,135 @@ async fn handle_stream_event(
                 }
             }
         }
+        StreamEvent::StructuredOutputRendered { payload, chat } => {
+            // Only handle events for this delivery task's platform.
+            if chat.platform != platform.platform_type() {
+                return;
+            }
+            handle_structured_output_rendered(platform, &payload, &chat).await;
+        }
+        StreamEvent::WebhookStatus {
+            schema,
+            run_id,
+            status,
+            chat,
+        } => {
+            // Only handle events for this delivery task's platform.
+            if chat.platform != platform.platform_type() {
+                return;
+            }
+            let msg = match &status {
+                WebhookStatusKind::Delivered => {
+                    format!("✅ webhook delivered (schema={}, run_id={})", schema, run_id)
+                }
+                WebhookStatusKind::Abandoned => {
+                    format!(
+                        "❌ webhook delivery abandoned after max retry age (schema={}, run_id={})",
+                        schema, run_id
+                    )
+                }
+                WebhookStatusKind::Error { msg: err_msg } => {
+                    format!(
+                        "❌ webhook delivery error (schema={}, run_id={}): {}",
+                        schema, run_id, err_msg
+                    )
+                }
+            };
+            if let Err(e) = platform
+                .send_message(&msg, &chat.chat_id, chat.thread_ts.as_deref())
+                .await
+            {
+                tracing::warn!(
+                    "Failed to send webhook status to chat {}: {}",
+                    chat.chat_id,
+                    e
+                );
+            }
+        }
     }
 }
+
+/// Maximum byte size for inline JSON rendering in chat.
+///
+/// Payloads ≤ 3900 bytes (after fence overhead) are sent inline as a
+/// ` ```json ` code block.  Larger payloads are uploaded as `.json` attachments.
+const INLINE_JSON_MAX_BYTES: usize = 3900;
+
+/// Render structured output to the appropriate chat platform.
+///
+/// Size-aware hybrid:
+/// - ≤ 3900 bytes (with fences): send as inline ` ```json ``` ` code block.
+/// - > 3900 bytes: upload as `.json` attachment + short summary line.
+async fn handle_structured_output_rendered(
+    platform: &dyn ChatPlatform,
+    payload: &crate::buffer::StructuredOutputPayload,
+    chat: &crate::chat_adapters::ChatBinding,
+) {
+    let pretty = match serde_json::to_string_pretty(&payload.value) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to pretty-print structured output: {}", e);
+            return;
+        }
+    };
+
+    // Compute size including code-fence overhead: "```json\n" + content + "\n```"
+    let fenced = format!("```json\n{}\n```", pretty);
+    let thread_ts = chat.thread_ts.as_deref();
+
+    if fenced.len() <= INLINE_JSON_MAX_BYTES {
+        if let Err(e) = platform
+            .send_message(&fenced, &chat.chat_id, thread_ts)
+            .await
+        {
+            tracing::error!("Failed to send inline structured output: {}", e);
+        }
+    } else {
+        // Upload as attachment.
+        let now = chrono::Utc::now();
+        let filename = format!(
+            "{}-{}.json",
+            payload.schema,
+            now.format("%Y%m%dT%H%M%SZ")
+        );
+        let json_bytes = pretty.into_bytes();
+        let kb = json_bytes.len() as f64 / 1024.0;
+
+        // Count top-level array items if the value is an array, else count object keys.
+        let item_count = match &payload.value {
+            serde_json::Value::Array(arr) => arr.len(),
+            serde_json::Value::Object(obj) => obj.len(),
+            _ => 0,
+        };
+
+        let summary = format!(
+            "✅ {} items, {:.1} KB, schema={}",
+            item_count, kb, payload.schema
+        );
+
+        if let Err(e) = platform
+            .send_message(&summary, &chat.chat_id, thread_ts)
+            .await
+        {
+            tracing::error!("Failed to send structured output summary: {}", e);
+        }
+
+        if let Err(e) = platform
+            .send_document(
+                &json_bytes,
+                &filename,
+                None,
+                &chat.chat_id,
+                thread_ts,
+            )
+            .await
+        {
+            tracing::error!("Failed to send structured output attachment: {}", e);
+        }
+    }
+}
+
+// Re-export split_message so tests can use it directly.
 
 /// Split a message into chunks of at most `max_len` characters,
 /// breaking at newline boundaries when possible.
@@ -558,6 +685,57 @@ mod tests {
             send_count.load(Ordering::SeqCst),
             1,
             "Telegram delivery task should send a Telegram-targeted GapBanner"
+        );
+    }
+
+    // ── Hybrid render boundary tests ─────────────────────────────────────────
+
+    /// `INLINE_JSON_MAX_BYTES` must be 3900 per the spec.
+    #[test]
+    fn inline_json_max_bytes_is_3900() {
+        assert_eq!(
+            INLINE_JSON_MAX_BYTES,
+            3900,
+            "Spec requires INLINE_JSON_MAX_BYTES = 3900"
+        );
+    }
+
+    /// The inline/attachment decision is made based on the fenced representation:
+    ///   ` ```json\n<content>\n``` `
+    /// The fence overhead is "```json\n" (8) + "\n```" (4) = 12 bytes.
+    /// Therefore a payload of exactly 3888 bytes of content is inline (total = 3900).
+    /// A payload of 3889 bytes of content is an attachment (total = 3901 > 3900).
+    #[test]
+    fn hybrid_render_boundary_exact() {
+        // The fenced format is: "```json\n" + content + "\n```"
+        // Fence overhead: "```json\n".len() + "\n```".len() = 8 + 4 = 12 bytes
+        let fence_overhead = "```json\n".len() + "\n```".len();
+        let max_content = INLINE_JSON_MAX_BYTES - fence_overhead;
+
+        // Content at exactly max_content bytes should be inline.
+        let inline_content = "x".repeat(max_content);
+        let inline_fenced = format!("```json\n{}\n```", inline_content);
+        assert_eq!(
+            inline_fenced.len(),
+            INLINE_JSON_MAX_BYTES,
+            "Exactly 3900-byte fenced payload should be inline"
+        );
+        assert!(
+            inline_fenced.len() <= INLINE_JSON_MAX_BYTES,
+            "Should be inline (len {} <= {})",
+            inline_fenced.len(),
+            INLINE_JSON_MAX_BYTES
+        );
+
+        // One byte over should be attachment.
+        let attachment_content = "x".repeat(max_content + 1);
+        let attachment_fenced = format!("```json\n{}\n```", attachment_content);
+        assert_eq!(attachment_fenced.len(), INLINE_JSON_MAX_BYTES + 1);
+        assert!(
+            attachment_fenced.len() > INLINE_JSON_MAX_BYTES,
+            "Should be attachment (len {} > {})",
+            attachment_fenced.len(),
+            INLINE_JSON_MAX_BYTES
         );
     }
 }

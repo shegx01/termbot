@@ -424,6 +424,120 @@ Use tmux mode when you need Claude Code's full interactive features (slash comma
 
 ---
 
+## Structured Output (--schema)
+
+terminus can instruct Claude to emit a validated JSON response that matches a JSON Schema you define, then optionally POST it to a webhook endpoint with HMAC-SHA256 authentication.
+
+### Why
+
+- **Type-safe pipeline**: Claude produces JSON that your code can parse directly without post-processing.
+- **Webhook delivery**: results flow into your automation stack (Zapier, n8n, custom microservices, databases) without polling.
+- **Write-ahead durability**: the job is written to disk before the first network attempt. Transient failures are retried automatically with exponential backoff.
+
+### Setup
+
+1. Define a named schema in `terminus.toml`:
+
+```toml
+[schemas.todos]
+schema = '''
+{
+  "type": "object",
+  "required": ["todos"],
+  "properties": {
+    "todos": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["title", "done"],
+        "properties": {
+          "title": { "type": "string" },
+          "done":  { "type": "boolean" }
+        }
+      }
+    }
+  }
+}
+'''
+
+# Optional: deliver to a webhook.
+webhook = "https://your-server.example.com/webhooks/todos"
+webhook_secret_env = "TODOS_WEBHOOK_SECRET"
+```
+
+2. Set the HMAC secret (if using a webhook):
+
+```sh
+export TODOS_WEBHOOK_SECRET="$(openssl rand -hex 32)"
+```
+
+3. Use it:
+
+```
+: harness --schema todos list my open tasks
+```
+
+Claude's response is rendered as a JSON code block in chat and, if a webhook is configured, POSTed to your endpoint immediately. On transient failure the job is queued for automatic retry.
+
+### Webhook request
+
+```
+POST https://your-server.example.com/webhooks/todos
+Content-Type: application/json
+X-Terminus-Schema: todos
+X-Terminus-Run-Id: 01J8...   (ULID, unique per run)
+X-Terminus-Timestamp: 1713193920
+X-Terminus-Signature: v1=<hmac-sha256-hex>
+
+{"todos":[{"title":"Write tests","done":false}]}
+```
+
+The signature covers `"<timestamp>.<raw_body>"` (Stripe-style), which binds the timestamp into the MAC so neither field can be altered without invalidating the signature.
+
+### Verifying in Python
+
+```python
+import hmac, hashlib, time
+
+def verify(secret: str, body: bytes, timestamp: str, signature: str) -> bool:
+    # Reject replays older than 5 minutes.
+    if abs(time.time() - int(timestamp)) > 300:
+        return False
+    payload = f"{timestamp}.".encode() + body
+    expected = "v1=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+```
+
+### Verifying in Node.js
+
+```js
+const crypto = require("crypto");
+
+function verify(secret, body, timestamp, signature) {
+  // Reject replays older than 5 minutes.
+  if (Math.abs(Date.now() / 1000 - parseInt(timestamp)) > 300) return false;
+  const payload = `${timestamp}.${body}`;
+  const expected = "v1=" + crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+}
+```
+
+### Retry behaviour
+
+| Attempt | Delay (±20% jitter) |
+|---------|---------------------|
+| 1       | 1s                  |
+| 2       | 2s                  |
+| 3       | 4s                  |
+| 4       | 8s                  |
+| 5       | 16s                 |
+| 6       | 32s                 |
+| 7+      | 60s (cap)           |
+
+Jobs survive restarts -- they are stored in `<queue_dir>/pending/` and picked up by the retry worker on startup. Set `structured_output.max_retry_age_hours` in `terminus.toml` to cap how long terminus will retry before abandoning a job (0 = forever, the default).
+
+---
+
 ## How it works
 
 ### Terminal output

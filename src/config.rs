@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -17,6 +18,68 @@ pub struct Config {
     #[serde(default)]
     #[allow(dead_code)]
     pub power: PowerConfig,
+    /// Per-schema structured output configuration (`[schemas.<name>]` tables).
+    #[serde(default)]
+    pub schemas: HashMap<String, SchemaEntry>,
+    /// Global structured output config (`[structured_output]` table).
+    #[serde(default)]
+    pub structured_output: StructuredOutputConfig,
+}
+
+/// Configuration for a single named schema.
+///
+/// ```toml
+/// [schemas.todos]
+/// schema = '{ "type": "object", ... }'
+/// webhook = "https://my-server/hooks/todos"
+/// webhook_secret_env = "TERMINUS_TODOS_SECRET"
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct SchemaEntry {
+    /// Inline JSON Schema as a TOML multi-line string.  Parsed at startup.
+    pub schema: String,
+    /// Webhook URL to POST structured output to, if set.
+    pub webhook: Option<String>,
+    /// Name of an environment variable containing the HMAC-SHA256 secret.
+    /// Required iff `webhook` is set.
+    pub webhook_secret_env: Option<String>,
+}
+
+/// Global structured output configuration (`[structured_output]` table).
+#[derive(Debug, Deserialize, Clone)]
+pub struct StructuredOutputConfig {
+    /// Webhook request timeout in milliseconds.  Default: 5000.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Directory for the durable delivery queue.
+    /// Default: `~/.local/share/terminus/queue`.
+    #[serde(default = "default_queue_dir")]
+    pub queue_dir: PathBuf,
+    /// Maximum age (in hours) before a queued job is abandoned.
+    /// `0` means retry forever (the default).
+    #[serde(default)]
+    pub max_retry_age_hours: u64,
+}
+
+fn default_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_queue_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+        .join("terminus")
+        .join("queue")
+}
+
+impl Default for StructuredOutputConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: default_timeout_ms(),
+            queue_dir: default_queue_dir(),
+            max_retry_age_hours: 0,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +314,40 @@ impl Config {
         if self.streaming.chunk_size == 0 {
             anyhow::bail!("streaming.chunk_size must be > 0");
         }
+
+        // Validate schema entries.
+        for (name, entry) in &self.schemas {
+            // JSON Schema string must be valid JSON.
+            serde_json::from_str::<serde_json::Value>(&entry.schema).with_context(|| {
+                format!(
+                    "[schemas.{}] schema field is not valid JSON: check the TOML multi-line string",
+                    name
+                )
+            })?;
+
+            // webhook requires webhook_secret_env.
+            if entry.webhook.is_some() && entry.webhook_secret_env.is_none() {
+                anyhow::bail!(
+                    "[schemas.{}] webhook is set but webhook_secret_env is missing; \
+                     set webhook_secret_env to the name of an env var containing the HMAC secret",
+                    name
+                );
+            }
+
+            // webhook_secret_env requires the env var to be resolvable.
+            // (Actual loading into Secret<Vec<u8>> happens in SchemaRegistry::from_config.)
+            if let Some(ref env_var) = entry.webhook_secret_env {
+                if entry.webhook.is_some() {
+                    std::env::var(env_var).with_context(|| {
+                        format!(
+                            "[schemas.{}] webhook_secret_env refers to env var '{}' which is not set",
+                            name, env_var
+                        )
+                    })?;
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -378,5 +475,106 @@ patterns = []
             !config2.discord_enabled(),
             "discord_enabled should be false without [discord] section"
         );
+    }
+
+    // ── Schema validation tests ──────────────────────────────────────────────
+
+    fn minimal_telegram_toml_with_schemas(extra: &str) -> String {
+        format!(
+            r#"
+[auth]
+telegram_user_id = 99
+
+[telegram]
+bot_token = "tg-token"
+
+[blocklist]
+patterns = []
+
+{}
+"#,
+            extra
+        )
+    }
+
+    #[test]
+    fn invalid_json_schema_fails_load() {
+        let toml = minimal_telegram_toml_with_schemas(
+            r#"
+[schemas.todos]
+schema = "{ not valid json }"
+"#,
+        );
+        let err = load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("[schemas.todos]"),
+            "Error should cite [schemas.todos], got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn webhook_without_secret_env_fails_load() {
+        let toml = minimal_telegram_toml_with_schemas(
+            r#"
+[schemas.todos]
+schema = '{"type": "object"}'
+webhook = "https://example.com/hook"
+"#,
+        );
+        let err = load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("webhook_secret_env is missing"),
+            "Error should mention webhook_secret_env, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn missing_webhook_secret_env_fails_load() {
+        let toml = minimal_telegram_toml_with_schemas(
+            r#"
+[schemas.todos]
+schema = '{"type": "object"}'
+webhook = "https://example.com/hook"
+webhook_secret_env = "TERMINUS_NONEXISTENT_ENV_VAR_XYZ123"
+"#,
+        );
+        // Make sure the env var is not set
+        std::env::remove_var("TERMINUS_NONEXISTENT_ENV_VAR_XYZ123");
+        let err = load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("TERMINUS_NONEXISTENT_ENV_VAR_XYZ123"),
+            "Error should cite the env var name, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn valid_schema_without_webhook_loads() {
+        let toml = minimal_telegram_toml_with_schemas(
+            r#"
+[schemas.todos]
+schema = '{"type": "object", "properties": {"todos": {"type": "array"}}}'
+"#,
+        );
+        let config = load_from_str(&toml).expect("Valid schema without webhook should load");
+        assert!(config.schemas.contains_key("todos"));
+    }
+
+    #[test]
+    fn valid_schema_with_webhook_and_set_env_var_loads() {
+        std::env::set_var("TERMINUS_TESTS_WEBHOOK_SECRET", "mysecret");
+        let toml = minimal_telegram_toml_with_schemas(
+            r#"
+[schemas.todos]
+schema = '{"type": "object"}'
+webhook = "https://example.com/hook"
+webhook_secret_env = "TERMINUS_TESTS_WEBHOOK_SECRET"
+"#,
+        );
+        let config = load_from_str(&toml).expect("Valid schema with set env var should load");
+        assert!(config.schemas.contains_key("todos"));
+        std::env::remove_var("TERMINUS_TESTS_WEBHOOK_SECRET");
     }
 }

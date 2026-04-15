@@ -5,10 +5,13 @@ pub mod gemini;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::chat_adapters::{Attachment, ChatPlatform, PlatformType, ReplyContext};
+use crate::buffer::{StreamEvent, StructuredOutputPayload};
+use crate::chat_adapters::{Attachment, ChatBinding, ChatPlatform, PlatformType, ReplyContext};
 use crate::command::HarnessOptions;
+use crate::structured_output::{DeliveryJob, DeliveryQueue, SchemaRegistry, WebhookClient};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HarnessKind {
@@ -55,6 +58,18 @@ pub enum HarnessEvent {
     Done { session_id: String },
     /// An error occurred
     Error(String),
+    /// Validated structured output produced by the Claude SDK.
+    ///
+    /// Emitted when `ClaudeAgentOptions.output_format` was set and the SDK
+    /// successfully returned a `structured_output` in the `ResultMessage`.
+    StructuredOutput {
+        /// Schema name (from `HarnessOptions.schema`).
+        schema: String,
+        /// Validated `serde_json::Value` matching the configured schema.
+        value: serde_json::Value,
+        /// ULID run ID (used as queue filename and `X-Terminus-Run-Id` header).
+        run_id: String,
+    },
 }
 
 #[async_trait]
@@ -111,16 +126,36 @@ pub fn format_tool_event(tool: &str, description: &str) -> String {
     }
 }
 
+/// Read-only context passed into `drive_harness`.
+///
+/// Groups the reply context, platform references, and structured-output
+/// infrastructure so the parameter list stays bounded as new concerns are added.
+pub struct HarnessContext<'a> {
+    pub ctx: &'a ReplyContext,
+    pub telegram: Option<&'a dyn ChatPlatform>,
+    pub slack: Option<&'a dyn ChatPlatform>,
+    pub discord: Option<&'a dyn ChatPlatform>,
+    /// Registry for resolving schema names to values + webhook info.
+    pub schema_registry: &'a SchemaRegistry,
+    /// Durable delivery queue (write-ahead before webhook attempt).
+    pub delivery_queue: &'a DeliveryQueue,
+    /// HTTP client for sync webhook delivery.
+    pub webhook_client: &'a WebhookClient,
+    /// Broadcast sender for structured output chat rendering and status events.
+    pub stream_tx: &'a tokio::sync::broadcast::Sender<StreamEvent>,
+}
+
 /// Consume HarnessEvents and deliver to chat. Handles tool-use deduplication,
 /// batched flushing, text chunking, and error delivery.
 /// Returns (got_any_output, session_id_from_done_event).
 pub async fn drive_harness(
     mut event_rx: mpsc::Receiver<HarnessEvent>,
-    ctx: &ReplyContext,
-    telegram: Option<&dyn ChatPlatform>,
-    slack: Option<&dyn ChatPlatform>,
-    discord: Option<&dyn ChatPlatform>,
+    hctx: &HarnessContext<'_>,
 ) -> (bool, Option<String>) {
+    let ctx = hctx.ctx;
+    let telegram = hctx.telegram;
+    let slack = hctx.slack;
+    let discord = hctx.discord;
     let mut tool_lines: Vec<String> = Vec::new();
     let mut last_tool_flush = tokio::time::Instant::now();
     let mut got_any_output = false;
@@ -234,6 +269,95 @@ pub async fn drive_harness(
                 send_error(ctx, &e, telegram, slack, discord).await;
                 got_any_output = true;
                 break;
+            }
+            HarnessEvent::StructuredOutput { schema, value, run_id } => {
+                got_any_output = true;
+
+                // Flush any pending tool lines first.
+                if !tool_lines.is_empty() {
+                    if consecutive_count > 0 {
+                        if let Some(last) = tool_lines.last_mut() {
+                            *last = format!("{} (+{} more)", last, consecutive_count);
+                        }
+                        consecutive_count = 0;
+                    }
+                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack, discord).await;
+                    tool_lines.clear();
+                    last_tool_name = None;
+                }
+
+                let chat = ChatBinding::from(ctx);
+
+                // Step 1: Broadcast for chat-side hybrid rendering.
+                let _ = hctx.stream_tx.send(StreamEvent::StructuredOutputRendered {
+                    payload: StructuredOutputPayload {
+                        schema: schema.clone(),
+                        value: value.clone(),
+                        run_id: run_id.clone(),
+                    },
+                    chat: chat.clone(),
+                });
+
+                // Step 2: No webhook configured → done.
+                let webhook_info = match hctx.schema_registry.webhook_for(&schema) {
+                    Some(w) => w,
+                    None => continue,
+                };
+
+                // Step 3: Write-ahead — enqueue BEFORE any network attempt.
+                let job = DeliveryJob {
+                    schema: schema.clone(),
+                    value,
+                    run_id: run_id.clone(),
+                    source_chat_binding: chat.clone(),
+                };
+                let queue_path = match hctx.delivery_queue.enqueue(&job).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!("Failed to enqueue delivery job {}: {}", run_id, e);
+                        send_error(
+                            ctx,
+                            &format!("Failed to queue webhook delivery: {}", e),
+                            telegram,
+                            slack,
+                            discord,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+
+                // Step 4: Sync attempt.
+                match hctx.webhook_client.deliver(&job, &webhook_info).await {
+                    Ok(elapsed) => {
+                        // On success: remove queue file (no retry needed).
+                        let _ = hctx.delivery_queue.remove(&queue_path).await;
+                        send_reply(
+                            ctx,
+                            &format!("✅ delivered to webhook ({}ms)", elapsed.as_millis()),
+                            telegram,
+                            slack,
+                            discord,
+                        )
+                        .await;
+                    }
+                    Err(_) => {
+                        // On failure: leave queue file; retry worker will pick it up.
+                        let pending = hctx
+                            .delivery_queue
+                            .pending_count()
+                            .await
+                            .unwrap_or(1);
+                        send_reply(
+                            ctx,
+                            &format!("⏳ queued for retry ({} pending)", pending),
+                            telegram,
+                            slack,
+                            discord,
+                        )
+                        .await;
+                    }
+                }
             }
         }
     }

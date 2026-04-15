@@ -12,10 +12,11 @@ use crate::command::{CommandBlocklist, HarnessOptions, ParsedCommand};
 use crate::config::Config;
 use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
-use crate::harness::{drive_harness, Harness, HarnessKind};
+use crate::harness::{drive_harness, HarnessContext, Harness, HarnessKind};
 use crate::power::types::PowerSignal;
 use crate::session::{self, SessionManager};
 use crate::state_store::{StateStore, StateUpdate};
+use crate::structured_output::{DeliveryQueue, SchemaRegistry, WebhookClient, spawn_retry_worker};
 use crate::tmux::TmuxClient;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -65,6 +66,13 @@ pub struct App {
     /// applied `MarkDirty` on startup.  Used by `emit_startup_gap_banners`
     /// to check whether the previous run exited cleanly.
     startup_was_clean: bool,
+
+    // ── Structured output ─────────────────────────────────────────────────────
+    schema_registry: Arc<SchemaRegistry>,
+    delivery_queue: Arc<DeliveryQueue>,
+    webhook_client: Arc<WebhookClient>,
+    /// Shutdown signal for the retry worker.  Notified by `mark_clean_shutdown`.
+    retry_worker_shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl App {
@@ -81,8 +89,22 @@ impl App {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
+        // Build structured output infrastructure.
+        let schema_registry = Arc::new(SchemaRegistry::from_config(&config.schemas)?);
+        let delivery_queue = Arc::new(
+            DeliveryQueue::new(config.structured_output.queue_dir.clone())?,
+        );
+        let webhook_client = Arc::new(WebhookClient::new(config.structured_output.timeout_ms));
+        let retry_worker_shutdown = Arc::new(tokio::sync::Notify::new());
+
         let mut harnesses: HashMap<HarnessKind, Box<dyn Harness>> = HashMap::new();
-        harnesses.insert(HarnessKind::Claude, Box::new(ClaudeHarness::new(cwd)));
+        harnesses.insert(
+            HarnessKind::Claude,
+            Box::new(
+                ClaudeHarness::new(cwd)
+                    .with_schema_registry(Arc::clone(&schema_registry)),
+            ),
+        );
         let (stream_tx, _) = broadcast::channel::<StreamEvent>(256);
 
         // Hydrate active chat sets from persisted state.
@@ -117,12 +139,30 @@ impl App {
             gap_prefix: Arc::new(AsyncMutex::new(HashMap::new())),
             dirty_sent: false,
             startup_was_clean,
+            schema_registry: Arc::clone(&schema_registry),
+            delivery_queue: Arc::clone(&delivery_queue),
+            webhook_client: Arc::clone(&webhook_client),
+            retry_worker_shutdown: Arc::clone(&retry_worker_shutdown),
         };
 
         // Immediately mark state dirty in memory (sets last_clean_shutdown=false).
         // This ensures that a crash before `mark_clean_shutdown()` is called
         // will correctly fire a restart banner on the next boot.
         app.store.apply(StateUpdate::MarkDirty);
+
+        // Spawn the retry worker with the broadcast sender's subscribe handle.
+        // We subscribe once here; the worker holds its own receiver.
+        {
+            let events_tx = app.stream_tx.clone();
+            spawn_retry_worker(
+                Arc::clone(&delivery_queue),
+                Arc::clone(&webhook_client),
+                Arc::clone(&schema_registry),
+                events_tx,
+                Arc::clone(&retry_worker_shutdown),
+                config.structured_output.max_retry_age_hours,
+            );
+        }
 
         Ok(app)
     }
@@ -438,6 +478,8 @@ impl App {
         } else {
             tracing::info!("Clean shutdown persisted");
         }
+        // Signal the retry worker to stop after completing its current job.
+        self.retry_worker_shutdown.notify_one();
     }
 
     /// Consume and return the inline gap prefix for `chat_id` if one is
@@ -772,6 +814,7 @@ impl App {
             ParsedCommand::HarnessPrompt {
                 harness: kind,
                 ref prompt,
+                ref options,
             } => {
                 if self.blocklist.is_blocked(prompt) {
                     cleanup_attachments(&msg.attachments).await;
@@ -781,14 +824,13 @@ impl App {
                     )
                     .await;
                 } else {
-                    // One-shot prompt (`: claude <prompt>`) — use default options
-                    let opts = HarnessOptions::default();
+                    // One-shot prompt (`: claude --schema=foo <prompt>`): use parsed options.
                     self.send_harness_prompt(
                         &msg.reply_context,
                         &kind,
                         prompt,
                         &msg.attachments,
-                        &opts,
+                        options,
                     )
                     .await;
                 }
@@ -925,14 +967,17 @@ impl App {
             .await
         {
             Ok(event_rx) => {
-                let (got_output, session_id) = drive_harness(
-                    event_rx,
+                let hctx = HarnessContext {
                     ctx,
-                    self.telegram.as_deref(),
-                    self.slack.as_deref(),
-                    self.discord.as_deref(),
-                )
-                .await;
+                    telegram: self.telegram.as_deref(),
+                    slack: self.slack.as_deref(),
+                    discord: self.discord.as_deref(),
+                    schema_registry: &self.schema_registry,
+                    delivery_queue: &self.delivery_queue,
+                    webhook_client: &self.webhook_client,
+                    stream_tx: &self.stream_tx,
+                };
+                let (got_output, session_id) = drive_harness(event_rx, &hctx).await;
                 if let Some(sid) = session_id {
                     harness.set_session_id(&session_name, sid);
                 }

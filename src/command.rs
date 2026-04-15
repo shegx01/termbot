@@ -34,6 +34,8 @@ pub struct HarnessOptions {
     pub mcp_config: Option<PathBuf>,
     /// Permission mode: default, acceptEdits, plan, bypassPermissions.
     pub permission_mode: Option<String>,
+    /// Schema name for structured output (registered in terminus.toml).
+    pub schema: Option<String>,
 }
 
 impl HarnessOptions {
@@ -48,6 +50,7 @@ impl HarnessOptions {
             && self.settings.is_none()
             && self.mcp_config.is_none()
             && self.permission_mode.is_none()
+            && self.schema.is_none()
     }
 
     /// Build a human-readable summary of active options for the ON confirmation message.
@@ -84,6 +87,9 @@ impl HarnessOptions {
         if let Some(ref pm) = self.permission_mode {
             parts.push(format!("permission-mode={}", pm));
         }
+        if let Some(ref s) = self.schema {
+            parts.push(format!("schema={}", s));
+        }
         parts.join(", ")
     }
 }
@@ -105,6 +111,8 @@ pub enum ParsedCommand {
     HarnessPrompt {
         harness: HarnessKind,
         prompt: String,
+        /// Options parsed from flags before the prompt text (e.g. `--schema=foo`).
+        options: HarnessOptions,
     },
     /// Capture and send the current terminal screen
     Screen,
@@ -229,9 +237,13 @@ impl ParsedCommand {
                     return Ok(ParsedCommand::HarnessOff { harness: kind });
                 }
                 if !after_harness.is_empty() {
+                    // Extract any leading --flags before the actual prompt text.
+                    // e.g. `: claude --schema=foo my prompt` → options={schema: "foo"}, prompt="my prompt"
+                    let (options, prompt) = split_prompt_options(after_harness)?;
                     return Ok(ParsedCommand::HarnessPrompt {
                         harness: kind,
-                        prompt: after_harness.to_string(),
+                        prompt,
+                        options,
                     });
                 }
                 // Bare `: claude` / `: gemini` falls through to ShellCommand
@@ -265,6 +277,57 @@ impl ParsedCommand {
             })
         }
     }
+}
+
+/// Split leading flag tokens from a prompt string.
+///
+/// Tokens starting with `--` (or `-` short flags) are consumed as options
+/// until a non-flag token is encountered.  The remainder is returned as the
+/// prompt text.
+///
+/// Example: `"--schema=foo my prompt"` → `(HarnessOptions { schema: Some("foo"), .. }, "my prompt")`
+fn split_prompt_options(
+    input: &str,
+) -> std::result::Result<(HarnessOptions, String), ParseError> {
+    let normalized = normalize_quotes(input);
+    let tokens = shell_tokenize(&normalized);
+
+    // Find the split point: first token that doesn't start with `-`.
+    let mut flag_end = 0;
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        if token.starts_with('-') {
+            // This is a flag.  If it's `--flag value` (not `--flag=value`),
+            // the next token is the value — consume it too.
+            if let Some(idx) = token.find('=') {
+                let _ = idx; // `--flag=value` form, single token
+                i += 1;
+            } else {
+                // `--flag value` form — skip flag and value.
+                i += 2;
+            }
+            flag_end = i;
+        } else {
+            break;
+        }
+    }
+
+    // The flag portion is everything up to flag_end.
+    let flag_tokens = &tokens[..flag_end.min(tokens.len())];
+    let prompt_tokens = &tokens[flag_end.min(tokens.len())..];
+    let prompt = prompt_tokens.join(" ");
+
+    // If there were no flags, just return with empty options.
+    if flag_tokens.is_empty() {
+        return Ok((HarnessOptions::default(), prompt));
+    }
+
+    // Re-join the flag tokens and parse them.
+    let flag_str = flag_tokens.join(" ");
+    let options = parse_harness_options(&flag_str)?;
+
+    Ok((options, prompt))
 }
 
 /// Parse CLI-style options from the text after `on `.
@@ -379,6 +442,10 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                     }
                 }
             }
+            "--schema" => {
+                let val = get_value!();
+                opts.schema = Some(val);
+            }
             other => {
                 // Better error for short-flag=value syntax (e.g. `-m=opus`)
                 if other.starts_with('-') && other.contains('=') {
@@ -389,7 +456,7 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                     )));
                 }
                 return Err(ParseError::InvalidHarnessOption(format!(
-                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode",
+                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema",
                     other
                 )));
             }
@@ -687,7 +754,8 @@ mod tests {
             ParsedCommand::parse(": claude explain this code", ':').unwrap(),
             ParsedCommand::HarnessPrompt {
                 harness: HarnessKind::Claude,
-                prompt: "explain this code".into()
+                prompt: "explain this code".into(),
+                options: HarnessOptions::default(),
             }
         );
     }
@@ -794,7 +862,8 @@ mod tests {
             ParsedCommand::parse(": codex explain this", ':').unwrap(),
             ParsedCommand::HarnessPrompt {
                 harness: HarnessKind::Codex,
-                prompt: "explain this".into()
+                prompt: "explain this".into(),
+                options: HarnessOptions::default(),
             }
         );
     }
@@ -894,7 +963,8 @@ mod tests {
             ParsedCommand::parse("! claude explain this", '!').unwrap(),
             ParsedCommand::HarnessPrompt {
                 harness: HarnessKind::Claude,
-                prompt: "explain this".into()
+                prompt: "explain this".into(),
+                options: HarnessOptions::default(),
             }
         );
     }
@@ -905,7 +975,8 @@ mod tests {
             ParsedCommand::parse(": claude explain\nthis code", ':').unwrap(),
             ParsedCommand::HarnessPrompt {
                 harness: HarnessKind::Claude,
-                prompt: "explain\nthis code".into()
+                prompt: "explain\nthis code".into(),
+                options: HarnessOptions::default(),
             }
         );
     }
@@ -1414,6 +1485,72 @@ mod tests {
         assert_eq!(
             shell_tokenize("--system-prompt \"hello world"),
             vec!["--system-prompt", "hello world"]
+        );
+    }
+
+    // ── --schema flag tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn schema_flag_parses() {
+        // `: claude --schema=todos extract all TODOs` — one-shot with schema
+        let cmd = ParsedCommand::parse(": claude --schema=todos extract all TODOs", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt { harness, prompt, options } => {
+                assert_eq!(harness, HarnessKind::Claude);
+                assert_eq!(prompt, "extract all TODOs");
+                assert_eq!(options.schema, Some("todos".into()));
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn schema_flag_space_separated_parses() {
+        let cmd =
+            ParsedCommand::parse(": claude --schema todos my prompt", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt { options, prompt, .. } => {
+                assert_eq!(options.schema, Some("todos".into()));
+                assert_eq!(prompt, "my prompt");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn schema_flag_in_harness_on_parses() {
+        let cmd = ParsedCommand::parse(": claude on --schema=todos", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn { options, .. } => {
+                assert_eq!(options.schema, Some("todos".into()));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn schema_flag_with_other_flags_parses() {
+        let cmd =
+            ParsedCommand::parse(": claude --schema=todos --model sonnet my prompt", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt { options, prompt, .. } => {
+                assert_eq!(options.schema, Some("todos".into()));
+                assert_eq!(options.model, Some("sonnet".into()));
+                assert_eq!(prompt, "my prompt");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn schema_flag_rejected_if_unknown_flag_mixed() {
+        // Unknown flags still rejected with helpful error.
+        let err =
+            ParsedCommand::parse(": claude on --schema=todos --unknown-flag x", ':').unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidHarnessOption(_)),
+            "Expected InvalidHarnessOption, got: {:?}",
+            err
         );
     }
 }
