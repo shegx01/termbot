@@ -169,19 +169,19 @@ impl App {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if name_str.starts_with("termbot-") && name_str.ends_with(".out") {
+                if name_str.starts_with("terminus-") && name_str.ends_with(".out") {
                     tracing::info!("Cleaning stale output file: {}", entry.path().display());
                     let _ = std::fs::remove_file(entry.path());
                 }
                 // Clean stale image temp files from previous runs
-                if name_str.starts_with("termbot-img-") {
+                if name_str.starts_with("terminus-img-") {
                     tracing::info!("Cleaning stale image temp file: {}", entry.path().display());
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
         }
 
-        // Reconnect to surviving tb-* tmux sessions
+        // Reconnect to surviving term-* tmux sessions
         match self.session_mgr.tmux().list_sessions().await {
             Ok(sessions) if !sessions.is_empty() => {
                 tracing::info!(
@@ -985,8 +985,8 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_test_config(dir: &std::path::Path) -> Config {
-        // Write a minimal valid termbot.toml to the temp dir.
-        let toml_path = dir.join("termbot.toml");
+        // Write a minimal valid terminus.toml to the temp dir.
+        let toml_path = dir.join("terminus.toml");
         std::fs::write(
             &toml_path,
             r#"
@@ -1006,7 +1006,7 @@ patterns = []
 
     fn make_app(dir: &std::path::Path) -> (App, mpsc::Receiver<StateUpdate>) {
         let config = make_test_config(dir);
-        let state_path = dir.join("termbot-state.json");
+        let state_path = dir.join("terminus-state.json");
         let store = StateStore::load(&state_path).expect("load state");
         let (state_tx, state_rx) = mpsc::channel::<StateUpdate>(64);
         let app = App::new(&config, store, state_tx).expect("App::new");
@@ -1040,7 +1040,7 @@ patterns = []
         // After persist, counter resets to 0.
         assert_eq!(app.updates_since_persist, 0);
         // State file should exist.
-        assert!(dir.path().join("termbot-state.json").exists());
+        assert!(dir.path().join("terminus-state.json").exists());
     }
 
     #[tokio::test]
@@ -1053,7 +1053,7 @@ patterns = []
         app.mark_clean_shutdown().await;
 
         // Reload from disk and check.
-        let reloaded = StateStore::load(dir.path().join("termbot-state.json")).unwrap();
+        let reloaded = StateStore::load(dir.path().join("terminus-state.json")).unwrap();
         assert!(
             reloaded.snapshot().last_clean_shutdown,
             "mark_clean_shutdown should persist last_clean_shutdown=true"
@@ -1084,7 +1084,7 @@ patterns = []
             "last_seen_wall": old_time.to_rfc3339(),
             "last_clean_shutdown": false
         });
-        let state_path = dir.path().join("termbot-state.json");
+        let state_path = dir.path().join("terminus-state.json");
         std::fs::write(&state_path, state.to_string()).unwrap();
 
         let config = make_test_config(dir.path());
@@ -1124,10 +1124,10 @@ patterns = []
             "last_seen_wall": old_time.to_rfc3339(),
             "last_clean_shutdown": true
         });
-        std::fs::write(dir.path().join("termbot-state.json"), state.to_string()).unwrap();
+        std::fs::write(dir.path().join("terminus-state.json"), state.to_string()).unwrap();
 
         let config = make_test_config(dir.path());
-        let store = StateStore::load(dir.path().join("termbot-state.json")).unwrap();
+        let store = StateStore::load(dir.path().join("terminus-state.json")).unwrap();
         let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
         let mut app = App::new(&config, store, state_tx).unwrap();
 
@@ -1152,10 +1152,10 @@ patterns = []
             "last_seen_wall": recent.to_rfc3339(),
             "last_clean_shutdown": false
         });
-        std::fs::write(dir.path().join("termbot-state.json"), state.to_string()).unwrap();
+        std::fs::write(dir.path().join("terminus-state.json"), state.to_string()).unwrap();
 
         let config = make_test_config(dir.path());
-        let store = StateStore::load(dir.path().join("termbot-state.json")).unwrap();
+        let store = StateStore::load(dir.path().join("terminus-state.json")).unwrap();
         let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
         let mut app = App::new(&config, store, state_tx).unwrap();
 

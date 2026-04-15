@@ -9,7 +9,7 @@ pub struct TmuxClient {
 impl TmuxClient {
     pub fn new() -> Self {
         Self {
-            session_prefix: "tb-".into(),
+            session_prefix: "term-".into(),
         }
     }
 
@@ -18,7 +18,7 @@ impl TmuxClient {
     }
 
     pub fn output_file_path(&self, name: &str) -> PathBuf {
-        PathBuf::from(format!("/tmp/termbot-{}.out", name))
+        PathBuf::from(format!("/tmp/terminus-{}.out", name))
     }
 
     pub async fn create_session(&self, name: &str) -> Result<()> {

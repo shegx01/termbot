@@ -27,10 +27,10 @@ use state_store::{StateStore, StateUpdate};
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    tracing::info!("Starting termbot...");
+    tracing::info!("Starting terminus...");
 
     let config_path =
-        std::env::var("TERMBOT_CONFIG").unwrap_or_else(|_| "termbot.toml".to_string());
+        std::env::var("TERMINUS_CONFIG").unwrap_or_else(|_| "terminus.toml".to_string());
     let config = Config::load(&config_path)?;
     tracing::info!("Config loaded successfully");
 
@@ -186,7 +186,7 @@ async fn main() -> Result<()> {
         tokio::time::interval(Duration::from_millis(config.streaming.poll_interval_ms));
 
     tracing::info!(
-        "termbot ready — listening on {}",
+        "terminus ready — listening on {}",
         platforms_desc.join(" and ")
     );
 
@@ -231,6 +231,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    tracing::info!("termbot stopped");
+    tracing::info!("terminus stopped");
     Ok(())
 }

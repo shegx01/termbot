@@ -1,8 +1,8 @@
-# termbot
+# terminus
 
 Control your terminal from Telegram, Slack, or Discord. Built in Rust.
 
-termbot gives you remote access to terminal sessions and Claude Code from your phone. Run shell commands, manage tmux sessions, send images, and have multi-turn AI conversations -- all through Telegram, Slack, or Discord.
+terminus gives you remote access to terminal sessions and Claude Code from your phone. Run shell commands, manage tmux sessions, send images, and have multi-turn AI conversations -- all through Telegram, Slack, or Discord.
 
 ---
 
@@ -24,11 +24,11 @@ That's it. Open Telegram, Slack, or Discord and start typing.
 1. Detects your OS and architecture (macOS/Linux, x86_64/ARM64)
 2. Checks for tmux (offers to install if missing) and Claude Code CLI (required)
 3. Walks you through Telegram/Slack configuration with inline help
-4. Downloads the correct binary to `~/.local/bin/termbot`
-5. Writes config to `~/.config/termbot/termbot.toml`
+4. Downloads the correct binary to `~/.local/bin/terminus`
+5. Writes config to `~/.config/terminus/terminus.toml`
 6. Registers a system service (systemd on Linux, launchd on macOS) with auto-restart
 7. Sets up a daily update check with OS-native notifications
-8. Starts termbot
+8. Starts terminus
 
 **Flags:**
 - `--quick` — skip inline help text during setup
@@ -50,12 +50,12 @@ Pre-built binaries are also available directly on the [Releases](https://github.
 
 ```bash
 # Download for your platform (macOS Apple Silicon shown)
-curl -L -o termbot \
-  https://github.com/shegx01/termbot/releases/latest/download/termbot-aarch64-apple-darwin
+curl -L -o terminus \
+  https://github.com/shegx01/termbot/releases/latest/download/terminus-aarch64-apple-darwin
 
-chmod +x termbot
-cp termbot.example.toml termbot.toml   # edit with your tokens
-./termbot
+chmod +x terminus
+cp terminus.example.toml terminus.toml   # edit with your tokens
+./terminus
 ```
 
 ### Build from source
@@ -63,15 +63,15 @@ cp termbot.example.toml termbot.toml   # edit with your tokens
 ```bash
 git clone https://github.com/shegx01/termbot.git
 cd termbot
-cp termbot.example.toml termbot.toml   # edit with your tokens
+cp terminus.example.toml terminus.toml   # edit with your tokens
 cargo build --release
-./target/release/termbot
+./target/release/terminus
 ```
 
-To use a config file at a custom path, set `TERMBOT_CONFIG`:
+To use a config file at a custom path, set `TERMINUS_CONFIG`:
 
 ```bash
-TERMBOT_CONFIG=/path/to/config.toml ./termbot
+TERMINUS_CONFIG=/path/to/config.toml ./terminus
 ```
 
 ---
@@ -175,7 +175,7 @@ max_sessions = 10
 1. Message [@userinfobot](https://t.me/userinfobot)
 2. It replies with your numeric ID
 
-**Permissions:** The default bot token grants everything termbot needs (receive messages, send messages, edit messages). No extra config required.
+**Permissions:** The default bot token grants everything terminus needs (receive messages, send messages, edit messages). No extra config required.
 </details>
 
 ### Slack only
@@ -265,11 +265,11 @@ max_sessions = 10
 
 ### Multiple platforms
 
-Include any combination of `[telegram]`, `[slack]`, and `[discord]` sections with their corresponding IDs in `[auth]`. Any platform can be omitted -- termbot starts with whatever is configured.
+Include any combination of `[telegram]`, `[slack]`, and `[discord]` sections with their corresponding IDs in `[auth]`. Any platform can be omitted -- terminus starts with whatever is configured.
 
 ### Sleep/wake management (optional)
 
-By default, termbot holds an idle-sleep inhibitor whenever the lid is open (or the device has no lid) and the host is on AC. Drop a `[power]` section into `termbot.toml` to adjust:
+By default, terminus holds an idle-sleep inhibitor whenever the lid is open (or the device has no lid) and the host is on AC. Drop a `[power]` section into `terminus.toml` to adjust:
 
 ```toml
 [power]
@@ -282,16 +282,16 @@ enabled = true
 # the battery faster since the host can't idle-sleep.
 stayawake_on_battery = false
 
-# Override the state-file location (default: <termbot.toml dir>/termbot-state.json).
+# Override the state-file location (default: <terminus.toml dir>/terminus-state.json).
 # This file stores the Telegram offset, chat bindings, last-seen-wall timestamp,
-# and the clean-shutdown flag. It MUST be writable by the termbot process.
-# state_file = "/absolute/path/to/termbot-state.json"
+# and the clean-shutdown flag. It MUST be writable by the terminus process.
+# state_file = "/absolute/path/to/terminus-state.json"
 ```
 
 All fields are optional — an empty `[power]` section (or no section at all) uses the defaults above. Verify the inhibitor is live with:
 
 - macOS: `pmset -g assertions | grep PreventUserIdleSystem`
-- Linux: `systemd-inhibit --list | grep termbot`
+- Linux: `systemd-inhibit --list | grep terminus`
 
 ### Command trigger (optional)
 
@@ -363,7 +363,7 @@ Options passed to `: claude on` persist for the entire session (until `: claude 
 
 Quote values that contain spaces: `--system-prompt "You are a Rust expert"` or `--system-prompt 'Be concise'`. Smart/curly quotes from mobile keyboards are normalized automatically.
 
-Paths (`--add-dir`, `--mcp-config`, `--settings`) are relative to termbot's working directory, not the terminal session's. Use absolute paths when in doubt.
+Paths (`--add-dir`, `--mcp-config`, `--settings`) are relative to terminus's working directory, not the terminal session's. Use absolute paths when in doubt.
 
 Examples:
 
@@ -428,7 +428,7 @@ Use tmux mode when you need Claude Code's full interactive features (slash comma
 
 ### Terminal output
 
-termbot uses `tmux capture-pane` to read the rendered terminal screen -- no raw byte streaming, no ANSI escape stripping. Output is diffed against the previous snapshot so only new content is delivered.
+terminus uses `tmux capture-pane` to read the rendered terminal screen -- no raw byte streaming, no ANSI escape stripping. Output is diffed against the previous snapshot so only new content is delivered.
 
 - Output arrives as new messages in Telegram (no edit-in-place accumulation)
 - Long output is automatically split at ~4000 chars (within Telegram's 4096 limit)
@@ -455,17 +455,17 @@ The `: claude` command uses the `claude-agent-sdk-rust` crate, which calls the C
 
 ### Output file delivery
 
-When Claude creates or writes files during a prompt, termbot automatically delivers qualifying files back to chat:
+When Claude creates or writes files during a prompt, terminus automatically delivers qualifying files back to chat:
 
 - **Images** (png, jpg, gif, webp, svg, bmp) -- sent as native photo previews
 - **Documents** (pdf, csv, xlsx, docx, pptx) -- sent as file attachments
 - **Text/data** (md, txt, json, yaml, toml, xml, html) -- sent as file attachments
 
-Files are detected from Write/Edit tool calls, Bash output redirects (`-o`, `>`, `--output`), and a post-prompt scan of the working directory and `/tmp`. Sensitive files (`termbot.toml`, `.env`, `credentials*`, `secret*`, `token*`, `password*`, `private_key*`) are never delivered. Max file size: 50 MB.
+Files are detected from Write/Edit tool calls, Bash output redirects (`-o`, `>`, `--output`), and a post-prompt scan of the working directory and `/tmp`. Sensitive files (`terminus.toml`, `.env`, `credentials*`, `secret*`, `token*`, `password*`, `private_key*`) are never delivered. Max file size: 50 MB.
 
 ### Session persistence
 
-When termbot shuts down (Ctrl+C), tmux sessions keep running. On restart, termbot automatically reconnects to surviving `tb-*` sessions. Send any command (e.g., `: list`) to re-bind the chat delivery.
+When terminus shuts down (Ctrl+C), tmux sessions keep running. On restart, terminus automatically reconnects to surviving `term-*` sessions. Send any command (e.g., `: list`) to re-bind the chat delivery.
 
 ---
 
@@ -477,7 +477,7 @@ Single-user only. Messages from any user ID other than the configured one are **
 
 ### Command blocklist
 
-Dangerous commands are blocked by regex patterns in `termbot.toml`. Both `: ` prefixed commands AND plain text input (including text routed to Claude) are checked. The defaults block:
+Dangerous commands are blocked by regex patterns in `terminus.toml`. Both `: ` prefixed commands AND plain text input (including text routed to Claude) are checked. The defaults block:
 
 | Pattern | Blocks |
 |---------|--------|
@@ -521,7 +521,7 @@ Files delivered from Claude are restricted:
 
 ### Smart quote normalization
 
-Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. termbot automatically normalizes these so shell commands work correctly.
+Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. terminus automatically normalizes these so shell commands work correctly.
 
 ---
 
@@ -548,19 +548,19 @@ Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. termbo
 | `commands.trigger` | char | Command prefix character (default: `:`). Must be one of `: ! > ; . , @ ~ ^ - + = \| % ?` |
 | `power.enabled` | bool | Enable the power-management subsystem (default: true). Set false for CI / headless |
 | `power.stayawake_on_battery` | bool | Prevent idle sleep on battery power too (default: false; AC-only) |
-| `power.state_file` | string | Override for the persisted-state JSON file (default: adjacent to `termbot.toml`) |
+| `power.state_file` | string | Override for the persisted-state JSON file (default: adjacent to `terminus.toml`) |
 
-Override the config file path with `TERMBOT_CONFIG=/path/to/file.toml`.
+Override the config file path with `TERMINUS_CONFIG=/path/to/file.toml`.
 
 ### Sleep/wake behavior
 
-termbot holds a platform-appropriate idle-sleep assertion while the lid is
+terminus holds a platform-appropriate idle-sleep assertion while the lid is
 open (or the device has no lid) and the host is on AC. On macOS this is a
 supervised `caffeinate -i` child; on Linux it's `systemd-inhibit --what=idle:sleep`.
 Closed-lid sleep is **never** blocked — macOS clamshell and Linux
 lid-close suspend continue to work normally.
 
-When the host does sleep (lid close, forced suspend, overnight), termbot
+When the host does sleep (lid close, forced suspend, overnight), terminus
 detects the gap on wake via monotonic/wall-clock divergence (>30s) and emits
 a one-time banner per active chat:
 
@@ -574,11 +574,11 @@ updates server-side and drains them in `update_id` order on resume. Discord
 uses a handler-gate (gateway events during the pause window are discarded --
 the pause is typically <5s and the `: ` command protocol is self-recoverable).
 If a banner fails to deliver within the timeout (e.g., rate-limit or network
-blip), termbot falls back to prepending `[gap: Xm Ys] ` inline to the first
+blip), terminus falls back to prepending `[gap: Xm Ys] ` inline to the first
 outbound message for that chat so the gap is never silently hidden.
 
 The Telegram offset and chat bindings persist atomically to
-`termbot-state.json` (adjacent to `termbot.toml` by default). A restart
+`terminus-state.json` (adjacent to `terminus.toml` by default). A restart
 during sleep still delivers a banner and drains the backlog, guarded by a
 compound gate: wall-gap > 30s **AND** the previous shutdown was unclean
 (so `cargo build`-and-restart cycles don't fire spurious banners).
@@ -586,7 +586,7 @@ compound gate: wall-gap > 30s **AND** the previous shutdown was unclean
 Verify the assertion with:
 
 - macOS: `pmset -g assertions | grep PreventUserIdleSystem`
-- Linux: `systemd-inhibit --list | grep termbot`
+- Linux: `systemd-inhibit --list | grep terminus`
 
 ---
 
@@ -664,7 +664,7 @@ Create a session first: `: new <name>`. If you just restarted, sessions auto-rec
 <details>
 <summary>No output after restart</summary>
 
-Reconnected sessions need a chat binding. Send `: list` or `: fg <name>` first -- this tells termbot which chat to deliver to.
+Reconnected sessions need a chat binding. Send `: list` or `: fg <name>` first -- this tells terminus which chat to deliver to.
 </details>
 
 <details>
@@ -694,7 +694,7 @@ The Claude CLI must be installed and authenticated: `npm i -g @anthropic-ai/clau
 <details>
 <summary>Smart quotes causing shell errors</summary>
 
-termbot normalizes curly quotes automatically. If you still see issues, check that you're running the latest build.
+terminus normalizes curly quotes automatically. If you still see issues, check that you're running the latest build.
 </details>
 
 <details>
@@ -713,7 +713,7 @@ The default limit is 10 concurrent sessions. Kill unused sessions with `: kill <
 
 ## tmux compatibility
 
-termbot works with any `base-index` or `pane-base-index` setting. Sessions are targeted by name (`tb-build`), never by numeric index.
+terminus works with any `base-index` or `pane-base-index` setting. Sessions are targeted by name (`term-build`), never by numeric index.
 
 ---
 

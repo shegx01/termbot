@@ -54,6 +54,6 @@ enabled = true
 stayawake_on_battery = false
 
 # Optional override for the persisted-state file location. Defaults to
-# `<termbot.toml's directory>/termbot-state.json`. Set this to e.g.
-# `~/.local/share/termbot/state.json` for an XDG-style location.
-# state_file = "/absolute/or/~-prefixed/path/to/termbot-state.json"
+# `<terminus.toml's directory>/terminus-state.json`. Set this to e.g.
+# `~/.local/share/terminus/state.json` for an XDG-style location.
+# state_file = "/absolute/or/~-prefixed/path/to/terminus-state.json"

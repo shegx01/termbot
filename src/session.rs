@@ -50,7 +50,7 @@ impl SessionManager {
             bail!("Session '{}' already tracked", name);
         }
         if !self.tmux.has_session(name).await? {
-            bail!("tmux session 'tb-{}' does not exist", name);
+            bail!("tmux session 'term-{}' does not exist", name);
         }
 
         let is_first = self.sessions.is_empty();
@@ -89,7 +89,7 @@ impl SessionManager {
         }
 
         if self.tmux.has_session(name).await? {
-            bail!("tmux session 'tb-{}' already exists externally. Use `{} fg {}` after restart to reconnect.", name, self.trigger, name);
+            bail!("tmux session 'term-{}' already exists externally. Use `{} fg {}` after restart to reconnect.", name, self.trigger, name);
         }
 
         self.tmux.create_session(name).await?;

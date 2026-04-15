@@ -199,7 +199,7 @@ impl Config {
         if !self.telegram_enabled() && !self.slack_enabled() && !self.discord_enabled() {
             anyhow::bail!(
                 "At least one platform must be configured. \
-                 Add a [telegram], [slack], or [discord] section to termbot.toml."
+                 Add a [telegram], [slack], or [discord] section to terminus.toml."
             );
         }
 

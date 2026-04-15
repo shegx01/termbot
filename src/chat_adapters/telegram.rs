@@ -229,7 +229,7 @@ impl TelegramAdapter {
                                 match bot.get_file(&photo.file.id).send().await {
                                     Ok(tg_file) => {
                                         let path = PathBuf::from(format!(
-                                            "/tmp/termbot-img-{}.jpg",
+                                            "/tmp/terminus-img-{}.jpg",
                                             Uuid::new_v4()
                                         ));
                                         match tokio::fs::File::create(&path).await {
@@ -298,7 +298,7 @@ impl TelegramAdapter {
                                 match bot.get_file(&doc.file.id).send().await {
                                     Ok(tg_file) => {
                                         let path = PathBuf::from(format!(
-                                            "/tmp/termbot-img-{}.{}",
+                                            "/tmp/terminus-img-{}.{}",
                                             Uuid::new_v4(),
                                             ext
                                         ));

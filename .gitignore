@@ -1,5 +1,7 @@
 /target
-termbot.toml
-/tmp/termbot-*.out
+terminus.toml
+/tmp/terminus-*.out
+terminus-state.json
+terminus-state.json.tmp
 .omc/
 .claude/worktrees/

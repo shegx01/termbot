@@ -326,7 +326,7 @@ impl SlackPlatform {
                 .and_then(|e| e.to_str())
                 .unwrap_or("jpg");
 
-            let tmp_path = PathBuf::from(format!("/tmp/termbot-img-{}.{}", Uuid::new_v4(), ext));
+            let tmp_path = PathBuf::from(format!("/tmp/terminus-img-{}.{}", Uuid::new_v4(), ext));
 
             let download_future = self
                 .http_client

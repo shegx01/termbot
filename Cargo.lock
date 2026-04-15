@@ -2352,7 +2352,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "termbot"
+name = "terminus"
 version = "0.1.0"
 dependencies = [
  "anyhow",

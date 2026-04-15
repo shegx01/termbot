@@ -201,7 +201,7 @@ impl StateStore {
     #[allow(dead_code)]
     pub fn persist(&self) -> Result<()> {
         // `Path::parent()` returns `Some("")` for a bare filename like
-        // `termbot-state.json`, which then propagates into `File::open("")`
+        // `terminus-state.json`, which propagates into `File::open("")`
         // and fails with ENOENT on directory fsync. Collapse empty → ".".
         let parent = match self.path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
@@ -300,7 +300,7 @@ impl StateStore {
         &self.state
     }
 
-    /// Returns the default state file path: `<config_parent>/termbot-state.json`.
+    /// Returns the default state file path: `<config_parent>/terminus-state.json`.
     /// Used when `power.state_file` is `None`.
     #[allow(dead_code)]
     pub fn resolve_default_path(config_path: &Path) -> PathBuf {
@@ -308,7 +308,7 @@ impl StateStore {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
-        parent.join("termbot-state.json")
+        parent.join("terminus-state.json")
     }
 }
 
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn load_missing_file_returns_default() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("termbot-state.json");
+        let path = dir.path().join("terminus-state.json");
         assert!(!path.exists());
 
         let store = StateStore::load(&path).expect("load missing file");
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn load_corrupt_file_quarantines_and_starts_fresh() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("termbot-state.json");
+        let path = dir.path().join("terminus-state.json");
         std::fs::write(&path, b"{invalid json}").unwrap();
 
         let store = StateStore::load(&path).expect("load corrupt file");
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn persist_is_atomic_on_drop() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("termbot-state.json");
+        let path = dir.path().join("terminus-state.json");
 
         // First: write and persist a known state.
         let mut store = StateStore::load(&path).unwrap();
@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn apply_telegram_offset_overwrites() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("termbot-state.json");
+        let path = dir.path().join("terminus-state.json");
         let mut store = StateStore::load(&path).unwrap();
 
         store.apply(StateUpdate::TelegramOffset(5));
@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn apply_bind_chat_deduplicates() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("termbot-state.json");
+        let path = dir.path().join("terminus-state.json");
         let mut store = StateStore::load(&path).unwrap();
 
         store.apply(StateUpdate::BindTelegramChat(42));
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn apply_mark_dirty_flips_clean_shutdown() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("termbot-state.json");
+        let path = dir.path().join("terminus-state.json");
         let mut store = StateStore::load(&path).unwrap();
 
         // Default must be true (clean).
@@ -459,9 +459,9 @@ mod tests {
 
     #[test]
     fn resolve_default_path_returns_adjacent_to_config() {
-        let config_path = Path::new("/tmp/x/termbot.toml");
+        let config_path = Path::new("/tmp/x/terminus.toml");
         let state_path = StateStore::resolve_default_path(config_path);
-        assert_eq!(state_path, PathBuf::from("/tmp/x/termbot-state.json"));
+        assert_eq!(state_path, PathBuf::from("/tmp/x/terminus-state.json"));
     }
 
     #[test]
@@ -469,9 +469,9 @@ mod tests {
         // A bare config filename (no directory component) used to produce a
         // bare state filename, which in turn made `persist()` call
         // `File::open("")` for the directory fsync and log ENOENT every time.
-        let config_path = Path::new("termbot.toml");
+        let config_path = Path::new("terminus.toml");
         let state_path = StateStore::resolve_default_path(config_path);
-        assert_eq!(state_path, PathBuf::from("./termbot-state.json"));
+        assert_eq!(state_path, PathBuf::from("./terminus-state.json"));
     }
 
     #[test]
@@ -483,11 +483,11 @@ mod tests {
         std::env::set_current_dir(dir.path()).unwrap();
 
         let result = (|| -> Result<()> {
-            let mut store = StateStore::load(PathBuf::from("termbot-state.json"))?;
+            let mut store = StateStore::load(PathBuf::from("terminus-state.json"))?;
             store.apply(StateUpdate::TelegramOffset(7));
             store.persist()?;
             let on_disk: State = serde_json::from_str(&std::fs::read_to_string(
-                dir.path().join("termbot-state.json"),
+                dir.path().join("terminus-state.json"),
             )?)?;
             assert_eq!(on_disk.telegram.offset, 7);
             Ok(())
@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn apply_bind_discord_chat_deduplicates() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("termbot-state.json");
+        let path = dir.path().join("terminus-state.json");
         let mut store = StateStore::load(&path).unwrap();
 
         store.apply(StateUpdate::BindDiscordChat("123456".into()));
@@ -538,7 +538,7 @@ mod tests {
     fn schema_version_preserved_or_quarantined() {
         // A file with schema_version != 1 should be quarantined and default returned.
         let dir = tempdir().unwrap();
-        let path = dir.path().join("termbot-state.json");
+        let path = dir.path().join("terminus-state.json");
 
         let incompatible = serde_json::json!({
             "schema_version": 99,

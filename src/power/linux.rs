@@ -275,8 +275,8 @@ impl PowerManager for LinuxPowerManager {
                 .args([
                     "--what=idle:sleep",
                     "--mode=block",
-                    "--who=termbot",
-                    "--why=termbot is running",
+                    "--who=terminus",
+                    "--why=terminus is running",
                     "sleep",
                     "infinity",
                 ])

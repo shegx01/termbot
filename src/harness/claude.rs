@@ -447,9 +447,9 @@ async fn scan_new_files(dir: &Path, since: std::time::SystemTime) -> Vec<String>
             continue;
         }
 
-        // Skip termbot temp files
+        // Skip terminus temp files
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("termbot-img-") {
+            if name.starts_with("terminus-img-") {
                 continue;
             }
         }
@@ -472,7 +472,7 @@ const MAX_OUTPUT_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB (Telegram doc limit
 /// Check written files and emit HarnessEvent::File for deliverable ones.
 /// Sensitive filename patterns that must never be delivered to chat.
 const SENSITIVE_PATTERNS: &[&str] = &[
-    "termbot.toml",
+    "terminus.toml",
     ".env",
     "credentials",
     "secret",
@@ -515,7 +515,7 @@ async fn emit_output_files(
 
         // Skip input attachment temp files
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("termbot-img-") {
+            if name.starts_with("terminus-img-") {
                 continue;
             }
             // Skip sensitive files
@@ -822,8 +822,8 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_patterns_termbot_toml_matches() {
-        assert!(filename_is_sensitive("termbot.toml"));
+    fn sensitive_patterns_terminus_toml_matches() {
+        assert!(filename_is_sensitive("terminus.toml"));
     }
 
     #[test]

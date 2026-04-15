@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn noise_detection_starship_prompt() {
         assert!(is_noise_line(
-            "termbot on  main ()   [?] is 📦 v0.1.0 via 🦀 v1.76.0",
+            "terminus on  main ()   [?] is 📦 v0.1.0 via 🦀 v1.76.0",
             None
         ));
     }
@@ -550,7 +550,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn make_buf() -> OutputBuffer {
-        OutputBuffer::new("tb-test", 65536)
+        OutputBuffer::new("term-test", 65536)
     }
 
     /// AC-1: Fresh session — `: pwd` delivers the command's output to chat.

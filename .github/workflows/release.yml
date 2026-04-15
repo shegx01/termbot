@@ -87,13 +87,13 @@ jobs:
       - name: Rename binary
         env:
           BUILD_TARGET: ${{ matrix.target }}
-        run: mv "target/${BUILD_TARGET}/release/termbot" "termbot-${BUILD_TARGET}"
+        run: mv "target/${BUILD_TARGET}/release/terminus" "terminus-${BUILD_TARGET}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
-          name: termbot-${{ matrix.target }}
-          path: termbot-${{ matrix.target }}
+          name: terminus-${{ matrix.target }}
+          path: terminus-${{ matrix.target }}
 
   release:
     name: Release
@@ -115,7 +115,7 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
         run: |
           cd artifacts
-          sha256sum termbot-* > checksums.txt
+          sha256sum terminus-* > checksums.txt
           {
             echo "Automated release from commit ${COMMIT_SHA}"
             echo ""
@@ -137,5 +137,5 @@ jobs:
           name: "Build ${{ env.TAG }}"
           body_path: release-notes.md
           files: |
-            artifacts/termbot-*
+            artifacts/terminus-*
           fail_on_unmatched_files: true

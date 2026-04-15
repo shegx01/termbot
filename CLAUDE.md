@@ -1,4 +1,4 @@
-# termbot
+# terminus
 
 Single-user Rust bot that controls tmux terminal sessions from Telegram, Slack, and Discord. Built on tokio async runtime with `tokio::select!` main loop.
 
@@ -7,10 +7,10 @@ Single-user Rust bot that controls tmux terminal sessions from Telegram, Slack, 
 ```bash
 cargo build                  # build
 cargo test                   # run unit tests (18 tests in command + buffer modules)
-cargo run                    # requires termbot.toml (copy termbot.example.toml)
+cargo run                    # requires terminus.toml (copy terminus.example.toml)
 ```
 
-Config file `termbot.toml` contains API secrets and is gitignored. Never commit it.
+Config file `terminus.toml` contains API secrets and is gitignored. Never commit it.
 
 ## Architecture
 
@@ -84,7 +84,7 @@ delivery task and acked back via `DeliveryAck::BannerSent`.
 Cross-platform (macOS + Linux) per the consensus plan:
 - **Idle sleep is prevented** while the lid is open (or the device has no lid)
   and the host is on AC. Set `power.stayawake_on_battery = true` in
-  `termbot.toml` to prevent idle sleep on battery too.
+  `terminus.toml` to prevent idle sleep on battery too.
 - **Closed-lid sleep is never blocked** — this is intentional. macOS clamshell
   and Linux `systemd-inhibit --what=idle:sleep` are both idle-sleep-only.
 - **Wake recovery**: a 1s ticker compares `SystemTime` (wall) vs `Instant`
@@ -95,7 +95,7 @@ Cross-platform (macOS + Linux) per the consensus plan:
   messages` banner is broadcast per active chat, the banner-sent ack is
   awaited (5s timeout with inline-prefix fallback), then polling resumes.
 - **Restart durability**: Telegram offset and chat IDs are persisted to
-  `<termbot.toml parent>/termbot-state.json` (or the `power.state_file`
+  `<terminus.toml parent>/terminus-state.json` (or the `power.state_file`
   override). The restart-banner gate requires `last_clean_shutdown == false`
   AND `wall_gap > 30s` so graceful restarts don't trigger spurious banners.
 - **Discord pause** uses a handler-gate rather than a poll-gate. Gateway events
@@ -127,7 +127,7 @@ All three implement `ChatPlatform` (async_trait). Auth is single-user: messages 
 - Error handling: `anyhow::Result` everywhere, `thiserror` for `ParseError` in command.rs
 - Logging: `tracing` macros (`info!`, `warn!`, `error!`, `debug!`), initialized with `tracing_subscriber::fmt`
 - Async: all tmux operations are async (spawns `tmux` CLI as child process via `tokio::process::Command`)
-- Sessions are prefixed `tb-` in tmux (e.g. `tb-build`). Always target by name, never by window/pane index
+- Sessions are prefixed `term-` in tmux (e.g. `term-build`). Always target by name, never by window/pane index
 - Smart quotes from mobile keyboards are normalized to ASCII in `tmux.rs::normalize_quotes`
 - Tests live in `#[cfg(test)] mod tests` within each module, not in a separate `tests/` dir
 
@@ -137,7 +137,7 @@ All three implement `ChatPlatform` (async_trait). Auth is single-user: messages 
 - **tmux must be on PATH.** All session operations shell out to `tmux`.
 - **No shared mutable state.** The main loop owns all mutable state directly; platform adapters only send/receive through channels.
 - **Rate limiting is per-platform.** `edit_throttle_ms` config controls minimum gap between message edits to stay within Telegram/Slack API limits.
-- **Startup reconciliation.** On restart, surviving `tb-*` tmux sessions are auto-reconnected. Chat binding is re-established on first user message (chat IDs are not persisted to disk).
+- **Startup reconciliation.** On restart, surviving `term-*` tmux sessions are auto-reconnected. Chat binding is re-established on first user message (chat IDs are not persisted to disk).
 
 ## Testing
 

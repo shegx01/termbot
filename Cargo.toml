@@ -1,8 +1,8 @@
 [package]
-name = "termbot"
+name = "terminus"
 version = "0.1.0"
 edition = "2021"
-description = "Control terminal sessions from Telegram and Slack"
+description = "Control terminal sessions from Telegram/Slack/Discord with structured-output automation"
 
 [workspace]
 
