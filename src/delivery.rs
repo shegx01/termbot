@@ -285,6 +285,25 @@ async fn handle_stream_event(
                 );
             }
         }
+        StreamEvent::QueueDrained {
+            delivered_count,
+            chat,
+        } => {
+            if chat.platform != platform.platform_type() {
+                return;
+            }
+            let msg = format!("✅ queue drained ({} delivered)", delivered_count);
+            if let Err(e) = platform
+                .send_message(&msg, &chat.chat_id, chat.thread_ts.as_deref())
+                .await
+            {
+                tracing::warn!(
+                    "Failed to send queue-drained status to chat {}: {}",
+                    chat.chat_id,
+                    e
+                );
+            }
+        }
     }
 }
 

@@ -544,6 +544,27 @@ webhook = "https://example.com/hook"
         );
     }
 
+    /// Non-https:// webhook URLs are rejected.  Leaks the HMAC signature and
+    /// the entire structured-output body over the network to any on-path
+    /// observer.
+    #[test]
+    fn http_webhook_url_fails_validation() {
+        let toml = minimal_telegram_toml_with_schemas(
+            r#"
+[schemas.todos]
+schema = '{"type": "object"}'
+webhook = "http://example.com/hook"
+webhook_secret_env = "IRRELEVANT"
+"#,
+        );
+        let err = load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("must use https://"),
+            "Error should reject http://, got: {}",
+            err
+        );
+    }
+
     #[test]
     #[serial(env_mutation)]
     fn missing_webhook_secret_env_fails_load() {

@@ -72,6 +72,13 @@ pub enum StreamEvent {
         status: WebhookStatusKind,
         chat: ChatBinding,
     },
+    /// Emitted by the retry worker once per chat after a non-empty drain cycle
+    /// completes.  One event per unique `ChatBinding` whose pending jobs were
+    /// delivered in this cycle.  Chat message: `✅ queue drained (N delivered)`.
+    QueueDrained {
+        delivered_count: u32,
+        chat: ChatBinding,
+    },
 }
 
 /// Captures terminal output by diffing tmux pane content between polls.

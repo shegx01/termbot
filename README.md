@@ -518,7 +518,11 @@ function verify(secret, body, timestamp, signature) {
   if (Math.abs(Date.now() / 1000 - parseInt(timestamp)) > 300) return false;
   const payload = `${timestamp}.${body}`;
   const expected = "v1=" + crypto.createHmac("sha256", secret).update(payload).digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  const expectedBuf = Buffer.from(expected);
+  const signatureBuf = Buffer.from(signature);
+  // timingSafeEqual requires equal-length buffers; length mismatch => invalid.
+  if (expectedBuf.length !== signatureBuf.length) return false;
+  return crypto.timingSafeEqual(expectedBuf, signatureBuf);
 }
 ```
 

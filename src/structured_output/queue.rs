@@ -387,6 +387,51 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// Queue job files contain structured-output bodies that may include
+    /// information derived from the user's code/context. On Unix, the file
+    /// must be 0o600 (owner-only) so other users on a shared host cannot
+    /// read it.  If the `set_permissions` call is ever removed or broken,
+    /// this test catches it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enqueued_file_has_mode_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let q = DeliveryQueue::new(dir.path().to_path_buf()).unwrap();
+        let path = q
+            .enqueue(&make_job("01HTESTPERMS0001TESTPERMS0"))
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "queue file must be 0o600 (owner-only), got {:#o}",
+            mode & 0o777
+        );
+    }
+
+    /// Queue subdirectories (tmp/, pending/, dead/) should also be 0o700 so a
+    /// casual `ls` from another user cannot enumerate pending run_ids.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queue_subdirs_have_mode_0o700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let _q = DeliveryQueue::new(dir.path().to_path_buf()).unwrap();
+        for sub in ["tmp", "pending", "dead"] {
+            let path = dir.path().join(sub);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "queue subdir {} must be 0o700, got {:#o}",
+                sub,
+                mode & 0o777
+            );
+        }
+    }
+
     #[tokio::test]
     async fn move_to_dead_creates_sidecar_and_removes_from_pending() {
         let dir = tempdir().unwrap();

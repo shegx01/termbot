@@ -232,9 +232,12 @@ async fn run_claude_prompt_inner(
                 } else {
                     known
                 };
+                // Emit as Text (not Error) so the chat message is exactly
+                // `❌ unknown schema 'X' (known: ...)` without the "Error: "
+                // wrapper that send_error prepends.
                 let _ = event_tx
-                    .send(HarnessEvent::Error(format!(
-                        "unknown schema '{}' (known: {})",
+                    .send(HarnessEvent::Text(format!(
+                        "❌ unknown schema '{}' (known: {})",
                         schema_name, known_display
                     )))
                     .await;

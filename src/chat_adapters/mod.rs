@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlatformType {
     Telegram,
     Slack,
@@ -22,7 +22,7 @@ pub enum PlatformType {
 ///
 /// Carried in queue job files so the retry worker can send status messages
 /// to the correct chat across restarts (queue files are self-describing).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChatBinding {
     pub platform: PlatformType,
     pub chat_id: String,
@@ -174,5 +174,29 @@ mod tests {
         let restored: ChatBinding = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.chat_id, binding.chat_id);
         assert!(matches!(restored.platform, PlatformType::Slack));
+    }
+
+    /// Golden-string assertion guarding the on-disk queue-file wire format.
+    ///
+    /// `ChatBinding` is persisted inside every `DeliveryJob` under
+    /// `<queue_dir>/pending/<run_id>.json`.  Queue files may survive across
+    /// terminus restarts and upgrades.  If a future refactor silently adds
+    /// `#[serde(rename = "…")]` or reorders fields in a backwards-incompatible
+    /// way, existing pending deliveries could fail to deserialize.  The
+    /// round-trip test above only proves the type is self-consistent; this
+    /// one pins the exact serialized form.
+    #[test]
+    fn chat_binding_serializes_to_exact_known_json() {
+        let binding = ChatBinding {
+            platform: PlatformType::Telegram,
+            chat_id: "12345".to_string(),
+            thread_ts: None,
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        assert_eq!(
+            json, r#"{"platform":"Telegram","chat_id":"12345","thread_ts":null}"#,
+            "ChatBinding JSON wire format changed; this breaks persisted queue \
+             files. If intentional, coordinate with a queue-file migration."
+        );
     }
 }

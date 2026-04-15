@@ -199,6 +199,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_mutation)]
     fn registry_webhook_with_missing_env_var_fails() {
         let mut entries = HashMap::new();
         entries.insert(

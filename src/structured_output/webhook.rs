@@ -169,6 +169,31 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    /// Golden-vector test with a HARDCODED hex string.  Unlike
+    /// `sign_matches_reference_vector` (which compares two in-process HMAC
+    /// computations), this asserts bit-exactness against a value generated
+    /// from an INDEPENDENT implementation (openssl CLI / Python `hmac`
+    /// stdlib).  If `sign()` were silently refactored to use a wrong
+    /// separator, wrong digest, or wrong encoding, BOTH in-process paths
+    /// would produce the same wrong output and the above test would still
+    /// pass — this one would catch it.
+    ///
+    /// To regenerate: `echo -n '1713193920.{"todos":[]}' | openssl dgst -sha256 -hmac 'test-secret'`
+    #[test]
+    fn sign_matches_hardcoded_golden_vector() {
+        let secret = b"test-secret";
+        let ts: u64 = 1713193920;
+        let body = b"{\"todos\":[]}";
+        let result = sign(secret, ts, body);
+        assert_eq!(
+            result, "12c22f837a913aad7cdafe23d84786b661224dd6a70438e94a078bb2a18d15e6",
+            "Wire-contract signature MUST match the independently-computed \
+             golden vector. If this fails, either the signed-payload construction \
+             (`<ts>.<body>`), the digest algorithm (SHA-256), or the encoding \
+             (hex lowercase) has changed — which breaks every consumer in the wild."
+        );
+    }
+
     #[test]
     fn sign_includes_timestamp_in_scope() {
         let secret = b"test-secret";

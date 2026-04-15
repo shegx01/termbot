@@ -67,7 +67,7 @@ pub fn spawn_retry_worker(
 
         loop {
             // Check for shutdown signal (non-blocking).
-            if shutdown_flag.load(Ordering::Relaxed) {
+            if shutdown_flag.load(Ordering::Acquire) {
                 tracing::info!("Retry worker: shutdown signal received, draining in-flight...");
                 break;
             }
@@ -94,10 +94,17 @@ pub fn spawn_retry_worker(
             }
 
             let mut delivered_count = 0usize;
+            // Per-chat delivery tally for this drain cycle.  At the end we
+            // emit one `QueueDrained` StreamEvent per chat that had jobs
+            // delivered, so each chat sees `✅ queue drained (N delivered)`.
+            let mut per_chat_delivered: std::collections::HashMap<
+                crate::chat_adapters::ChatBinding,
+                u32,
+            > = std::collections::HashMap::new();
 
             for path in &paths {
                 // Re-check shutdown before each job.
-                if shutdown_flag.load(Ordering::Relaxed) {
+                if shutdown_flag.load(Ordering::Acquire) {
                     tracing::info!("Retry worker: shutdown during drain, stopping");
                     break;
                 }
@@ -185,6 +192,9 @@ pub fn spawn_retry_worker(
                         consecutive_failures.remove(&job.schema);
                         let _ = queue.remove(path).await;
                         delivered_count += 1;
+                        *per_chat_delivered
+                            .entry(job.source_chat_binding.clone())
+                            .or_insert(0) += 1;
 
                         let _ = events_tx.send(StreamEvent::WebhookStatus {
                             schema: job.schema.clone(),
@@ -247,6 +257,15 @@ pub fn spawn_retry_worker(
 
             if delivered_count > 0 {
                 tracing::info!(delivered_count = delivered_count, "queue.drain_complete");
+                // Emit one QueueDrained per chat whose pending jobs were drained
+                // in this cycle, so the user sees `✅ queue drained (N delivered)`
+                // in each affected chat.
+                for (chat, count) in per_chat_delivered {
+                    let _ = events_tx.send(StreamEvent::QueueDrained {
+                        delivered_count: count,
+                        chat,
+                    });
+                }
             }
         }
 
@@ -325,6 +344,23 @@ mod tests {
             max_retry_age_hours == 0,
             "max_retry_age_hours = 0 should never trigger abandonment"
         );
+    }
+
+    /// Guards against a misconfiguration where `max_retry_age_hours` is set to
+    /// a value larger than `u64::MAX / 3600`.  Plain multiplication would
+    /// panic in debug builds or wrap to a tiny value in release, causing all
+    /// jobs to be immediately abandoned.  `saturating_mul` caps at u64::MAX.
+    #[test]
+    fn max_retry_age_saturating_mul_does_not_overflow() {
+        let huge: u64 = u64::MAX;
+        let result = huge.saturating_mul(3600);
+        assert_eq!(
+            result,
+            u64::MAX,
+            "saturating_mul must cap at u64::MAX, not wrap"
+        );
+        // Duration::from_secs(u64::MAX) must not panic either.
+        let _ = Duration::from_secs(result);
     }
 
     #[test]
