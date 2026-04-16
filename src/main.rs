@@ -43,7 +43,19 @@ async fn main() -> Result<()> {
     let (cancel_tx, mut cancel_rx) = mpsc::channel::<String>(32);
 
     // ── State store ───────────────────────────────────────────────────────────
-    let config_path_buf = std::path::PathBuf::from(&config_path);
+    // Canonicalize config path to absolute so resolve_default_path produces an
+    // absolute state file path (avoids "creating tempfile in ." when the binary
+    // is launched with a relative TERMINUS_CONFIG).
+    let config_path_buf = std::fs::canonicalize(&config_path).unwrap_or_else(|_| {
+        // canonicalize failed (e.g. path doesn't exist — shouldn't happen since
+        // Config::load already succeeded) — fall back to CWD join.
+        let p = std::path::PathBuf::from(&config_path);
+        if p.is_relative() {
+            std::env::current_dir().map(|cwd| cwd.join(&p)).unwrap_or(p)
+        } else {
+            p
+        }
+    });
     let state_path = config
         .power
         .state_file

@@ -234,7 +234,7 @@ impl SessionManager {
                     crashed.push((name, None));
                 }
                 Err(e) => {
-                    tracing::error!("Failed to check session '{}': {}", name, e);
+                    tracing::error!("Failed to check session '{}': {:#}", name, e);
                 }
             }
         }

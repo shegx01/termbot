@@ -266,6 +266,15 @@ impl App {
             }
         }
 
+        // Verify tmux is available before anything else.
+        match self.session_mgr.tmux().verify_available().await {
+            Ok(version) => tracing::info!("tmux available: {}", version),
+            Err(e) => tracing::error!(
+                "tmux is not available: {:#}. Session commands will fail.",
+                e
+            ),
+        }
+
         // Reconnect to surviving term-* tmux sessions
         match self.session_mgr.tmux().list_sessions().await {
             Ok(sessions) if !sessions.is_empty() => {
@@ -282,7 +291,7 @@ impl App {
                             tracing::info!("Reconnected session '{}'", name);
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to reconnect session '{}': {}", name, e);
+                            tracing::warn!("Failed to reconnect session '{}': {:#}", name, e);
                         }
                     }
                 }
@@ -290,8 +299,11 @@ impl App {
                     tracing::info!("Foreground session: '{}'", fg);
                 }
             }
-            _ => {
+            Ok(_) => {
                 tracing::info!("No existing tmux sessions found");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to list tmux sessions: {:#}", e);
             }
         }
     }
@@ -586,7 +598,8 @@ impl App {
         let cmd = match ParsedCommand::parse(&msg.text, self.trigger) {
             Ok(cmd) => cmd,
             Err(e) => {
-                self.send_error(&msg.reply_context, &e.to_string()).await;
+                self.send_error(&msg.reply_context, &format!("{:#}", e))
+                    .await;
                 return;
             }
         };
@@ -663,7 +676,7 @@ impl App {
                 }
                 Err(e) => {
                     // Check if the error is a session-limit error and emit ambient.
-                    let err_str = e.to_string();
+                    let err_str = format!("{:#}", e);
                     if err_str.contains("Maximum session limit") {
                         self.emit_ambient(AmbientEvent::SessionLimitReached {
                             attempted: name.clone(),
@@ -688,7 +701,8 @@ impl App {
                     .await;
                 }
                 Err(e) => {
-                    self.send_error(&msg.reply_context, &e.to_string()).await;
+                    self.send_error(&msg.reply_context, &format!("{:#}", e))
+                        .await;
                 }
             },
             ParsedCommand::Background => match self.session_mgr.bg() {
@@ -704,7 +718,8 @@ impl App {
                         .await;
                 }
                 Err(e) => {
-                    self.send_error(&msg.reply_context, &e.to_string()).await;
+                    self.send_error(&msg.reply_context, &format!("{:#}", e))
+                        .await;
                 }
             },
             ParsedCommand::ListSessions => {
@@ -749,7 +764,8 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.send_error(&msg.reply_context, &e.to_string()).await;
+                        self.send_error(&msg.reply_context, &format!("{:#}", e))
+                            .await;
                     }
                 },
                 None => {
@@ -769,7 +785,8 @@ impl App {
                         .await;
                 }
                 Err(e) => {
-                    self.send_error(&msg.reply_context, &e.to_string()).await;
+                    self.send_error(&msg.reply_context, &format!("{:#}", e))
+                        .await;
                 }
             },
             ParsedCommand::HarnessOn {
@@ -937,7 +954,8 @@ impl App {
                     }
                 }
                 if let Err(e) = self.session_mgr.execute_in_foreground(&cmd).await {
-                    self.send_error(&msg.reply_context, &e.to_string()).await;
+                    self.send_error(&msg.reply_context, &format!("{:#}", e))
+                        .await;
                 }
             }
             ParsedCommand::StdinInput { text } => {
@@ -978,7 +996,8 @@ impl App {
                         }
                     }
                     if let Err(e) = self.session_mgr.send_stdin_to_foreground(&text).await {
-                        self.send_error(&msg.reply_context, &e.to_string()).await;
+                        self.send_error(&msg.reply_context, &format!("{:#}", e))
+                            .await;
                     }
                 }
             }
@@ -1090,7 +1109,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.send_error(ctx, &format!("{}: {}", kind.name(), e))
+                self.send_error(ctx, &format!("{}: {:#}", kind.name(), e))
                     .await;
             }
         }

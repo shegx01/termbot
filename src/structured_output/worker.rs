@@ -75,7 +75,7 @@ pub fn spawn_retry_worker(
             let paths = match queue.list_pending().await {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::error!("Retry worker: failed to list pending queue: {}", e);
+                    tracing::error!("Retry worker: failed to list pending queue: {:#}", e);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }

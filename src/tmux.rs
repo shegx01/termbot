@@ -13,6 +13,20 @@ impl TmuxClient {
         }
     }
 
+    /// Check that `tmux` is on PATH and executable. Returns the version
+    /// string on success, or an error describing why tmux is unavailable.
+    pub async fn verify_available(&self) -> Result<String> {
+        let output = Command::new("tmux")
+            .arg("-V")
+            .output()
+            .await
+            .context("tmux binary not found — is tmux installed and on PATH?")?;
+        if !output.status.success() {
+            anyhow::bail!("tmux -V exited with status {}", output.status);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     fn prefixed(&self, name: &str) -> String {
         format!("{}{}", self.session_prefix, name)
     }
