@@ -276,8 +276,11 @@ impl EventHandler for DiscordHandler {
                 platform: PlatformType::Discord,
                 chat_id,
                 thread_ts: None,
+                socket_reply_tx: None,
             },
             attachments: Vec::new(),
+            socket_request_id: None,
+            socket_client_name: None,
         };
 
         if self.cmd_tx.send(incoming).await.is_err() {

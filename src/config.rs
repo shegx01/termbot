@@ -24,6 +24,132 @@ pub struct Config {
     /// Global structured output config (`[structured_output]` table).
     #[serde(default)]
     pub structured_output: StructuredOutputConfig,
+    /// WebSocket socket server config (`[socket]` table).
+    #[serde(default)]
+    pub socket: SocketConfig,
+}
+
+// ─── Socket configuration ────────────────────────────────────────────────────
+
+/// Configuration for the WebSocket bidirectional API.
+///
+/// Feature is opt-in: `enabled = false` by default. When enabled, terminus
+/// listens on `ws://bind:port` (TLS terminated externally by a reverse proxy).
+#[derive(Debug, Deserialize, Clone)]
+pub struct SocketConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_socket_bind")]
+    pub bind: String,
+    #[serde(default = "default_socket_port")]
+    pub port: u16,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    #[serde(default = "default_max_subscriptions_per_connection")]
+    pub max_subscriptions_per_connection: usize,
+    #[serde(default = "default_max_pending_requests")]
+    pub max_pending_requests: usize,
+    #[serde(default = "default_rate_limit_per_second")]
+    pub rate_limit_per_second: f64,
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: f64,
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: usize,
+    #[serde(default = "default_ping_interval_secs")]
+    pub ping_interval_secs: u64,
+    #[serde(default = "default_pong_timeout_secs")]
+    pub pong_timeout_secs: u64,
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    #[allow(dead_code)] // reserved for broadcast receiver capacity tuning
+    #[serde(default = "default_send_buffer_size")]
+    pub send_buffer_size: usize,
+    #[serde(default = "default_shutdown_drain_secs")]
+    pub shutdown_drain_secs: u64,
+    /// Per-client named tokens for authentication.
+    #[serde(default, rename = "client")]
+    pub clients: Vec<SocketClient>,
+}
+
+/// A named client with a bearer token.
+///
+/// Manual `Debug` impl redacts the token, matching the pattern used for
+/// `TelegramConfig`, `SlackConfig`, and `DiscordConfig`.
+#[derive(Deserialize, Clone)]
+pub struct SocketClient {
+    pub name: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for SocketClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocketClient")
+            .field("name", &self.name)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+fn default_socket_bind() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_socket_port() -> u16 {
+    7645
+}
+fn default_max_connections() -> usize {
+    16
+}
+fn default_max_subscriptions_per_connection() -> usize {
+    8
+}
+fn default_max_pending_requests() -> usize {
+    32
+}
+fn default_rate_limit_per_second() -> f64 {
+    20.0
+}
+fn default_rate_limit_burst() -> f64 {
+    60.0
+}
+fn default_max_message_bytes() -> usize {
+    1_048_576
+}
+fn default_ping_interval_secs() -> u64 {
+    30
+}
+fn default_pong_timeout_secs() -> u64 {
+    10
+}
+fn default_idle_timeout_secs() -> u64 {
+    300
+}
+fn default_send_buffer_size() -> usize {
+    1024
+}
+fn default_shutdown_drain_secs() -> u64 {
+    30
+}
+
+impl Default for SocketConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_socket_bind(),
+            port: default_socket_port(),
+            max_connections: default_max_connections(),
+            max_subscriptions_per_connection: default_max_subscriptions_per_connection(),
+            max_pending_requests: default_max_pending_requests(),
+            rate_limit_per_second: default_rate_limit_per_second(),
+            rate_limit_burst: default_rate_limit_burst(),
+            max_message_bytes: default_max_message_bytes(),
+            ping_interval_secs: default_ping_interval_secs(),
+            pong_timeout_secs: default_pong_timeout_secs(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+            send_buffer_size: default_send_buffer_size(),
+            shutdown_drain_secs: default_shutdown_drain_secs(),
+            clients: Vec::new(),
+        }
+    }
 }
 
 /// Configuration for a single named schema.
@@ -258,11 +384,18 @@ impl Config {
         self.discord.is_some() && self.auth.discord_user_id.is_some()
     }
 
+    pub fn socket_enabled(&self) -> bool {
+        self.socket.enabled && !self.socket.clients.is_empty()
+    }
+
     fn validate(&self) -> Result<()> {
-        if !self.telegram_enabled() && !self.slack_enabled() && !self.discord_enabled() {
+        let has_chat_platform =
+            self.telegram_enabled() || self.slack_enabled() || self.discord_enabled();
+        if !has_chat_platform && !self.socket_enabled() {
             anyhow::bail!(
                 "At least one platform must be configured. \
-                 Add a [telegram], [slack], or [discord] section to terminus.toml."
+                 Add a [telegram], [slack], or [discord] section, or enable [socket] \
+                 with at least one [[socket.client]], to terminus.toml."
             );
         }
 
@@ -357,6 +490,71 @@ impl Config {
                             name, env_var
                         )
                     })?;
+                }
+            }
+        }
+
+        // ── Socket validation ────────────────────────────────────────────────
+        if self.socket.enabled {
+            // Validate bind address is parseable
+            if self.socket.bind.parse::<std::net::IpAddr>().is_err() {
+                anyhow::bail!(
+                    "[socket] bind '{}' is not a valid IP address",
+                    self.socket.bind
+                );
+            }
+            if self.socket.max_connections < 1 {
+                anyhow::bail!("[socket] max_connections must be >= 1");
+            }
+            if self.socket.max_subscriptions_per_connection < 1 {
+                anyhow::bail!("[socket] max_subscriptions_per_connection must be >= 1");
+            }
+            if self.socket.max_pending_requests < 1 {
+                anyhow::bail!("[socket] max_pending_requests must be >= 1");
+            }
+            if self.socket.max_message_bytes < 1024 {
+                anyhow::bail!("[socket] max_message_bytes must be >= 1024");
+            }
+            if self.socket.ping_interval_secs == 0 {
+                anyhow::bail!("[socket] ping_interval_secs must be > 0");
+            }
+            if self.socket.pong_timeout_secs == 0 {
+                anyhow::bail!("[socket] pong_timeout_secs must be > 0");
+            }
+            if self.socket.idle_timeout_secs == 0 {
+                anyhow::bail!("[socket] idle_timeout_secs must be > 0");
+            }
+            if self.socket.shutdown_drain_secs == 0 {
+                anyhow::bail!("[socket] shutdown_drain_secs must be > 0");
+            }
+            if self.socket.rate_limit_per_second <= 0.0 {
+                anyhow::bail!("[socket] rate_limit_per_second must be > 0");
+            }
+            if self.socket.clients.is_empty() {
+                anyhow::bail!(
+                    "[socket] enabled but no [[socket.client]] entries configured; \
+                     add at least one client with name and token"
+                );
+            }
+            // Check for empty/short tokens and duplicate client names.
+            let mut seen_names = std::collections::HashSet::new();
+            for client in &self.socket.clients {
+                if client.name.is_empty() {
+                    anyhow::bail!("[[socket.client]] name must not be empty");
+                }
+                if client.token.len() < 32 {
+                    anyhow::bail!(
+                        "[[socket.client]] '{}' token must be >= 32 characters for security \
+                         (got {} characters)",
+                        client.name,
+                        client.token.len()
+                    );
+                }
+                if !seen_names.insert(&client.name) {
+                    anyhow::bail!(
+                        "[[socket.client]] duplicate name '{}'; each client must have a unique name",
+                        client.name
+                    );
                 }
             }
         }
@@ -614,5 +812,163 @@ webhook_secret_env = "TERMINUS_TESTS_WEBHOOK_SECRET"
         let config = load_from_str(&toml).expect("Valid schema with set env var should load");
         assert!(config.schemas.contains_key("todos"));
         std::env::remove_var("TERMINUS_TESTS_WEBHOOK_SECRET");
+    }
+
+    // ── Socket config validation tests ──────────────────────────────────────
+
+    fn socket_only_toml(extra: &str) -> String {
+        format!(
+            r#"
+[auth]
+
+[blocklist]
+patterns = []
+
+[socket]
+enabled = true
+{}
+
+[[socket.client]]
+name = "agent-a"
+token = "tk_live_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+            extra
+        )
+    }
+
+    #[test]
+    fn socket_only_deployment_passes_validation() {
+        let toml = socket_only_toml("");
+        let config = load_from_str(&toml).expect("socket-only config should be valid");
+        assert!(config.socket_enabled());
+        assert!(!config.telegram_enabled());
+    }
+
+    #[test]
+    fn socket_zero_max_connections_fails() {
+        let toml = socket_only_toml("max_connections = 0");
+        let err = load_from_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("max_connections"), "got: {}", err);
+    }
+
+    #[test]
+    fn socket_zero_max_pending_fails() {
+        let toml = socket_only_toml("max_pending_requests = 0");
+        let err = load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("max_pending_requests"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn socket_zero_ping_interval_fails() {
+        let toml = socket_only_toml("ping_interval_secs = 0");
+        let err = load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("ping_interval_secs"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn socket_small_max_message_bytes_fails() {
+        let toml = socket_only_toml("max_message_bytes = 512");
+        let err = load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("max_message_bytes"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn socket_invalid_bind_address_fails() {
+        let toml = socket_only_toml(r#"bind = "not-an-ip""#);
+        let err = load_from_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("not a valid IP"), "got: {}", err);
+    }
+
+    #[test]
+    fn socket_short_token_fails() {
+        let toml = r#"
+[auth]
+
+[blocklist]
+patterns = []
+
+[socket]
+enabled = true
+
+[[socket.client]]
+name = "agent-a"
+token = "short"
+"#;
+        let err = load_from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("32 characters"), "got: {}", err);
+    }
+
+    #[test]
+    fn socket_duplicate_client_name_fails() {
+        let toml = r#"
+[auth]
+
+[blocklist]
+patterns = []
+
+[socket]
+enabled = true
+
+[[socket.client]]
+name = "agent-a"
+token = "tk_live_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[socket.client]]
+name = "agent-a"
+token = "tk_live_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#;
+        let err = load_from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("duplicate name"), "got: {}", err);
+    }
+
+    #[test]
+    fn socket_empty_client_name_fails() {
+        let toml = r#"
+[auth]
+
+[blocklist]
+patterns = []
+
+[socket]
+enabled = true
+
+[[socket.client]]
+name = ""
+token = "tk_live_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#;
+        let err = load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("name must not be empty"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn socket_disabled_by_default() {
+        let toml = r#"
+[auth]
+telegram_user_id = 99
+
+[telegram]
+bot_token = "tg-token"
+
+[blocklist]
+patterns = []
+"#;
+        let config = load_from_str(toml).expect("config without [socket] should load");
+        assert!(!config.socket_enabled());
     }
 }

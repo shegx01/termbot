@@ -272,8 +272,11 @@ impl SlackPlatform {
                 platform: PlatformType::Slack,
                 chat_id: channel.to_string(),
                 thread_ts,
+                socket_reply_tx: None,
             },
             attachments,
+            socket_request_id: None,
+            socket_client_name: None,
         })
     }
 

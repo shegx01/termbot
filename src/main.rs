@@ -7,6 +7,7 @@ mod delivery;
 mod harness;
 mod power;
 mod session;
+mod socket;
 mod state_store;
 mod structured_output;
 mod tmux;
@@ -159,6 +160,34 @@ async fn main() -> Result<()> {
     .collect();
 
     app.set_platforms(telegram, slack, discord);
+
+    // ── Socket server (optional) ─────────────────────────────────────────────
+    let socket_cancel = tokio_util::sync::CancellationToken::new();
+    let socket_drain_secs = config.socket.shutdown_drain_secs;
+    let mut socket_handle: Option<tokio::task::JoinHandle<()>> = if config.socket_enabled() {
+        let server = socket::SocketServer::new(
+            config.socket.clone(),
+            cmd_tx.clone(),
+            app.stream_tx_clone(),
+            app.ambient_tx_clone(),
+            socket_cancel.clone(),
+        );
+        let handle = tokio::spawn(async move {
+            if let Err(e) = server.run().await {
+                tracing::error!("Socket server error: {}", e);
+            }
+        });
+        tracing::info!(
+            "Socket server enabled (ws://{}:{})",
+            config.socket.bind,
+            config.socket.port
+        );
+        Some(handle)
+    } else {
+        tracing::info!("Socket server not configured, skipping");
+        None
+    };
+
     drop(cmd_tx); // Drop our copy so channel closes when adapters stop
 
     // ── Power subsystem ───────────────────────────────────────────────────────
@@ -225,6 +254,15 @@ async fn main() -> Result<()> {
 
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Shutting down...");
+                // Cancel socket server first so it can drain connections
+                socket_cancel.cancel();
+                // Await socket drain with configured timeout (fix #7)
+                if let Some(handle) = socket_handle.take() {
+                    let drain_timeout = Duration::from_secs(socket_drain_secs);
+                    if tokio::time::timeout(drain_timeout, handle).await.is_err() {
+                        tracing::warn!("Socket drain timed out after {}s", socket_drain_secs);
+                    }
+                }
                 app.mark_clean_shutdown().await;
                 app.cleanup().await;
                 break;

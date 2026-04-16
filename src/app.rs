@@ -16,6 +16,7 @@ use crate::harness::claude::ClaudeHarness;
 use crate::harness::{drive_harness, Harness, HarnessContext, HarnessKind};
 use crate::power::types::PowerSignal;
 use crate::session::{self, SessionManager};
+use crate::socket::events::AmbientEvent;
 use crate::state_store::{StateStore, StateUpdate};
 use crate::structured_output::{spawn_retry_worker, DeliveryQueue, SchemaRegistry, WebhookClient};
 use crate::tmux::TmuxClient;
@@ -72,6 +73,12 @@ pub struct App {
     schema_registry: Arc<SchemaRegistry>,
     delivery_queue: Arc<DeliveryQueue>,
     webhook_client: Arc<WebhookClient>,
+    // ── Socket ambient event bus ───────────────────────────────────────────
+    /// Broadcast sender for genuinely-new ambient events consumed by socket
+    /// subscribers.  Capacity 512.  Fire-and-forget: send errors are ignored
+    /// (expected when no socket connections are active or socket is disabled).
+    ambient_tx: broadcast::Sender<AmbientEvent>,
+
     /// Shutdown notify (async wakeup) for the retry worker.  Notified by
     /// `mark_clean_shutdown` for immediate wakeup during idle/backoff sleeps.
     retry_worker_shutdown: Arc<tokio::sync::Notify>,
@@ -110,6 +117,7 @@ impl App {
             Box::new(ClaudeHarness::new(cwd).with_schema_registry(Arc::clone(&schema_registry))),
         );
         let (stream_tx, _) = broadcast::channel::<StreamEvent>(256);
+        let (ambient_tx, _) = broadcast::channel::<AmbientEvent>(512);
 
         // Hydrate active chat sets from persisted state.
         let snapshot = store.snapshot();
@@ -146,6 +154,7 @@ impl App {
             schema_registry: Arc::clone(&schema_registry),
             delivery_queue: Arc::clone(&delivery_queue),
             webhook_client: Arc::clone(&webhook_client),
+            ambient_tx,
             retry_worker_shutdown: Arc::clone(&retry_worker_shutdown),
             retry_worker_shutdown_flag: Arc::clone(&retry_worker_shutdown_flag),
         };
@@ -186,6 +195,28 @@ impl App {
 
     pub fn subscribe_stream(&self) -> broadcast::Receiver<StreamEvent> {
         self.stream_tx.subscribe()
+    }
+
+    /// Subscribe to the ambient event bus for socket consumers.
+    #[allow(dead_code)] // used by SocketServer when integration tests are wired
+    pub fn subscribe_ambient(&self) -> broadcast::Receiver<AmbientEvent> {
+        self.ambient_tx.subscribe()
+    }
+
+    /// Clone the stream broadcast sender (for socket server).
+    pub fn stream_tx_clone(&self) -> broadcast::Sender<StreamEvent> {
+        self.stream_tx.clone()
+    }
+
+    /// Clone the ambient broadcast sender (for socket server).
+    pub fn ambient_tx_clone(&self) -> broadcast::Sender<AmbientEvent> {
+        self.ambient_tx.clone()
+    }
+
+    /// Fire-and-forget emit of an ambient event.  Ignores closed-channel
+    /// errors (expected when socket is disabled / no subscribers).
+    fn emit_ambient(&self, event: AmbientEvent) {
+        let _ = self.ambient_tx.send(event);
     }
 
     /// Shared handle to the banner-ack map — passed into `spawn_delivery_task`
@@ -507,25 +538,39 @@ impl App {
             self.dirty_sent = true;
         }
 
-        // Bind chat IDs for active platform (so we know which chats to banner).
-        match msg.reply_context.platform {
-            PlatformType::Telegram => {
-                if let Ok(id) = msg.reply_context.chat_id.parse::<i64>() {
-                    if self.active_telegram_chats.insert(id) {
-                        let _ = self.state_tx.try_send(StateUpdate::BindTelegramChat(id));
+        // Emit ChatForward ambient event for chat-origin messages (not socket).
+        if msg.socket_request_id.is_none() {
+            self.emit_ambient(AmbientEvent::ChatForward {
+                platform: format!("{:?}", msg.platform),
+                user_id: msg.user_id.clone(),
+                text: msg.text.clone(),
+            });
+        }
+
+        // Skip chat binding for socket-origin messages — they use
+        // PlatformType::Telegram as a wire-compat placeholder but should NOT
+        // pollute active_telegram_chats or trigger gap banners.
+        if msg.reply_context.socket_reply_tx.is_none() {
+            // Bind chat IDs for active platform (so we know which chats to banner).
+            match msg.reply_context.platform {
+                PlatformType::Telegram => {
+                    if let Ok(id) = msg.reply_context.chat_id.parse::<i64>() {
+                        if self.active_telegram_chats.insert(id) {
+                            let _ = self.state_tx.try_send(StateUpdate::BindTelegramChat(id));
+                        }
                     }
                 }
-            }
-            PlatformType::Slack => {
-                let id = msg.reply_context.chat_id.clone();
-                if self.active_slack_chats.insert(id.clone()) {
-                    let _ = self.state_tx.try_send(StateUpdate::BindSlackChat(id));
+                PlatformType::Slack => {
+                    let id = msg.reply_context.chat_id.clone();
+                    if self.active_slack_chats.insert(id.clone()) {
+                        let _ = self.state_tx.try_send(StateUpdate::BindSlackChat(id));
+                    }
                 }
-            }
-            PlatformType::Discord => {
-                let id = msg.reply_context.chat_id.clone();
-                if self.active_discord_chats.insert(id.clone()) {
-                    let _ = self.state_tx.try_send(StateUpdate::BindDiscordChat(id));
+                PlatformType::Discord => {
+                    let id = msg.reply_context.chat_id.clone();
+                    if self.active_discord_chats.insert(id.clone()) {
+                        let _ = self.state_tx.try_send(StateUpdate::BindDiscordChat(id));
+                    }
                 }
             }
         }
@@ -600,11 +645,25 @@ impl App {
                         chat_id: msg.reply_context.chat_id.clone(),
                         thread_ts: msg.reply_context.thread_ts.clone(),
                     });
+                    self.emit_ambient(AmbientEvent::SessionCreated {
+                        session: name.clone(),
+                        origin_chat: Some(msg.reply_context.chat_id.clone()),
+                        created_at: chrono::Utc::now(),
+                    });
                     self.send_reply(&msg.reply_context, &format!("Session '{}' created", name))
                         .await;
                 }
                 Err(e) => {
-                    self.send_error(&msg.reply_context, &e.to_string()).await;
+                    // Check if the error is a session-limit error and emit ambient.
+                    let err_str = e.to_string();
+                    if err_str.contains("Maximum session limit") {
+                        self.emit_ambient(AmbientEvent::SessionLimitReached {
+                            attempted: name.clone(),
+                            current: self.session_mgr.session_count(),
+                            max: self.session_mgr.max_sessions(),
+                        });
+                    }
+                    self.send_error(&msg.reply_context, &err_str).await;
                 }
             },
             ParsedCommand::Foreground { name } => match self.session_mgr.fg(&name) {
@@ -693,6 +752,11 @@ impl App {
             ParsedCommand::KillSession { name } => match self.session_mgr.kill(&name).await {
                 Ok(()) => {
                     self.buffers.remove(&name);
+                    self.emit_ambient(AmbientEvent::SessionKilled {
+                        session: name.clone(),
+                        reason: "user_request".to_string(),
+                        killed_at: chrono::Utc::now(),
+                    });
                     self.send_reply(&msg.reply_context, &format!("Session '{}' killed", name))
                         .await;
                 }
@@ -977,6 +1041,13 @@ impl App {
             .await
         {
             Ok(event_rx) => {
+                let run_id = ulid::Ulid::new().to_string();
+                self.emit_ambient(AmbientEvent::HarnessStarted {
+                    harness: kind.name().to_string(),
+                    run_id: run_id.clone(),
+                    prompt_hash: None,
+                });
+
                 let hctx = HarnessContext {
                     ctx,
                     telegram: self.telegram.as_deref(),
@@ -988,6 +1059,14 @@ impl App {
                     stream_tx: &self.stream_tx,
                 };
                 let (got_output, session_id) = drive_harness(event_rx, &hctx).await;
+
+                let status = if got_output { "completed" } else { "no_output" };
+                self.emit_ambient(AmbientEvent::HarnessFinished {
+                    harness: kind.name().to_string(),
+                    run_id,
+                    status: status.to_string(),
+                });
+
                 if let Some(sid) = session_id {
                     harness.set_session_id(&session_name, sid);
                 }
@@ -1004,6 +1083,12 @@ impl App {
     }
 
     async fn send_reply(&self, ctx: &ReplyContext, text: &str) {
+        // Socket-origin: route to the per-request response channel.
+        if let Some(ref tx) = ctx.socket_reply_tx {
+            let _ = tx.send(text.to_string());
+            return;
+        }
+        // Chat-origin: route to the platform adapter.
         let platform: Option<&dyn ChatPlatform> = match ctx.platform {
             PlatformType::Telegram => self.telegram.as_deref(),
             PlatformType::Slack => self.slack.as_deref(),
@@ -1328,8 +1413,11 @@ patterns = []
                 platform: PlatformType::Discord,
                 chat_id: "discord_channel_42".to_string(),
                 thread_ts: None,
+                socket_reply_tx: None,
             },
             attachments: vec![],
+            socket_request_id: None,
+            socket_client_name: None,
         };
 
         app.handle_command(&msg).await;

@@ -100,6 +100,39 @@ stayawake_on_battery = false
 # #   export TODOS_WEBHOOK_SECRET="your-32-byte-random-secret"
 # webhook_secret_env = "TODOS_WEBHOOK_SECRET"
 
+# ---------------------------------------------------------------------------
+# WebSocket Bidirectional API
+# ---------------------------------------------------------------------------
+# Exposes an authenticated WebSocket endpoint for local programs and remote
+# agents to drive terminus programmatically. Plain ws:// — deploy behind a
+# reverse proxy (nginx/caddy/Traefik) for wss:// TLS termination.
+#
+# [socket]
+# enabled = true
+# bind = "127.0.0.1"   # use "0.0.0.0" for container deployments
+# port = 7645
+# max_connections = 16
+# max_subscriptions_per_connection = 8
+# max_pending_requests = 32
+# rate_limit_per_second = 20.0
+# rate_limit_burst = 60.0
+# max_message_bytes = 1048576      # 1 MiB
+# ping_interval_secs = 30
+# pong_timeout_secs = 10
+# idle_timeout_secs = 300
+# send_buffer_size = 1024
+# shutdown_drain_secs = 30
+#
+# # Per-client named tokens. Each client authenticates with
+# # Authorization: Bearer <token> at the HTTP upgrade.
+# [[socket.client]]
+# name = "agent-a"
+# token = "tk_live_your-32-byte-random-secret-here"
+#
+# [[socket.client]]
+# name = "dashboard"
+# token = "tk_live_another-secret-for-the-dashboard"
+
 # [structured_output]
 # # HTTP timeout for webhook delivery attempts (milliseconds). Default: 5000.
 # timeout_ms = 5000

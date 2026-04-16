@@ -44,6 +44,16 @@ impl SessionManager {
         &self.tmux
     }
 
+    /// Number of currently tracked sessions.
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Configured maximum session limit.
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
+    }
+
     /// Reconnect to an existing tmux session (e.g. after restart).
     pub async fn reconnect_session(&mut self, name: &str) -> Result<()> {
         if self.sessions.contains_key(name) {

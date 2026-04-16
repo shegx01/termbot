@@ -33,11 +33,29 @@ src/
                     via mpsc::Sender<StateUpdate>
   claude.rs         Claude Code SDK integration (claude-agent-sdk-rust crate)
   chat_adapters/
-    mod.rs          ChatPlatform trait (async_trait)
+    mod.rs          ChatPlatform trait (async_trait), IncomingMessage,
+                    ReplyContext (with optional socket_reply_tx for socket-
+                    origin routing), PlatformType (Telegram/Slack/Discord —
+                    NOT modified for socket; socket uses socket_reply_tx)
     telegram.rs     Telegram adapter (teloxide, long-polling, level-triggered
                     watch-channel pause/resume for banner ordering)
     slack.rs        Slack adapter (Socket Mode via tokio-tungstenite)
     discord.rs      Discord adapter (serenity gateway, handler-gate pause/resume)
+  socket/
+    mod.rs          SocketServer: TcpListener, Bearer token auth at HTTP
+                    upgrade, per-connection task spawn, connection-limit
+                    enforcement
+    connection.rs   Per-connection tokio::select! loop: pending-request FIFO,
+                    subscription dispatch, rate limiting, ping/pong, idle
+                    timeout, graceful shutdown
+    envelope.rs     InboundEnvelope/OutboundEnvelope serde types (terminus/v1
+                    wire protocol), ErrorCode, Filter, OutboundFrame
+    events.rs       AmbientEvent (7 genuinely-new event types for socket
+                    subscription bus), AmbientEventType discriminator
+    rate_limit.rs   Per-connection TokenBucket (capacity + refill)
+    subscription.rs SubscriptionRegistry with matches_ambient/matches_stream
+                    (facet filter: event_types/schemas/sessions, OR within
+                    facets, AND across facets)
   power/
     mod.rs          PowerManager trait (async_trait) + cfg-gated submod picks
     types.rs        LidState, PowerSource, PowerEvent, PowerSignal
@@ -121,6 +139,41 @@ Uses `claude-agent-sdk-rust` crate, not terminal scraping. Claude prompts spawn 
 ### Platform adapters
 
 All three implement `ChatPlatform` (async_trait). Auth is single-user: messages from non-authorized user IDs are silently dropped. Telegram uses manual `getUpdates` long-polling (not webhooks). Slack uses Socket Mode WebSocket with auto-reconnect. Discord uses the serenity crate with gateway intents `DIRECT_MESSAGES | GUILD_MESSAGES | MESSAGE_CONTENT` (privileged). Inbound Discord attachments (images/files sent by the user to the bot) are not currently processed -- only `msg.content` text is forwarded to the main loop. Telegram-parity for inbound attachments is a follow-up.
+
+### WebSocket bidirectional API (`src/socket/`)
+
+Optional, opt-in (`[socket] enabled = true`). Exposes an authenticated WebSocket
+endpoint for local programs and remote agents. Transport is plain `ws://`; deploy
+behind a reverse proxy for `wss://` TLS termination.
+
+**Architecture:** Per-connection task model. `SocketServer` binds a `TcpListener`,
+authenticates via `Authorization: Bearer <token>` at the HTTP upgrade (tokens from
+`[[socket.client]]` entries in config), and spawns a per-connection task.
+
+**Integration seams (no structural changes to App/session/harness):**
+- Inbound: `mpsc::Sender<IncomingMessage>` (same channel as chat adapters). Socket
+  sets `socket_reply_tx` on `ReplyContext` so `App::send_reply` routes responses
+  back to the socket instead of to a chat platform.
+- Per-request output: `broadcast::channel<StreamEvent>` (existing). The connection
+  task subscribes and translates matching events for subscribed clients.
+- Ambient events: `broadcast::channel<AmbientEvent>` (new, capacity 512). 7 new
+  event types emitted from `App` methods: `SessionCreated`, `SessionKilled`,
+  `SessionLimitReached`, `ChatForward`, `HarnessStarted`, `HarnessFinished`,
+  `SessionOutput` (translated from `StreamEvent::NewMessage` at socket layer).
+- `PlatformType` is NOT modified (preserves golden-tested queue-file wire format).
+
+**Wire protocol:** `terminus/v1`. One JSON envelope per WebSocket text message.
+Client-supplied `request_id` for correlation. Per-request lifecycle:
+`request → ack → [text_chunk | tool_call | partial_result]* → result | error → end`.
+Subscription: `subscribe → subscribed → event*`, filtered by facets
+(`event_types` / `schemas` / `sessions`), OR within facets, AND across.
+
+**Rate limiting:** Per-connection token bucket (burst + refill). Max message size,
+idle timeout, ping/pong, configurable in `[socket]` table.
+
+**Shutdown ordering:** `main.rs` ctrl_c branch cancels `socket_cancel` token first,
+then calls `app.mark_clean_shutdown()`. Socket connections receive `shutting_down`
+envelope and drain pending requests within `shutdown_drain_secs`.
 
 ## Conventions
 

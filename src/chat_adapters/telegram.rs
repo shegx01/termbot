@@ -367,8 +367,11 @@ impl TelegramAdapter {
                             platform: PlatformType::Telegram,
                             chat_id,
                             thread_ts: None,
+                            socket_reply_tx: None,
                         },
                         attachments,
+                        socket_request_id: None,
+                        socket_client_name: None,
                     };
 
                     if cmd_tx.send(incoming).await.is_err() {

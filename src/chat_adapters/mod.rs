@@ -66,6 +66,12 @@ pub struct IncomingMessage {
     pub platform: PlatformType,
     pub reply_context: ReplyContext,
     pub attachments: Vec<Attachment>,
+    /// Socket-origin: client-supplied request ID for correlation.
+    #[allow(dead_code)]
+    pub socket_request_id: Option<String>,
+    /// Socket-origin: client name for tracing spans.
+    #[allow(dead_code)]
+    pub socket_client_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +79,9 @@ pub struct ReplyContext {
     pub platform: PlatformType,
     pub chat_id: String,
     pub thread_ts: Option<String>,
+    /// If set, route replies to this channel instead of to the chat platform.
+    /// Used by the socket adapter for per-request response routing.
+    pub socket_reply_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 #[async_trait]
@@ -156,6 +165,7 @@ mod tests {
             platform: PlatformType::Telegram,
             chat_id: "12345".to_string(),
             thread_ts: Some("1234567890.123".to_string()),
+            socket_reply_tx: None,
         };
         let binding = ChatBinding::from(&ctx);
         assert_eq!(binding.platform, PlatformType::Telegram);
