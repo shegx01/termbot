@@ -1,8 +1,8 @@
 # terminus
 
-Control your terminal from Telegram, Slack, or Discord. Built in Rust.
+Control your terminal from Telegram, Slack, Discord, or any WebSocket client. Built in Rust.
 
-terminus gives you remote access to terminal sessions and Claude Code from your phone. Run shell commands, manage tmux sessions, send images, and have multi-turn AI conversations -- all through Telegram, Slack, or Discord.
+terminus gives you remote access to terminal sessions and Claude Code from your phone or from code. Run shell commands, manage tmux sessions, send images, and have multi-turn AI conversations -- through chat platforms or a programmatic WebSocket API.
 
 ---
 
@@ -124,6 +124,22 @@ Show me the test gaps.           # still the same session
 : claude off
 ```
 
+**Programmatic access** -- drive terminus from scripts, agents, or dashboards via WebSocket:
+
+```bash
+# Connect with websocat
+websocat ws://127.0.0.1:7645 -H "Authorization: Bearer tk_live_..."
+
+# Send a command and get structured JSON back
+> {"type":"request","request_id":"r1","command":": list"}
+< {"type":"ack","request_id":"r1","accepted_at":"..."}
+< {"type":"result","request_id":"r1","value":{"text":"..."},"cancelled":false}
+< {"type":"end","request_id":"r1"}
+
+# Subscribe to live session output
+> {"type":"subscribe","subscription_id":"s1","filter":{"event_types":["session_output"]}}
+```
+
 ---
 
 ## Requirements
@@ -131,7 +147,7 @@ Show me the test gaps.           # still the same session
 - **Rust 1.70+** (for building)
 - **tmux** (for terminal sessions)
 - **Claude Code CLI** (for `: claude` commands -- `npm i -g @anthropic-ai/claude-code`)
-- At least one of: Telegram bot token, Slack bot + app tokens, Discord bot token
+- At least one of: Telegram bot token, Slack bot + app tokens, Discord bot token, or Socket API enabled
 
 ---
 
@@ -263,9 +279,31 @@ max_sessions = 10
 4. Right-click a channel > **Copy Channel ID** (this is `channel_id`)
 </details>
 
+### Socket API only
+
+```toml
+[auth]
+# No chat platform IDs needed for socket-only mode
+
+[blocklist]
+patterns = [
+  "rm\\s+-[a-z]*f[a-z]*r[a-z]*\\s+/",
+  "sudo\\s+",
+]
+
+[socket]
+enabled = true
+
+[[socket.client]]
+name = "my-agent"
+token = "tk_live_your-32-character-minimum-secret"
+```
+
+The socket API is opt-in (`enabled = false` by default). Each client authenticates with a named Bearer token. See [Socket API](#socket-api) below for usage and [docs/socket.md](docs/socket.md) for the full wire protocol reference.
+
 ### Multiple platforms
 
-Include any combination of `[telegram]`, `[slack]`, and `[discord]` sections with their corresponding IDs in `[auth]`. Any platform can be omitted -- terminus starts with whatever is configured.
+Include any combination of `[telegram]`, `[slack]`, `[discord]`, and `[socket]` sections. Any platform can be omitted -- terminus starts with whatever is configured.
 
 ### Sleep/wake management (optional)
 
@@ -542,6 +580,145 @@ Jobs survive restarts -- they are stored in `<queue_dir>/pending/` and picked up
 
 ---
 
+## Socket API
+
+The socket API lets programs, scripts, and agents drive terminus over WebSocket. It supports every command available in chat, with typed JSON envelopes, request pipelining, and live event subscriptions.
+
+**Transport:** Plain `ws://` (deploy behind nginx/caddy/Traefik for `wss://` TLS termination).
+**Auth:** Bearer token in the `Authorization` header at the HTTP upgrade.
+**Protocol:** `terminus/v1` -- one JSON envelope per WebSocket text message.
+
+### Quick start
+
+1. Add to `terminus.toml`:
+
+```toml
+[socket]
+enabled = true
+
+[[socket.client]]
+name = "my-agent"
+token = "tk_live_your-32-character-minimum-secret"
+```
+
+2. Connect and send a command:
+
+```bash
+websocat ws://127.0.0.1:7645 -H "Authorization: Bearer tk_live_your-32-character-minimum-secret"
+```
+
+```json
+{"type":"request","request_id":"r1","command":": new build"}
+```
+
+The server responds with a sequence of typed frames:
+
+```json
+{"type":"ack","request_id":"r1","accepted_at":"2026-04-15T12:00:01Z"}
+{"type":"result","request_id":"r1","value":{"text":"Session 'build' created"},"cancelled":false}
+{"type":"end","request_id":"r1"}
+```
+
+### Per-request lifecycle
+
+Every request follows this frame sequence:
+
+```
+request → ack → [text_chunk | tool_call | partial_result]* → result | error → end
+```
+
+- **`ack`** -- server accepted the request
+- **`result`** -- terminal success with the command's output
+- **`error`** -- terminal failure with an error code
+- **`end`** -- sentinel marking the response is complete
+
+Multiple requests can be pipelined without waiting for results (FIFO per connection).
+
+### Subscriptions
+
+Subscribe to ambient events (session lifecycle, structured output, chat messages) with facet filters:
+
+```json
+{"type":"subscribe","subscription_id":"s1","filter":{
+  "event_types":["session_output","structured_output"],
+  "sessions":["build"]
+}}
+```
+
+Events arrive as they happen:
+
+```json
+{"type":"event","subscription_id":"s1","event":{
+  "type":"session_output","session":"build","chunk":"cargo test\n   Compiling..."
+}}
+```
+
+Filter facets: `event_types`, `schemas`, `sessions`. OR within a facet, AND across facets. Empty filter = receive everything. Up to 8 named subscriptions per connection.
+
+<details>
+<summary>Available event types</summary>
+
+| Event type | What it delivers |
+|---|---|
+| `structured_output` | Claude `--schema` results (schema, value, run_id) |
+| `webhook_status` | Webhook delivery attempts (Delivered/Abandoned/Error) |
+| `queue_drained` | Webhook queue drain cycle complete |
+| `session_output` | Terminal output from tmux sessions |
+| `session_created` | New session created (`: new`) |
+| `session_killed` | Session destroyed (`: kill`) |
+| `session_limit_reached` | Max session cap hit |
+| `session_started` | Session foregrounded (`: fg`) |
+| `session_exited` | Session process exited |
+| `chat_forward` | Message received from a chat platform |
+| `harness_started` | Claude turn started |
+| `harness_finished` | Claude turn completed |
+| `gap_banner` | Sleep/wake gap detected |
+
+</details>
+
+### Rate limiting and backpressure
+
+Each client has a per-client token bucket (survives reconnects):
+
+| Control | Default |
+|---|---|
+| Burst capacity | 60 requests |
+| Sustained rate | 20 requests/sec |
+| Max pending requests | 32 per connection |
+| Max connections | 16 total |
+| Idle timeout | 300s |
+| Max message size | 1 MiB |
+
+Rate-limited requests receive an `error` with `code: "rate_limited"` and a machine-readable `retry_after_ms` field.
+
+### Proxy setup for TLS
+
+terminus listens on plain `ws://`. For production, terminate TLS at a reverse proxy:
+
+**Caddy** (automatic TLS):
+```caddyfile
+terminus.example.com {
+    reverse_proxy 127.0.0.1:7645
+}
+```
+
+**nginx:**
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:7645;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+}
+```
+
+### Full reference
+
+See [docs/socket.md](docs/socket.md) for the complete wire protocol specification, all envelope types, error codes, and configuration details.
+
+---
+
 ## How it works
 
 ### Terminal output
@@ -591,7 +768,9 @@ When terminus shuts down (Ctrl+C), tmux sessions keep running. On restart, termi
 
 ### Authentication
 
-Single-user only. Messages from any user ID other than the configured one are **silently ignored** -- the bot does not reveal its existence to unauthorized users.
+**Chat platforms:** Single-user only. Messages from any user ID other than the configured one are **silently ignored** -- the bot does not reveal its existence to unauthorized users.
+
+**Socket API:** Per-client Bearer tokens (`Authorization: Bearer <token>`) validated at the HTTP upgrade with constant-time comparison. Missing or invalid tokens receive HTTP 401 before a WebSocket is established. Tokens must be at least 32 characters; the `Debug` impl redacts them from logs. Token comparison is timing-safe to prevent side-channel enumeration.
 
 ### Command blocklist
 
@@ -667,6 +846,21 @@ Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. termin
 | `power.enabled` | bool | Enable the power-management subsystem (default: true). Set false for CI / headless |
 | `power.stayawake_on_battery` | bool | Prevent idle sleep on battery power too (default: false; AC-only) |
 | `power.state_file` | string | Override for the persisted-state JSON file (default: adjacent to `terminus.toml`) |
+| `socket.enabled` | bool | Enable WebSocket API (default: false) |
+| `socket.bind` | string | Bind address (default: `127.0.0.1`; use `0.0.0.0` for containers) |
+| `socket.port` | integer | Listener port (default: 7645) |
+| `socket.max_connections` | integer | Max concurrent WebSocket connections (default: 16) |
+| `socket.max_subscriptions_per_connection` | integer | Named subscriptions per connection (default: 8) |
+| `socket.max_pending_requests` | integer | Pipelined request queue depth (default: 32) |
+| `socket.rate_limit_per_second` | float | Token bucket refill rate (default: 20.0) |
+| `socket.rate_limit_burst` | float | Token bucket capacity (default: 60.0) |
+| `socket.max_message_bytes` | integer | Max inbound message size (default: 1048576) |
+| `socket.ping_interval_secs` | integer | Server ping interval (default: 30) |
+| `socket.pong_timeout_secs` | integer | Close if pong not received (default: 10) |
+| `socket.idle_timeout_secs` | integer | Close if no inbound activity (default: 300) |
+| `socket.shutdown_drain_secs` | integer | Grace period on shutdown (default: 30) |
+| `socket.client[].name` | string | Client display name (unique) |
+| `socket.client[].token` | string | Bearer token (min 32 characters) |
 
 Override the config file path with `TERMINUS_CONFIG=/path/to/file.toml`.
 
@@ -743,28 +937,36 @@ src/
     telegram.rs        Telegram adapter (teloxide, long-polling)
     slack.rs           Slack adapter (Socket Mode, tokio-tungstenite)
     discord.rs         Discord adapter (serenity, gateway + handler-gate pause)
+  socket/
+    mod.rs             WebSocket server (TcpListener, Bearer auth, per-connection spawn)
+    connection.rs      Per-connection task (select! loop, pipelining, subscriptions)
+    envelope.rs        Wire protocol types (terminus/v1 JSON envelopes)
+    events.rs          Ambient event types for subscription bus
+    rate_limit.rs      Per-client token bucket rate limiter
+    subscription.rs    Subscription registry with facet filter matching
 ```
 
 ```
-Telegram/Slack/Discord
-    |
-    v
-cmd_tx (mpsc) ──> tokio::select! core loop (main.rs)
-                    ├── handle_command() (app.rs)
-                    │   ├── tmux send-keys (shell commands)
-                    │   └── harness driver (Claude SDK stream-json)
-                    │       ├── tool events ──> chat
-                    │       ├── text response ──> chat
-                    │       └── output files ──> chat (photos/documents)
-                    ├── health_check (5s) ──> tmux has-session
-                    ├── poll_tick (250ms) ──> tmux capture-pane
-                    └── ctrl_c ──> cleanup (detach, sessions survive)
-                           |
-                    broadcast::channel
-                           |
-                    ├── Telegram delivery task
-                    ├── Slack delivery task
-                    └── Discord delivery task
+Telegram/Slack/Discord          WebSocket clients
+    |                               |
+    v                               v
+cmd_tx (mpsc) ──────────> tokio::select! core loop (main.rs)
+                            ├── handle_command() (app.rs)
+                            │   ├── tmux send-keys (shell commands)
+                            │   └── harness driver (Claude SDK stream-json)
+                            │       ├── tool events ──> chat / socket
+                            │       ├── text response ──> chat / socket
+                            │       └── output files ──> chat (photos/documents)
+                            ├── health_check (5s) ──> tmux has-session
+                            ├── poll_tick (250ms) ──> tmux capture-pane
+                            └── ctrl_c ──> socket drain ──> cleanup
+                                   |
+                            broadcast::channel (StreamEvent + AmbientEvent)
+                                   |
+                            ├── Telegram delivery task
+                            ├── Slack delivery task
+                            ├── Discord delivery task
+                            └── Socket per-connection tasks (subscription filtering)
 ```
 
 The harness system is extensible via the `Harness` trait. Currently only Claude is implemented; Gemini and Codex have stubs ready for future integration. Each harness supports streaming events (`ToolUse`, `Text`, `File`, `Done`, `Error`) and optional multi-turn session resume.
@@ -825,6 +1027,24 @@ Images are only supported in harness mode. Enter Claude mode first with `: claud
 <summary>"Maximum session limit reached"</summary>
 
 The default limit is 10 concurrent sessions. Kill unused sessions with `: kill <name>` or increase `streaming.max_sessions` in the config.
+</details>
+
+<details>
+<summary>Socket: connection refused</summary>
+
+Check `[socket] enabled = true` in `terminus.toml`, verify at least one `[[socket.client]]` is configured, and confirm the bind address and port (`ss -tlnp | grep 7645`).
+</details>
+
+<details>
+<summary>Socket: 401 Unauthorized</summary>
+
+Verify the `Authorization: Bearer <token>` header is present and the token matches a `[[socket.client]]` entry exactly (minimum 32 characters).
+</details>
+
+<details>
+<summary>Socket: "lagged" warnings</summary>
+
+The broadcast buffer overflowed because the client is consuming events too slowly. Events were dropped. Increase `socket.send_buffer_size` or process events faster. This is non-fatal; the connection continues.
 </details>
 
 ---
