@@ -211,7 +211,11 @@ pub async fn drive_harness(
                     last_tool_name = None;
                 }
                 if !text.is_empty() {
-                    for chunk in split_message(&text, 4000) {
+                    let max_len = match ctx.platform {
+                        crate::chat_adapters::PlatformType::Discord => 1900,
+                        _ => 4000,
+                    };
+                    for chunk in split_message(&text, max_len) {
                         send_reply(ctx, &chunk, telegram, slack, discord).await;
                     }
                 }
@@ -334,28 +338,26 @@ pub async fn drive_harness(
                 // Rename to `.delivering.json` before attempting delivery so the
                 // retry worker (which only scans `*.json`) cannot pick up the same
                 // file concurrently and cause a duplicate POST.
-                let delivering_path =
-                    match hctx.delivery_queue.mark_delivering(&queue_path).await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to mark job as delivering (will be retried by worker): {}",
-                                e
-                            );
-                            // Leave the file in pending/; the retry worker will deliver it.
-                            let pending =
-                                hctx.delivery_queue.pending_count().await.unwrap_or(1);
-                            send_reply(
-                                ctx,
-                                &format!("⏳ queued for retry ({} pending)", pending),
-                                telegram,
-                                slack,
-                                discord,
-                            )
-                            .await;
-                            continue;
-                        }
-                    };
+                let delivering_path = match hctx.delivery_queue.mark_delivering(&queue_path).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to mark job as delivering (will be retried by worker): {}",
+                            e
+                        );
+                        // Leave the file in pending/; the retry worker will deliver it.
+                        let pending = hctx.delivery_queue.pending_count().await.unwrap_or(1);
+                        send_reply(
+                            ctx,
+                            &format!("⏳ queued for retry ({} pending)", pending),
+                            telegram,
+                            slack,
+                            discord,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
 
                 match hctx.webhook_client.deliver(&job, &webhook_info).await {
                     Ok(elapsed) => {
@@ -372,8 +374,10 @@ pub async fn drive_harness(
                     }
                     Err(_) => {
                         // On failure: rename back to `.json` so retry worker picks it up.
-                        if let Err(e) =
-                            hctx.delivery_queue.unmark_delivering(&delivering_path).await
+                        if let Err(e) = hctx
+                            .delivery_queue
+                            .unmark_delivering(&delivering_path)
+                            .await
                         {
                             tracing::error!(
                                 "Failed to unmark delivering job (manual recovery may be needed): {}",

@@ -300,12 +300,17 @@ pub async fn run(
                             InboundEnvelope::Request { request_id, command, options: _ } => {
                                 // Reject duplicate request_id while already in-flight
                                 if pending.contains_key(&request_id) {
-                                    let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Error {
-                                        request_id: Some(request_id),
-                                        code: ErrorCode::ParseError,
-                                        message: "duplicate request_id: already in-flight".to_string(),
-                                        retry_after_ms: None,
-                                    }).await;
+                                    let _ = send_envelope(
+                                        &mut ws_sink,
+                                        &OutboundEnvelope::Error {
+                                            request_id: Some(request_id),
+                                            code: ErrorCode::QueueFull,
+                                            message: "duplicate request_id: already in-flight"
+                                                .to_string(),
+                                            retry_after_ms: None,
+                                        },
+                                    )
+                                    .await;
                                     continue;
                                 }
 

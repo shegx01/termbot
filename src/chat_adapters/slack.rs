@@ -398,6 +398,10 @@ impl SlackPlatform {
         channel_id: &str,
         thread_ts: Option<&str>,
     ) -> Result<PlatformMessageId> {
+        if file_bytes.is_empty() {
+            anyhow::bail!("Cannot upload zero-byte file to Slack");
+        }
+
         // Step 1: Get upload URL
         let get_url_resp = self
             .http_client
@@ -417,9 +421,7 @@ impl SlackPlatform {
             .context("Failed to parse files.getUploadURLExternal response")?;
 
         if !get_url_json["ok"].as_bool().unwrap_or(false) {
-            let err = get_url_json["error"]
-                .as_str()
-                .unwrap_or("unknown error");
+            let err = get_url_json["error"].as_str().unwrap_or("unknown error");
             anyhow::bail!("files.getUploadURLExternal failed: {}", err);
         }
 
@@ -470,9 +472,7 @@ impl SlackPlatform {
             .context("Failed to parse files.completeUploadExternal response")?;
 
         if !complete_json["ok"].as_bool().unwrap_or(false) {
-            let err = complete_json["error"]
-                .as_str()
-                .unwrap_or("unknown error");
+            let err = complete_json["error"].as_str().unwrap_or("unknown error");
             anyhow::bail!("files.completeUploadExternal failed: {}", err);
         }
 
@@ -515,12 +515,12 @@ impl ChatPlatform for SlackPlatform {
                     );
                 }
                 Err(e) => {
+                    // Double the backoff on errors only, not on clean disconnects
+                    delay_secs = (delay_secs * 2).min(MAX_DELAY_SECS);
                     error!(
                         "Slack WebSocket loop error: {}. Reconnecting in {}s...",
                         e, delay_secs
                     );
-                    // Only double the backoff on errors, not on clean disconnects
-                    delay_secs = (delay_secs * 2).min(MAX_DELAY_SECS);
                 }
             }
 

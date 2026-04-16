@@ -189,7 +189,7 @@ async fn handle_stream_event(
             // Split at a platform-appropriate limit and prepend prefix to first chunk.
             let max_len = match platform.platform_type() {
                 crate::chat_adapters::PlatformType::Discord => 1900, // Discord limit is 2000, leave margin
-                _ => 4000, // Telegram 4096, Slack 40000
+                _ => 4000,                                           // Telegram 4096, Slack 40000
             };
             let mut chunks = split_message(&content, max_len);
             if let (Some(pfx), Some(first)) = (prefix, chunks.first_mut()) {

@@ -610,28 +610,29 @@ impl CommandBlocklist {
             }
         }
 
-        // Also extract content from $(...) subcommand substitutions
-        // e.g. `echo $(sudo reboot)` → check `sudo reboot`
-        if command.contains("$(") {
-            let mut rest = command;
-            while let Some(start) = rest.find("$(") {
-                rest = &rest[start + 2..];
-                // Find matching closing paren (simple, non-nested)
-                if let Some(end) = rest.find(')') {
-                    let inner = rest[..end].trim();
-                    if !inner.is_empty() {
-                        let norm_inner = Self::normalize_command(inner);
-                        if self
-                            .patterns
-                            .iter()
-                            .any(|p| p.is_match(inner) || p.is_match(&norm_inner))
-                        {
-                            return true;
+        // Extract content from $(...) and backtick subcommand substitutions
+        // e.g. `echo $(sudo reboot)` or `echo \`sudo reboot\`` → check `sudo reboot`
+        for (open, close) in &[("$(", ')'), ("`", '`')] {
+            if command.contains(open) {
+                let mut rest = command;
+                while let Some(start) = rest.find(open) {
+                    rest = &rest[start + open.len()..];
+                    if let Some(end) = rest.find(*close) {
+                        let inner = rest[..end].trim();
+                        if !inner.is_empty() {
+                            let norm_inner = Self::normalize_command(inner);
+                            if self
+                                .patterns
+                                .iter()
+                                .any(|p| p.is_match(inner) || p.is_match(&norm_inner))
+                            {
+                                return true;
+                            }
                         }
+                        rest = &rest[end + 1..];
+                    } else {
+                        break;
                     }
-                    rest = &rest[end + 1..];
-                } else {
-                    break;
                 }
             }
         }
@@ -1653,6 +1654,8 @@ mod tests {
         let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
         // $(...) subcommand substitution — inner `sudo reboot` must be caught
         assert!(bl.is_blocked("echo $(sudo reboot)"));
+        // backtick substitution — equivalent to $()
+        assert!(bl.is_blocked("echo `sudo reboot`"));
     }
 
     #[test]

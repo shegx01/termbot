@@ -32,12 +32,10 @@ pub(crate) fn detect_gap(
     now_wall: SystemTime,
 ) -> Option<(SystemTime, SystemTime, Duration)> {
     let mono_delta = now_mono.duration_since(last_mono);
-    let wall_delta = now_wall
-        .duration_since(last_wall)
-        .unwrap_or_else(|e| {
-            tracing::debug!(backwards_by = ?e.duration(), "wall clock went backwards (NTP step?)");
-            Duration::ZERO
-        });
+    let wall_delta = now_wall.duration_since(last_wall).unwrap_or_else(|e| {
+        tracing::debug!(backwards_by = ?e.duration(), "wall clock went backwards (NTP step?)");
+        Duration::ZERO
+    });
 
     if wall_delta > mono_delta + GAP_THRESHOLD {
         let gap = wall_delta - mono_delta;

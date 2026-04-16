@@ -93,6 +93,23 @@ impl DeliveryQueue {
             }
         }
 
+        // Recover orphaned .delivering files from crashed sync delivery attempts.
+        // Rename them back to .json so the retry worker picks them up.
+        if let Ok(entries) = std::fs::read_dir(&pending_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("delivering") {
+                    let recovered = path.with_extension("json");
+                    tracing::info!(
+                        "Recovering orphaned delivering file: {} → {}",
+                        path.display(),
+                        recovered.display()
+                    );
+                    let _ = std::fs::rename(&path, &recovered);
+                }
+            }
+        }
+
         // Same-device check on Unix (atomic rename requires same filesystem).
         #[cfg(unix)]
         {
@@ -304,35 +321,26 @@ impl DeliveryQueue {
         Ok(job)
     }
 
-    /// Rename a pending job file to `<run_id>.delivering.json` to signal that
-    /// synchronous delivery is in progress.
+    /// Rename a pending job file from `<run_id>.json` to `<run_id>.delivering`
+    /// to signal that synchronous delivery is in progress.
     ///
-    /// `list_pending()` only scans for `*.json` files (not `*.delivering.json`),
-    /// so the retry worker will not pick up the file while this rename is in effect.
+    /// `list_pending()` only scans for files with extension `"json"`, so
+    /// `*.delivering` files are invisible to the retry worker.
     ///
-    /// Returns the new path. Call `unmark_delivering` on success or failure to
-    /// restore the file to the retry queue if needed.
+    /// Returns the new path. Call `unmark_delivering` on failure to restore
+    /// the file to the retry queue, or `remove` the delivering path on success.
     pub async fn mark_delivering(&self, path: &Path) -> Result<PathBuf> {
-        let delivering_path = path.with_extension("delivering.json");
+        let delivering_path = path.with_extension("delivering");
         tokio::fs::rename(path, &delivering_path)
             .await
             .with_context(|| format!("Failed to mark as delivering: {}", path.display()))?;
         Ok(delivering_path)
     }
 
-    /// Rename a `<run_id>.delivering.json` file back to `<run_id>.json` so the
+    /// Rename a `<run_id>.delivering` file back to `<run_id>.json` so the
     /// retry worker can pick it up after a failed synchronous delivery attempt.
-    ///
-    /// Strips the `.delivering` suffix before the `.json` extension to recover
-    /// the original pending path.
     pub async fn unmark_delivering(&self, delivering_path: &Path) -> Result<PathBuf> {
-        // "foo.delivering.json" → stem is "foo.delivering", strip suffix → "foo"
-        let stem = delivering_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        let base = stem.strip_suffix(".delivering").unwrap_or(stem);
-        let pending_path = delivering_path.with_file_name(format!("{}.json", base));
+        let pending_path = delivering_path.with_extension("json");
         tokio::fs::rename(delivering_path, &pending_path)
             .await
             .with_context(|| {

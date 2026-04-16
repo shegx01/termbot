@@ -218,8 +218,10 @@ pub fn spawn_retry_worker(
                             _ => None,
                         };
 
+                        // All 4xx except 408 (Request Timeout) and 429 (Rate Limited)
+                        // are permanent — retrying will never succeed.
                         let is_permanent = matches!(http_status, Some(s) if
-                            matches!(s, 400 | 401 | 403 | 404)
+                            (400..500).contains(&s) && s != 408 && s != 429
                         );
 
                         if is_permanent {
@@ -232,10 +234,7 @@ pub fn spawn_retry_worker(
                                 "Webhook delivery failed with permanent error, moving to dead/"
                             );
                             if let Err(move_err) = queue
-                                .move_to_dead(
-                                    path,
-                                    &format!("permanent_http_error_{}", status),
-                                )
+                                .move_to_dead(path, &format!("permanent_http_error_{}", status))
                                 .await
                             {
                                 tracing::error!(

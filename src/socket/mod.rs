@@ -219,6 +219,7 @@ impl SocketServer {
                             Ok(ws) => ws,
                             Err(e) => {
                                 tracing::debug!(peer = %peer_addr, error = %e, "WebSocket upgrade failed");
+                                active.fetch_sub(1, Ordering::Release);
                                 return;
                             }
                         };
@@ -249,7 +250,7 @@ impl SocketServer {
                         )
                         .await;
 
-                        active.fetch_sub(1, Ordering::Relaxed);
+                        active.fetch_sub(1, Ordering::Release);
                         tracing::info!(
                             client = %client_name,
                             session = %session_id,
@@ -263,15 +264,18 @@ impl SocketServer {
 }
 
 /// Constant-time byte comparison to prevent timing side-channel attacks
-/// on token authentication. Uses XOR accumulation so the comparison time
-/// is independent of both byte values and token length (length difference
-/// is XOR-folded into the accumulator rather than early-returned).
+/// on token authentication. Always iterates over `max(a.len(), b.len())`
+/// bytes, padding the shorter input with zeros, so the loop count is
+/// determined by the longer input. Length mismatch is XOR-folded into the
+/// accumulator.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let len_diff = (a.len() != b.len()) as u8;
-    let min_len = std::cmp::min(a.len(), b.len());
+    let max_len = std::cmp::max(a.len(), b.len());
     let mut acc = len_diff;
-    for i in 0..min_len {
-        acc |= a[i] ^ b[i];
+    for i in 0..max_len {
+        let x = if i < a.len() { a[i] } else { 0 };
+        let y = if i < b.len() { b[i] } else { 0 };
+        acc |= x ^ y;
     }
     acc == 0
 }

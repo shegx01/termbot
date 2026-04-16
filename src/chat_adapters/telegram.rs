@@ -242,8 +242,14 @@ impl TelegramAdapter {
                                                         #[cfg(unix)]
                                                         {
                                                             use std::os::unix::fs::PermissionsExt;
-                                                            let perms = std::fs::Permissions::from_mode(0o600);
-                                                            let _ = tokio::fs::set_permissions(&path, perms).await;
+                                                            let perms =
+                                                                std::fs::Permissions::from_mode(
+                                                                    0o600,
+                                                                );
+                                                            let _ = tokio::fs::set_permissions(
+                                                                &path, perms,
+                                                            )
+                                                            .await;
                                                         }
                                                         attachments.push(Attachment {
                                                             filename: path
@@ -319,8 +325,14 @@ impl TelegramAdapter {
                                                         #[cfg(unix)]
                                                         {
                                                             use std::os::unix::fs::PermissionsExt;
-                                                            let perms = std::fs::Permissions::from_mode(0o600);
-                                                            let _ = tokio::fs::set_permissions(&path, perms).await;
+                                                            let perms =
+                                                                std::fs::Permissions::from_mode(
+                                                                    0o600,
+                                                                );
+                                                            let _ = tokio::fs::set_permissions(
+                                                                &path, perms,
+                                                            )
+                                                            .await;
                                                         }
                                                         attachments.push(Attachment {
                                                             filename: path

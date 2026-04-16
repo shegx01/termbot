@@ -525,7 +525,10 @@ impl App {
         }
         // Safety-critical variants bypass the debounce window so a crash
         // immediately after cannot leave the on-disk state inconsistent.
-        let force = matches!(&update, StateUpdate::MarkDirty | StateUpdate::SetCleanShutdown(_));
+        let force = matches!(
+            &update,
+            StateUpdate::MarkDirty | StateUpdate::SetCleanShutdown(_)
+        );
         self.store.apply(update);
         self.updates_since_persist += 1;
         if force
@@ -592,7 +595,9 @@ impl App {
                 PlatformType::Telegram => {
                     if let Ok(id) = msg.reply_context.chat_id.parse::<i64>() {
                         if self.active_telegram_chats.insert(id) {
-                            if let Err(e) = self.state_tx.try_send(StateUpdate::BindTelegramChat(id)) {
+                            if let Err(e) =
+                                self.state_tx.try_send(StateUpdate::BindTelegramChat(id))
+                            {
                                 tracing::warn!("state_tx full, update dropped: {}", e);
                             }
                         }
