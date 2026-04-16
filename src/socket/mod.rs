@@ -11,14 +11,16 @@
 //!   2. New `broadcast::channel<AmbientEvent>` for genuinely-new events
 //!   3. Existing `mpsc::Sender<IncomingMessage>` for inbound command dispatch
 
+pub mod config_watcher;
 pub mod connection;
 pub mod envelope;
 pub mod events;
 pub mod rate_limit;
 pub mod subscription;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use tokio::net::TcpListener;
@@ -31,8 +33,15 @@ use crate::buffer::StreamEvent;
 use crate::chat_adapters::IncomingMessage;
 use crate::config::SocketConfig;
 
+use self::config_watcher::SharedClientList;
 use self::connection::SharedRateLimiters;
+use self::envelope::Filter;
 use self::events::AmbientEvent;
+
+/// Shared per-client subscription store. Keyed by client name, stores the
+/// subscription list from the last connection. In-memory only (not persisted
+/// to disk — server restart clears all saved subscriptions).
+pub type SharedSubscriptionStore = Arc<Mutex<HashMap<String, Vec<(String, Filter)>>>>;
 
 /// The socket server: binds a TCP listener, accepts connections, authenticates
 /// via Bearer token at HTTP upgrade, and spawns per-connection tasks.
@@ -42,15 +51,22 @@ pub struct SocketServer {
     stream_tx: broadcast::Sender<StreamEvent>,
     ambient_tx: broadcast::Sender<AmbientEvent>,
     cancel: tokio_util::sync::CancellationToken,
+    cancel_tx: mpsc::Sender<String>,
+    shared_clients: SharedClientList,
+    shared_subs: SharedSubscriptionStore,
 }
 
 impl SocketServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: SocketConfig,
         cmd_tx: mpsc::Sender<IncomingMessage>,
         stream_tx: broadcast::Sender<StreamEvent>,
         ambient_tx: broadcast::Sender<AmbientEvent>,
         cancel: tokio_util::sync::CancellationToken,
+        cancel_tx: mpsc::Sender<String>,
+        shared_clients: SharedClientList,
+        shared_subs: SharedSubscriptionStore,
     ) -> Self {
         Self {
             config,
@@ -58,6 +74,9 @@ impl SocketServer {
             stream_tx,
             ambient_tx,
             cancel,
+            cancel_tx,
+            shared_clients,
+            shared_subs,
         }
     }
 
@@ -123,17 +142,25 @@ impl SocketServer {
                     let cancel = self.cancel.child_token();
                     let active = Arc::clone(&active_connections);
                     let rate_limiters = Arc::clone(&shared_rate_limiters);
+                    let cancel_tx = self.cancel_tx.clone();
+                    // Snapshot the current client list atomically for this connection's auth
+                    let clients_snapshot = self.shared_clients.load_full();
+                    let shared_subs = Arc::clone(&self.shared_subs);
 
                     tokio::spawn(async move {
                         // Authenticate at HTTP upgrade via Bearer token
                         let mut authenticated_client: Option<String> = None;
-                        let clients = config.clients.clone();
-                        let max_msg = config.max_message_bytes;
+                        // WS frame limit must accommodate the larger of text and
+                        // binary limits so the tungstenite layer doesn't reject
+                        // binary frames before our application handler sees them.
+                        let ws_max = std::cmp::max(
+                            config.max_message_bytes,
+                            config.max_binary_bytes,
+                        );
 
-                        // Fix #3: set max frame/message size to prevent pre-auth OOM
                         let ws_config = WebSocketConfig {
-                            max_message_size: Some(max_msg),
-                            max_frame_size: Some(max_msg),
+                            max_message_size: Some(ws_max),
+                            max_frame_size: Some(ws_max),
                             ..Default::default()
                         };
 
@@ -154,7 +181,7 @@ impl SocketServer {
                                 match token {
                                     Some(t) => {
                                         // Fix #1: constant-time token comparison
-                                        if let Some(client) = clients.iter().find(|c| constant_time_eq(c.token.as_bytes(), t.as_bytes())) {
+                                        if let Some(client) = clients_snapshot.iter().find(|c| constant_time_eq(c.token.as_bytes(), t.as_bytes())) {
                                             authenticated_client = Some(client.name.clone());
                                             Ok(response)
                                         } else {
@@ -204,6 +231,8 @@ impl SocketServer {
                             cancel,
                             config,
                             rate_limiters,
+                            cancel_tx,
+                            shared_subs,
                         )
                         .await;
 

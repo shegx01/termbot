@@ -67,9 +67,14 @@ token = "tk_live_..."
 
 #### `hello` (optional)
 ```json
-{"type": "hello", "protocol": "terminus/v1"}
+{"type": "hello", "protocol": "terminus/v1", "restore_subscriptions": false}
 ```
 Server validates protocol version. If unsupported, sends `error` + closes.
+
+- `restore_subscriptions`: If `true`, the server restores any subscriptions saved from
+  the previous connection for this client (matched by token). The server sends a
+  `subscribed` envelope for each restored subscription. Saved subscriptions are
+  in-memory only — a server restart clears them.
 
 #### `request`
 ```json
@@ -88,8 +93,14 @@ Server validates protocol version. If unsupported, sends `error` + closes.
 ```json
 {"type": "cancel", "request_id": "client-supplied-ulid"}
 ```
-Best-effort cancellation. Claude turns cancel at the next event boundary; shell
-commands already dispatched to tmux cannot be cancelled (result carries `cancelled: true`).
+Cancels an in-flight request. Behaviour depends on command type:
+
+- **Shell commands (`: <cmd>`):** Sends `Ctrl+C` (SIGINT) to the foreground tmux
+  pane, which actually interrupts the running process. The `result` frame will
+  carry `"cancelled": true`.
+- **Harness commands (`: claude ...`):** Best-effort only. Cancellation is flagged
+  at the next event boundary; the Claude turn may still complete. The `result`
+  frame carries `"cancelled": true`.
 
 #### `subscribe`
 ```json
@@ -112,6 +123,31 @@ commands already dispatched to tmux cannot be cancelled (result carries `cancell
 ```json
 {"type": "unsubscribe", "subscription_id": "sub-1"}
 ```
+
+#### `attachment_meta`
+```json
+{
+  "type": "attachment_meta",
+  "request_id": "client-supplied-ulid",
+  "filename": "screenshot.png",
+  "content_type": "image/png",
+  "size_bytes": 102400
+}
+```
+Two-phase protocol for sending binary attachments (images, files):
+
+1. Send the `attachment_meta` JSON envelope. The server responds with `ack`.
+2. Send the raw binary data as a single WebSocket binary frame.
+
+The server writes the binary frame to a temp file and forwards it as an attachment
+to the active session. If the binary frame does not arrive within 30 seconds, the
+server emits an `attachment_timeout` error. The maximum allowed size is controlled
+by `max_binary_bytes` (default 10 MiB); exceeding it produces `attachment_too_large`.
+
+**Note:** Binary attachments require an active harness session (e.g., `: claude on`).
+Without a harness, attachment-only messages are rejected with an error. To send an
+image for analysis, first enable harness mode, then send the `attachment_meta` +
+binary frame — the harness receives the image as an attachment.
 
 #### `ping`
 ```json
@@ -259,6 +295,8 @@ For `rate_limited` errors, the response includes a machine-readable `retry_after
 | `subscription_limit` | Max subscriptions per connection exceeded |
 | `unknown_subscription` | Unsubscribe for non-existent subscription_id |
 | `message_too_large` | Inbound message exceeds `max_message_bytes` |
+| `attachment_too_large` | Binary frame exceeds `max_binary_bytes` |
+| `attachment_timeout` | Binary frame did not arrive within 30 seconds of `attachment_meta` |
 | `internal_error` | Unexpected server error |
 
 ## Pipelining
@@ -293,6 +331,7 @@ max_pending_requests = 32             # Pipelined request queue depth
 rate_limit_per_second = 20.0          # Token refill rate (requests/sec)
 rate_limit_burst = 60.0               # Token bucket capacity (burst)
 max_message_bytes = 1048576           # 1 MiB inbound message limit
+max_binary_bytes = 10485760           # 10 MiB binary attachment limit
 ping_interval_secs = 30               # Server-sent WebSocket Ping interval
 pong_timeout_secs = 10                # Close if Pong not received in time
 idle_timeout_secs = 300               # Close if no inbound activity
@@ -363,10 +402,50 @@ Caddy handles WebSocket upgrade + TLS automatically.
 - Send periodic `ping` envelopes or real commands to prevent timeout
 - Increase `idle_timeout_secs` for long-idle monitoring sessions
 
+**Token rotated but new token rejected:**
+- Config hot-reload applies to new connections only. Disconnect and reconnect with
+  the new token.
+- If still rejected, check that the `[[socket.client]]` entry was saved correctly
+  and that terminus reloaded the file (look for a log line indicating config reload).
+
+**Subscriptions not restored after reconnect:**
+- Send `"restore_subscriptions": true` in the `hello` envelope on reconnect.
+- Saved subscriptions are in-memory: if terminus restarted since the last connection,
+  they are gone and must be re-subscribed manually.
+
+**`attachment_timeout` error:**
+- The binary frame must follow `attachment_meta` within 30 seconds. Ensure your
+  client sends the binary WebSocket frame immediately after receiving the `ack`.
+
+**`attachment_too_large` error:**
+- The binary payload exceeded `max_binary_bytes` (default 10 MiB). Increase this
+  value in `[socket]` or reduce the attachment size.
+
+**Cancel did not interrupt the running command:**
+- Shell commands receive Ctrl+C via the tmux pane; confirm the session is in the
+  foreground (`tmux list-panes -a`).
+- Claude harness commands are best-effort — the turn may still complete after a
+  cancel. Use `result.cancelled` to detect suppressed delivery.
+
 ## v1 Limitations
 
-- **No config hot-reload.** Token changes require terminus restart.
-- **No persistent subscriptions.** Reconnect re-subscribes from scratch.
-- **No binary frames.** Inbound attachments (images/files) not supported over socket.
-- **Shell command cancellation is best-effort.** Once dispatched to tmux, the command
-  runs to completion; only the result delivery is suppressed.
+- **Config hot-reload is partial.** Token additions, removals, and rotations in
+  `[[socket.client]]` take effect on the next new connection without a restart.
+  Existing authenticated connections are not disrupted. Structural changes (`bind`,
+  `port`, `max_connections`, etc.) still require a restart.
+
+- **Persistent subscriptions are in-memory only.** Subscriptions saved from a prior
+  connection (restored via `restore_subscriptions: true` in `hello`) are held in
+  server memory. A server restart clears all saved subscriptions; clients must
+  re-subscribe from scratch after a restart.
+
+- **Binary frames: no streaming, one frame per attachment.** The two-phase
+  `attachment_meta` + binary frame protocol supports file/image transfers up to
+  `max_binary_bytes`. Streaming binary (chunked transfer) is not supported — the
+  entire payload must arrive as a single WebSocket binary frame.
+
+- **Shell command cancellation sends Ctrl+C; harness cancellation is still
+  best-effort.** Cancelling a shell command (`: <cmd>`) delivers SIGINT to the
+  foreground tmux pane, which interrupts the running process. Cancelling a Claude
+  harness command (`: claude ...`) remains best-effort — the flag is set at the
+  next event boundary and the turn may still complete.

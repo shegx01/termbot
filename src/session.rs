@@ -262,6 +262,15 @@ impl SessionManager {
         }
     }
 
+    /// Send Ctrl+C interrupt to the foreground session's pane.
+    /// Returns Ok(()) if interrupt was sent, Err if no foreground session.
+    pub async fn interrupt_foreground(&self) -> Result<()> {
+        match &self.foreground {
+            Some(name) => self.tmux.send_interrupt(name).await,
+            None => bail!("No active session to interrupt"),
+        }
+    }
+
     /// Detach from all sessions without killing them.
     /// Sessions survive restart and can be reconnected via `reconcile_startup`.
     pub async fn cleanup_all(&mut self) {

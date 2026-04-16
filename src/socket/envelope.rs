@@ -15,6 +15,10 @@ pub enum InboundEnvelope {
     Hello {
         #[serde(default)]
         protocol: Option<String>,
+        /// If true, restore subscriptions from the previous connection with the
+        /// same client name. Backward compatible (defaults to false).
+        #[serde(default)]
+        restore_subscriptions: bool,
     },
     /// Command request with client-supplied correlation ID.
     Request {
@@ -36,6 +40,14 @@ pub enum InboundEnvelope {
     Unsubscribe { subscription_id: String },
     /// Liveness ping (optional — server also sends WS Ping frames).
     Ping,
+    /// Metadata for an upcoming binary frame attachment.
+    /// The next WebSocket binary frame after this envelope is the payload.
+    AttachmentMeta {
+        request_id: String,
+        filename: String,
+        content_type: String,
+        size_bytes: usize,
+    },
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -163,6 +175,8 @@ pub enum ErrorCode {
     UnknownSubscription,
     MessageTooLarge,
     InternalError,
+    AttachmentTooLarge,
+    AttachmentTimeout,
 }
 
 /// Subscription filter: empty facets match everything (OR within facet, AND across facets).
@@ -239,6 +253,36 @@ mod tests {
         let json = r#"{"type":"hello","protocol":"terminus/v1"}"#;
         let env: InboundEnvelope = serde_json::from_str(json).unwrap();
         assert!(matches!(env, InboundEnvelope::Hello { .. }));
+    }
+
+    #[test]
+    fn inbound_hello_with_restore_deserializes() {
+        let json = r#"{"type":"hello","protocol":"terminus/v1","restore_subscriptions":true}"#;
+        let env: InboundEnvelope = serde_json::from_str(json).unwrap();
+        match env {
+            InboundEnvelope::Hello {
+                restore_subscriptions,
+                ..
+            } => {
+                assert!(restore_subscriptions);
+            }
+            other => panic!("expected Hello, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inbound_hello_without_restore_defaults_false() {
+        let json = r#"{"type":"hello","protocol":"terminus/v1"}"#;
+        let env: InboundEnvelope = serde_json::from_str(json).unwrap();
+        match env {
+            InboundEnvelope::Hello {
+                restore_subscriptions,
+                ..
+            } => {
+                assert!(!restore_subscriptions);
+            }
+            other => panic!("expected Hello, got {:?}", other),
+        }
     }
 
     #[test]
@@ -382,6 +426,8 @@ mod tests {
             ErrorCode::UnknownSubscription,
             ErrorCode::MessageTooLarge,
             ErrorCode::InternalError,
+            ErrorCode::AttachmentTooLarge,
+            ErrorCode::AttachmentTimeout,
         ];
         for code in codes {
             let json = serde_json::to_string(&code).unwrap();
@@ -393,5 +439,52 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn inbound_attachment_meta_deserializes() {
+        let json = r#"{
+            "type": "attachment_meta",
+            "request_id": "req-99",
+            "filename": "photo.png",
+            "content_type": "image/png",
+            "size_bytes": 4096
+        }"#;
+        let env: InboundEnvelope = serde_json::from_str(json).unwrap();
+        match env {
+            InboundEnvelope::AttachmentMeta {
+                request_id,
+                filename,
+                content_type,
+                size_bytes,
+            } => {
+                assert_eq!(request_id, "req-99");
+                assert_eq!(filename, "photo.png");
+                assert_eq!(content_type, "image/png");
+                assert_eq!(size_bytes, 4096);
+            }
+            other => panic!("expected AttachmentMeta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn attachment_error_codes_serialize() {
+        let env = OutboundEnvelope::Error {
+            request_id: Some("req-1".into()),
+            code: ErrorCode::AttachmentTooLarge,
+            message: "Attachment exceeds limit".into(),
+            retry_after_ms: None,
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains(r#""code":"attachment_too_large""#));
+
+        let env2 = OutboundEnvelope::Error {
+            request_id: Some("req-2".into()),
+            code: ErrorCode::AttachmentTimeout,
+            message: "Binary frame not received".into(),
+            retry_after_ms: None,
+        };
+        let json2 = serde_json::to_string(&env2).unwrap();
+        assert!(json2.contains(r#""code":"attachment_timeout""#));
     }
 }

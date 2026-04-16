@@ -98,6 +98,21 @@ impl TmuxClient {
         self.send_keys(name, text).await
     }
 
+    /// Send Ctrl+C (interrupt signal) to the session's foreground process.
+    /// Uses `tmux send-keys C-c` which sends the interrupt without `-l` (literal).
+    pub async fn send_interrupt(&self, name: &str) -> Result<()> {
+        let prefixed = self.prefixed(name);
+        let status = Command::new("tmux")
+            .args(["send-keys", "-t", &prefixed, "C-c"])
+            .status()
+            .await
+            .context("Failed to send interrupt")?;
+        if !status.success() {
+            anyhow::bail!("tmux send-keys (C-c) failed for '{}'", name);
+        }
+        Ok(())
+    }
+
     /// Capture the current pane content as plain text (no ANSI escapes).
     /// Uses `-J` to join wrapped lines. Returns tmux's rendered screen grid.
     pub async fn capture_pane(&self, name: &str) -> Result<String> {

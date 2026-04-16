@@ -79,9 +79,10 @@ src/
 2. **state_rx** -- `StateUpdate` mpsc from adapters and App internals; debounced
    persist (≥10 updates OR ≥5s)
 3. **cmd_rx** -- incoming messages from platform adapters
-4. **health_interval** -- 5s timer, crashed-session detection + `StateUpdate::Tick`
-5. **poll_interval** -- 250ms timer, capture-pane scrollback read
-6. **ctrl_c** -- graceful shutdown; calls `App::mark_clean_shutdown()` to flip
+4. **cancel_rx** -- socket cancel requests; sends `C-c` to foreground tmux pane
+5. **health_interval** -- 5s timer, crashed-session detection + `StateUpdate::Tick`
+6. **poll_interval** -- 250ms timer, capture-pane scrollback read
+7. **ctrl_c** -- graceful shutdown; calls `App::mark_clean_shutdown()` to flip
    `last_clean_shutdown=true` before cleanup so restarts don't fire false banners
 
 **Banner-ack ordering** (no main-loop round-trip, no deadlock): `handle_gap`
@@ -148,12 +149,15 @@ behind a reverse proxy for `wss://` TLS termination.
 
 **Architecture:** Per-connection task model. `SocketServer` binds a `TcpListener`,
 authenticates via `Authorization: Bearer <token>` at the HTTP upgrade (tokens from
-`[[socket.client]]` entries in config), and spawns a per-connection task.
+`[[socket.client]]` entries in config via `Arc<ArcSwap<Vec<SocketClient>>>`), and
+spawns a per-connection task.
 
 **Integration seams (no structural changes to App/session/harness):**
 - Inbound: `mpsc::Sender<IncomingMessage>` (same channel as chat adapters). Socket
   sets `socket_reply_tx` on `ReplyContext` so `App::send_reply` routes responses
   back to the socket instead of to a chat platform.
+- Cancel: `mpsc::Sender<String>` carries cancel request_ids from socket connections
+  to the main loop, which sends `C-c` to the foreground tmux pane.
 - Per-request output: `broadcast::channel<StreamEvent>` (existing). The connection
   task subscribes and translates matching events for subscribed clients.
 - Ambient events: `broadcast::channel<AmbientEvent>` (new, capacity 512). 7 new
@@ -161,6 +165,23 @@ authenticates via `Authorization: Bearer <token>` at the HTTP upgrade (tokens fr
   `SessionLimitReached`, `ChatForward`, `HarnessStarted`, `HarnessFinished`,
   `SessionOutput` (translated from `StreamEvent::NewMessage` at socket layer).
 - `PlatformType` is NOT modified (preserves golden-tested queue-file wire format).
+
+**Config hot-reload:** `src/socket/config_watcher.rs` uses the `notify` crate to
+watch `terminus.toml` for changes, debounces at 500ms, and atomically swaps the
+`[[socket.client]]` list via `ArcSwap`. Only client tokens/names are hot-reloaded;
+structural config (bind, port, limits) still requires restart. Existing connections
+are not disrupted.
+
+**Persistent subscriptions:** `SharedSubscriptionStore` (`Arc<Mutex<HashMap<String,
+Vec<(String, Filter)>>>>`) in `SocketServer` saves subscriptions by client_name on
+every subscribe/unsubscribe. Clients send `hello` with `restore_subscriptions: true`
+to restore saved subscriptions on reconnect. In-memory only — server restart clears.
+
+**Binary frames:** Two-phase protocol: `attachment_meta` JSON envelope declares
+upcoming binary frame, then a WebSocket binary frame with the payload. Connection
+state machine (`PendingBinary`) enforces one pending at a time, max size
+(`max_binary_bytes`, default 10 MiB), and 30s timeout. Binary data is written to
+`/tmp/terminus-attachment-{ulid}.{ext}` and forwarded via `IncomingMessage.attachments`.
 
 **Wire protocol:** `terminus/v1`. One JSON envelope per WebSocket text message.
 Client-supplied `request_id` for correlation. Per-request lifecycle:

@@ -66,6 +66,8 @@ pub struct SocketConfig {
     pub send_buffer_size: usize,
     #[serde(default = "default_shutdown_drain_secs")]
     pub shutdown_drain_secs: u64,
+    #[serde(default = "default_max_binary_bytes")]
+    pub max_binary_bytes: usize,
     /// Per-client named tokens for authentication.
     #[serde(default, rename = "client")]
     pub clients: Vec<SocketClient>,
@@ -129,6 +131,9 @@ fn default_send_buffer_size() -> usize {
 fn default_shutdown_drain_secs() -> u64 {
     30
 }
+fn default_max_binary_bytes() -> usize {
+    10_485_760 // 10 MiB
+}
 
 impl Default for SocketConfig {
     fn default() -> Self {
@@ -147,6 +152,7 @@ impl Default for SocketConfig {
             idle_timeout_secs: default_idle_timeout_secs(),
             send_buffer_size: default_send_buffer_size(),
             shutdown_drain_secs: default_shutdown_drain_secs(),
+            max_binary_bytes: default_max_binary_bytes(),
             clients: Vec::new(),
         }
     }
@@ -526,6 +532,9 @@ impl Config {
             }
             if self.socket.shutdown_drain_secs == 0 {
                 anyhow::bail!("[socket] shutdown_drain_secs must be > 0");
+            }
+            if self.socket.max_binary_bytes < 1024 {
+                anyhow::bail!("[socket] max_binary_bytes must be >= 1024");
             }
             if self.socket.rate_limit_per_second <= 0.0 {
                 anyhow::bail!("[socket] rate_limit_per_second must be > 0");

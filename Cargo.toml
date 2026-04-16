@@ -30,6 +30,8 @@ dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
 ulid = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+arc-swap = "1"
 wiremock = { version = "0.6", optional = true }
 # native_tls_backend avoids the vulnerable rustls-webpki 0.102.8 (RUSTSEC-2026-0049)
 # that rustls_backend pulls via tokio-tungstenite 0.21 → rustls 0.22.

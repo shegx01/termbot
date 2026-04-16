@@ -26,7 +26,7 @@ use tokio::time::interval;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::buffer::StreamEvent;
-use crate::chat_adapters::{IncomingMessage, PlatformType, ReplyContext};
+use crate::chat_adapters::{Attachment, IncomingMessage, PlatformType, ReplyContext};
 use crate::config::SocketConfig;
 
 use super::envelope::{ErrorCode, InboundEnvelope, OutboundEnvelope};
@@ -37,6 +37,15 @@ use super::subscription::SubscriptionRegistry;
 /// Shared per-client rate limiter. Keyed by client name so reconnecting
 /// clients share the same token bucket (prevents rate-limit bypass via reconnect).
 pub type SharedRateLimiters = Arc<Mutex<HashMap<String, TokenBucket>>>;
+
+/// State for a pending binary frame after receiving an `attachment_meta` envelope.
+/// Cleared once the binary frame arrives or the 30-second timeout elapses.
+struct PendingBinary {
+    request_id: String,
+    filename: String,
+    content_type: String,
+    received_at: Instant,
+}
 
 /// State for one pending (in-flight) request.
 struct PendingRequest {
@@ -62,12 +71,16 @@ pub async fn run(
     cancel: tokio_util::sync::CancellationToken,
     config: SocketConfig,
     shared_rate_limiters: SharedRateLimiters,
+    cancel_tx: mpsc::Sender<String>,
+    shared_subs: super::SharedSubscriptionStore,
 ) {
     let (mut ws_sink, mut ws_stream_read) = ws_stream.split();
 
     // Per-connection state
     let mut subs = SubscriptionRegistry::new(config.max_subscriptions_per_connection);
     let mut pending: HashMap<String, PendingRequest> = HashMap::new();
+    let mut pending_binary: Option<PendingBinary> = None;
+    let mut hello_received = false;
     let mut last_activity = Instant::now();
     // Pong tracking: close connection if pong not received within timeout after ping
     let mut last_pong = Instant::now();
@@ -102,6 +115,8 @@ pub async fn run(
         ],
     };
     if send_envelope(&mut ws_sink, &hello_ack).await.is_err() {
+        // Save subscriptions even on early exit (may have been restored via hello)
+        save_subscriptions(&subs, &client_name, &shared_subs);
         return;
     }
 
@@ -110,7 +125,7 @@ pub async fn run(
         // accumulate all text chunks; when the sender is dropped (command handler
         // returned), emit a single `result` with joined text + a single `end`.
         if drain_pending(&mut pending, &mut ws_sink).await.is_err() {
-            return; // WS write error
+            break; // WS write error
         }
 
         tokio::select! {
@@ -124,7 +139,7 @@ pub async fn run(
                 let _ = send_envelope(&mut ws_sink, &env).await;
                 let _ = ws_sink.close().await;
                 tracing::info!(client = %client_name, "socket connection closed (shutdown)");
-                return;
+                break;
             }
 
             // 2. Inbound WebSocket frame
@@ -132,6 +147,25 @@ pub async fn run(
                 match frame {
                     Some(Ok(Message::Text(text))) => {
                         last_activity = Instant::now();
+
+                        // If a binary frame was expected (attachment_meta sent) but
+                        // a text frame arrived instead, cancel the pending binary.
+                        // This prevents stale state from correlating a later binary
+                        // frame with the wrong attachment_meta.
+                        if let Some(stale) = pending_binary.take() {
+                            tracing::warn!(
+                                client = %client_name,
+                                request_id = %stale.request_id,
+                                "text frame received while binary frame was expected — \
+                                 cancelling pending attachment"
+                            );
+                            let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Error {
+                                request_id: Some(stale.request_id),
+                                code: ErrorCode::AttachmentTimeout,
+                                message: "Text frame received while binary frame was expected".to_string(),
+                                retry_after_ms: None,
+                            }).await;
+                        }
 
                         // Max message size check
                         if text.len() > config.max_message_bytes {
@@ -142,7 +176,7 @@ pub async fn run(
                                 retry_after_ms: None,
                             }).await;
                             let _ = ws_sink.close().await;
-                            return;
+                            break;
                         }
 
                         // Rate limit check (shared per-client bucket)
@@ -183,7 +217,16 @@ pub async fn run(
                         };
 
                         match envelope {
-                            InboundEnvelope::Hello { protocol } => {
+                            InboundEnvelope::Hello { protocol, restore_subscriptions } => {
+                                // Guard: only process hello once per connection.
+                                // A second hello could re-import stale subscriptions
+                                // that the client explicitly unsubscribed from.
+                                if hello_received {
+                                    // Silently ignore duplicate hello (backward compat)
+                                    continue;
+                                }
+                                hello_received = true;
+
                                 // Validate protocol version; hello_ack already sent
                                 if let Some(ref p) = protocol {
                                     if p != "terminus/v1" {
@@ -194,10 +237,44 @@ pub async fn run(
                                             retry_after_ms: None,
                                         }).await;
                                         let _ = ws_sink.close().await;
-                                        return;
+                                        break;
                                     }
                                 }
-                                // hello_ack already sent on connect; no-op
+                                // Restore subscriptions from previous connection if requested
+                                if restore_subscriptions {
+                                    let stored = {
+                                        let store = shared_subs
+                                            .lock()
+                                            .expect("subscription store mutex poisoned");
+                                        store.get(&client_name).cloned().unwrap_or_default()
+                                    };
+                                    if !stored.is_empty() {
+                                        let count = subs.import(stored);
+                                        tracing::info!(
+                                            client = %client_name,
+                                            restored = count,
+                                            "Restored subscriptions"
+                                        );
+                                        // Persist the restored set and notify client
+                                        let restored_subs = subs.export();
+                                        {
+                                            let mut store = shared_subs
+                                                .lock()
+                                                .expect("subscription store mutex poisoned");
+                                            store.insert(client_name.clone(), restored_subs.clone());
+                                        }
+                                        // Notify client of each restored subscription
+                                        for (sub_id, _) in restored_subs {
+                                            let _ = send_envelope(
+                                                &mut ws_sink,
+                                                &OutboundEnvelope::Subscribed {
+                                                    subscription_id: sub_id,
+                                                },
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
                             }
 
                             InboundEnvelope::Request { request_id, command, options: _ } => {
@@ -236,7 +313,7 @@ pub async fn run(
                                 // Forward to main loop
                                 if cmd_tx.send(incoming).await.is_err() {
                                     tracing::error!(client = %client_name, "cmd_tx closed");
-                                    return;
+                                    break;
                                 }
 
                                 // Store pending request
@@ -255,13 +332,34 @@ pub async fn run(
 
                             InboundEnvelope::Cancel { request_id } => {
                                 if let Some(req) = pending.get_mut(&request_id) {
-                                    req.cancelled = true;
+                                    // Dedup: only send one interrupt per request.
+                                    // Multiple cancel envelopes for the same request_id
+                                    // should not produce multiple C-c signals.
+                                    if !req.cancelled {
+                                        req.cancelled = true;
+                                        if let Err(e) = cancel_tx.try_send(request_id) {
+                                            tracing::warn!(
+                                                client = %client_name,
+                                                error = %e,
+                                                "cancel_tx full or closed — interrupt not sent"
+                                            );
+                                        }
+                                    }
                                 }
+                                // If request_id not found in pending, it already completed
+                                // — no interrupt needed.
                             }
 
                             InboundEnvelope::Subscribe { subscription_id, filter } => {
                                 match subs.add(subscription_id.clone(), filter) {
                                     Ok(()) => {
+                                        // Persist updated subscription set
+                                        {
+                                            let mut store = shared_subs
+                                                .lock()
+                                                .expect("subscription store mutex poisoned");
+                                            store.insert(client_name.clone(), subs.export());
+                                        }
                                         let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Subscribed {
                                             subscription_id,
                                         }).await;
@@ -281,6 +379,18 @@ pub async fn run(
                             InboundEnvelope::Unsubscribe { subscription_id } => {
                                 match subs.remove(&subscription_id) {
                                     Ok(()) => {
+                                        // Persist updated subscription set
+                                        {
+                                            let mut store = shared_subs
+                                                .lock()
+                                                .expect("subscription store mutex poisoned");
+                                            let exported = subs.export();
+                                            if exported.is_empty() {
+                                                store.remove(&client_name);
+                                            } else {
+                                                store.insert(client_name.clone(), exported);
+                                            }
+                                        }
                                         let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Unsubscribed {
                                             subscription_id,
                                         }).await;
@@ -299,6 +409,58 @@ pub async fn run(
                             InboundEnvelope::Ping => {
                                 let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Pong).await;
                             }
+
+                            InboundEnvelope::AttachmentMeta {
+                                request_id,
+                                filename,
+                                content_type,
+                                size_bytes,
+                            } => {
+                                // Reject if another binary frame is already pending
+                                if pending_binary.is_some() {
+                                    let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Error {
+                                        request_id: Some(request_id),
+                                        code: ErrorCode::QueueFull,
+                                        message: "A binary frame is already pending".to_string(),
+                                        retry_after_ms: None,
+                                    }).await;
+                                    continue;
+                                }
+                                // Reject zero-size attachments
+                                if size_bytes == 0 {
+                                    let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Error {
+                                        request_id: Some(request_id),
+                                        code: ErrorCode::ParseError,
+                                        message: "Attachment size_bytes must be > 0".to_string(),
+                                        retry_after_ms: None,
+                                    }).await;
+                                    continue;
+                                }
+                                // Enforce size limit
+                                if size_bytes > config.max_binary_bytes {
+                                    let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Error {
+                                        request_id: Some(request_id),
+                                        code: ErrorCode::AttachmentTooLarge,
+                                        message: format!(
+                                            "Attachment size {} exceeds limit of {} bytes",
+                                            size_bytes, config.max_binary_bytes
+                                        ),
+                                        retry_after_ms: None,
+                                    }).await;
+                                    continue;
+                                }
+                                pending_binary = Some(PendingBinary {
+                                    request_id: request_id.clone(),
+                                    filename,
+                                    content_type,
+                                    received_at: Instant::now(),
+                                });
+                                // Ack — client should send binary frame next
+                                let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Ack {
+                                    request_id,
+                                    accepted_at: chrono::Utc::now().to_rfc3339(),
+                                }).await;
+                            }
                         }
                     }
 
@@ -315,15 +477,137 @@ pub async fn run(
 
                     Some(Ok(Message::Close(_))) | None => {
                         tracing::info!(client = %client_name, "socket connection closed by client");
-                        return;
+                        break;
                     }
 
                     Some(Err(e)) => {
                         tracing::warn!(client = %client_name, error = %e, "WebSocket error");
-                        return;
+                        break;
                     }
 
-                    _ => {} // Binary frames ignored
+                    Some(Ok(Message::Binary(data))) => {
+                        last_activity = Instant::now();
+
+                        // Rate limit check (shared per-client bucket)
+                        let rate_result = {
+                            let mut limiters = shared_rate_limiters
+                                .lock()
+                                .expect("rate limiter mutex poisoned");
+                            if let Some(bucket) = limiters.get_mut(&client_name) {
+                                bucket.try_consume(1.0)
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        if let Err(retry_after) = rate_result {
+                            let ms = retry_after.as_millis() as u64;
+                            let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Error {
+                                request_id: None,
+                                code: ErrorCode::RateLimited,
+                                message: format!("retry after {}ms", ms),
+                                retry_after_ms: Some(ms),
+                            }).await;
+                            continue;
+                        }
+
+                        let Some(meta) = pending_binary.take() else {
+                            // No pending attachment_meta — ignore binary frame
+                            tracing::debug!(
+                                client = %client_name,
+                                bytes = data.len(),
+                                "ignoring unexpected binary frame (no pending attachment_meta)"
+                            );
+                            continue;
+                        };
+
+                        // Validate actual binary frame size against config limit.
+                        // The attachment_meta declared size was pre-checked, but a
+                        // malicious client can lie — this check is authoritative.
+                        if data.len() > config.max_binary_bytes {
+                            let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Error {
+                                request_id: Some(meta.request_id),
+                                code: ErrorCode::AttachmentTooLarge,
+                                message: format!(
+                                    "Binary frame {} bytes exceeds limit of {} bytes",
+                                    data.len(), config.max_binary_bytes
+                                ),
+                                retry_after_ms: None,
+                            }).await;
+                            continue;
+                        }
+
+                        // Write binary data to a temp file.
+                        // Sanitize extension: only keep alphanumeric chars to
+                        // prevent path traversal via crafted filenames.
+                        let raw_ext = std::path::Path::new(&meta.filename)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("bin");
+                        let ext: String = raw_ext
+                            .chars()
+                            .take(10)
+                            .filter(|c| c.is_ascii_alphanumeric())
+                            .collect();
+                        let ext = if ext.is_empty() { "bin".to_string() } else { ext };
+                        let ulid_str = ulid::Ulid::new().to_string();
+                        let tmp_path = std::path::PathBuf::from(format!(
+                            "/tmp/terminus-attachment-{}.{}",
+                            ulid_str, ext
+                        ));
+                        let tmp_path_for_cleanup = tmp_path.clone();
+
+                        if let Err(e) = tokio::fs::write(&tmp_path, &data).await {
+                            tracing::warn!(
+                                client = %client_name,
+                                error = %e,
+                                "failed to write attachment to temp file"
+                            );
+                            let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Error {
+                                request_id: Some(meta.request_id),
+                                code: ErrorCode::InternalError,
+                                message: "Failed to write attachment".to_string(),
+                                retry_after_ms: None,
+                            }).await;
+                            continue;
+                        }
+
+                        // Create per-request response channel
+                        let (reply_tx, reply_rx) = mpsc::unbounded_channel::<String>();
+                        let request_id = meta.request_id.clone();
+
+                        let incoming = IncomingMessage {
+                            user_id: client_name.clone(),
+                            text: String::new(),
+                            platform: PlatformType::Telegram,
+                            reply_context: ReplyContext {
+                                platform: PlatformType::Telegram,
+                                chat_id: format!("socket:{}", client_name),
+                                thread_ts: None,
+                                socket_reply_tx: Some(reply_tx),
+                            },
+                            attachments: vec![Attachment {
+                                path: tmp_path,
+                                filename: meta.filename,
+                                media_type: meta.content_type,
+                            }],
+                            socket_request_id: Some(request_id.clone()),
+                            socket_client_name: Some(client_name.clone()),
+                        };
+
+                        if cmd_tx.send(incoming).await.is_err() {
+                            tracing::error!(client = %client_name, "cmd_tx closed");
+                            let _ = tokio::fs::remove_file(&tmp_path_for_cleanup).await;
+                            break;
+                        }
+
+                        pending.insert(request_id, PendingRequest {
+                            chunks: Vec::new(),
+                            reply_rx,
+                            cancelled: false,
+                        });
+                    }
+
+                    _ => {} // Other frame types ignored
                 }
             }
 
@@ -347,7 +631,7 @@ pub async fn run(
                             missed_count: Some(n),
                         }).await;
                     }
-                    Err(broadcast::error::RecvError::Closed) => return,
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
 
@@ -378,7 +662,7 @@ pub async fn run(
                             missed_count: Some(n),
                         }).await;
                     }
-                    Err(broadcast::error::RecvError::Closed) => return,
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
 
@@ -388,11 +672,11 @@ pub async fn run(
                 if ping_outstanding && last_pong.elapsed() > pong_timeout {
                     tracing::info!(client = %client_name, "pong timeout — closing connection");
                     let _ = ws_sink.close().await;
-                    return;
+                    break;
                 }
                 if let Err(e) = ws_sink.send(Message::Ping(vec![])).await {
                     tracing::debug!(client = %client_name, error = %e, "ping send failed");
-                    return;
+                    break;
                 }
                 ping_outstanding = true;
             }
@@ -407,8 +691,51 @@ pub async fn run(
         if last_activity.elapsed() > idle_timeout {
             tracing::info!(client = %client_name, "idle timeout — closing connection");
             let _ = ws_sink.close().await;
-            return;
+            break;
         }
+
+        // Attachment timeout check: if a binary frame was expected but not received
+        // within 30 seconds, send an error and clear the pending state.
+        if let Some(ref meta) = pending_binary {
+            if meta.received_at.elapsed() > Duration::from_secs(30) {
+                let request_id = meta.request_id.clone();
+                pending_binary = None;
+                let _ = send_envelope(
+                    &mut ws_sink,
+                    &OutboundEnvelope::Error {
+                        request_id: Some(request_id),
+                        code: ErrorCode::AttachmentTimeout,
+                        message: "Binary frame not received within 30 seconds".to_string(),
+                        retry_after_ms: None,
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    // Final drain: emit result+end for any completed-but-not-yet-drained requests.
+    // Errors ignored — the WebSocket may already be dead.
+    let _ = drain_pending(&mut pending, &mut ws_sink).await;
+
+    // Save subscriptions on connection close (regardless of close reason).
+    save_subscriptions(&subs, &client_name, &shared_subs);
+}
+
+/// Save current subscriptions to the shared store for potential reconnect restore.
+fn save_subscriptions(
+    subs: &SubscriptionRegistry,
+    client_name: &str,
+    shared_subs: &super::SharedSubscriptionStore,
+) {
+    let exported = subs.export();
+    let mut store = shared_subs
+        .lock()
+        .expect("subscription store mutex poisoned");
+    if exported.is_empty() {
+        store.remove(client_name);
+    } else {
+        store.insert(client_name.to_string(), exported);
     }
 }
 

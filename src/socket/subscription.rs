@@ -93,6 +93,28 @@ impl SubscriptionRegistry {
     pub fn is_empty(&self) -> bool {
         self.subs.is_empty()
     }
+
+    /// Export all current subscriptions as a Vec of (id, filter) pairs.
+    /// Used to persist subscriptions when a connection closes.
+    pub fn export(&self) -> Vec<(String, Filter)> {
+        self.subs
+            .iter()
+            .map(|(id, filter)| (id.clone(), filter.clone()))
+            .collect()
+    }
+
+    /// Import subscriptions from a previously exported list.
+    /// Silently skips entries that would exceed the limit.
+    /// Returns the number of subscriptions successfully imported.
+    pub fn import(&mut self, entries: Vec<(String, Filter)>) -> usize {
+        let mut imported = 0;
+        for (id, filter) in entries {
+            if self.add(id, filter).is_ok() {
+                imported += 1;
+            }
+        }
+        imported
+    }
 }
 
 /// Filter match: OR within each facet, AND across facets.
@@ -322,6 +344,41 @@ mod tests {
     fn remove_unknown_fails() {
         let mut reg = SubscriptionRegistry::new(8);
         assert!(reg.remove("nonexistent").is_err());
+    }
+
+    #[test]
+    fn export_roundtrips() {
+        let mut reg = SubscriptionRegistry::new(8);
+        reg.add(
+            "sub-1".into(),
+            Filter {
+                event_types: vec!["session_output".into()],
+                sessions: vec!["build".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        reg.add("sub-2".into(), Filter::default()).unwrap();
+
+        let exported = reg.export();
+        assert_eq!(exported.len(), 2);
+
+        let mut reg2 = SubscriptionRegistry::new(8);
+        let count = reg2.import(exported);
+        assert_eq!(count, 2);
+        assert_eq!(reg2.len(), 2);
+    }
+
+    #[test]
+    fn import_respects_limit() {
+        let mut reg = SubscriptionRegistry::new(1);
+        let entries = vec![
+            ("sub-1".into(), Filter::default()),
+            ("sub-2".into(), Filter::default()),
+        ];
+        let count = reg.import(entries);
+        assert_eq!(count, 1); // Only first fits
+        assert_eq!(reg.len(), 1);
     }
 
     #[test]

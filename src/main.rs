@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<IncomingMessage>(100);
     let (state_tx, mut state_rx) = mpsc::channel::<StateUpdate>(64);
     let (power_tx, mut power_rx) = mpsc::channel::<PowerSignal>(32);
+    let (cancel_tx, mut cancel_rx) = mpsc::channel::<String>(32);
 
     // ── State store ───────────────────────────────────────────────────────────
     let config_path_buf = std::path::PathBuf::from(&config_path);
@@ -164,6 +165,26 @@ async fn main() -> Result<()> {
     // ── Socket server (optional) ─────────────────────────────────────────────
     let socket_cancel = tokio_util::sync::CancellationToken::new();
     let socket_drain_secs = config.socket.shutdown_drain_secs;
+
+    // Shared, hot-reloadable client list (atomically swapped on config change)
+    let shared_clients: socket::config_watcher::SharedClientList = Arc::new(
+        arc_swap::ArcSwap::from_pointee(config.socket.clients.clone()),
+    );
+
+    // Spawn config watcher if socket is enabled
+    let _config_watcher_handle = if config.socket_enabled() {
+        socket::config_watcher::spawn_config_watcher(
+            std::path::PathBuf::from(&config_path),
+            Arc::clone(&shared_clients),
+        )
+    } else {
+        None
+    };
+
+    // Shared, in-memory subscription store for restoring subscriptions on reconnect
+    let shared_subs: socket::SharedSubscriptionStore =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     let mut socket_handle: Option<tokio::task::JoinHandle<()>> = if config.socket_enabled() {
         let server = socket::SocketServer::new(
             config.socket.clone(),
@@ -171,6 +192,9 @@ async fn main() -> Result<()> {
             app.stream_tx_clone(),
             app.ambient_tx_clone(),
             socket_cancel.clone(),
+            cancel_tx.clone(),
+            Arc::clone(&shared_clients),
+            Arc::clone(&shared_subs),
         );
         let handle = tokio::spawn(async move {
             if let Err(e) = server.run().await {
@@ -236,6 +260,14 @@ async fn main() -> Result<()> {
             // `pending_banner_acks` map — no ack mpsc needed.
             Some(update) = state_rx.recv() => {
                 app.apply_state_update(update).await;
+            }
+
+            // Cancel preempts queued commands — a user interrupt should not
+            // wait behind a burst of pending messages (e.g., post-wake drain).
+            Some(request_id) = cancel_rx.recv() => {
+                if let Err(e) = app.interrupt_foreground().await {
+                    tracing::warn!("interrupt_foreground (request_id={}) failed: {}", request_id, e);
+                }
             }
 
             msg = cmd_rx.recv() => {

@@ -255,6 +255,14 @@ impl App {
                     tracing::info!("Cleaning stale image temp file: {}", entry.path().display());
                     let _ = std::fs::remove_file(entry.path());
                 }
+                // Clean stale attachment temp files from socket binary uploads
+                if name_str.starts_with("terminus-attachment-") {
+                    tracing::info!(
+                        "Cleaning stale attachment temp file: {}",
+                        entry.path().display()
+                    );
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
         }
 
@@ -1008,6 +1016,12 @@ impl App {
 
     pub async fn cleanup(&mut self) {
         self.session_mgr.cleanup_all().await;
+    }
+
+    /// Send Ctrl+C interrupt to the foreground tmux session.
+    /// Called by the main loop when a socket cancel request is received.
+    pub async fn interrupt_foreground(&self) -> Result<()> {
+        self.session_mgr.interrupt_foreground().await
     }
 
     /// Send a prompt to a harness (Claude, Gemini, Codex) with real-time streaming to chat.
