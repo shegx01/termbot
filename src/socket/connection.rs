@@ -29,6 +29,7 @@ use crate::buffer::StreamEvent;
 use crate::chat_adapters::{Attachment, IncomingMessage, PlatformType, ReplyContext};
 use crate::config::SocketConfig;
 
+use super::config_watcher::SharedClientList;
 use super::envelope::{ErrorCode, InboundEnvelope, OutboundEnvelope};
 use super::events::AmbientEvent;
 use super::rate_limit::TokenBucket;
@@ -73,6 +74,7 @@ pub async fn run(
     shared_rate_limiters: SharedRateLimiters,
     cancel_tx: mpsc::Sender<String>,
     shared_subs: super::SharedSubscriptionStore,
+    shared_clients: SharedClientList,
 ) {
     let (mut ws_sink, mut ws_stream_read) = ws_stream.split();
 
@@ -137,6 +139,24 @@ pub async fn run(
                     drain_deadline_ms: config.shutdown_drain_secs * 1000,
                 };
                 let _ = send_envelope(&mut ws_sink, &env).await;
+                // Bounded drain: give pending requests up to shutdown_drain_secs
+                // to complete rather than closing immediately.
+                let drain_deadline = tokio::time::Instant::now()
+                    + Duration::from_secs(config.shutdown_drain_secs);
+                while !pending.is_empty() {
+                    let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, reply_poll.tick()).await {
+                        Ok(_) => {
+                            if drain_pending(&mut pending, &mut ws_sink).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break, // deadline exceeded
+                    }
+                }
                 let _ = ws_sink.close().await;
                 tracing::info!(client = %client_name, "socket connection closed (shutdown)");
                 break;
@@ -278,6 +298,17 @@ pub async fn run(
                             }
 
                             InboundEnvelope::Request { request_id, command, options: _ } => {
+                                // Reject duplicate request_id while already in-flight
+                                if pending.contains_key(&request_id) {
+                                    let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Error {
+                                        request_id: Some(request_id),
+                                        code: ErrorCode::ParseError,
+                                        message: "duplicate request_id: already in-flight".to_string(),
+                                        retry_after_ms: None,
+                                    }).await;
+                                    continue;
+                                }
+
                                 // Check pending queue cap
                                 if pending.len() >= config.max_pending_requests {
                                     let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Error {
@@ -673,6 +704,23 @@ pub async fn run(
                     tracing::info!(client = %client_name, "pong timeout — closing connection");
                     let _ = ws_sink.close().await;
                     break;
+                }
+                // Periodic client re-validation: check that this client name still
+                // exists in the live client list (handles token revocation via hot-reload).
+                {
+                    let current_clients = shared_clients.load();
+                    if !current_clients.iter().any(|c| c.name == client_name) {
+                        tracing::warn!(
+                            client = %client_name,
+                            "client no longer in config — closing connection (token revoked)"
+                        );
+                        let env = OutboundEnvelope::ShuttingDown {
+                            drain_deadline_ms: 0,
+                        };
+                        let _ = send_envelope(&mut ws_sink, &env).await;
+                        let _ = ws_sink.close().await;
+                        break;
+                    }
                 }
                 if let Err(e) = ws_sink.send(Message::Ping(vec![])).await {
                     tracing::debug!(client = %client_name, error = %e, "ping send failed");

@@ -539,6 +539,9 @@ impl Config {
             if self.socket.rate_limit_per_second <= 0.0 {
                 anyhow::bail!("[socket] rate_limit_per_second must be > 0");
             }
+            if self.socket.rate_limit_burst <= 0.0 {
+                anyhow::bail!("[socket] rate_limit_burst must be > 0");
+            }
             if self.socket.clients.is_empty() {
                 anyhow::bail!(
                     "[socket] enabled but no [[socket.client]] entries configured; \
