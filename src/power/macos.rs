@@ -86,13 +86,21 @@ impl Default for MacOsPowerManager {
 impl Drop for MacOsPowerManager {
     fn drop(&mut self) {
         // We cannot .await here; use start_kill() which is non-blocking.
-        if let Ok(mut guard) = self.inner.try_lock() {
-            if let Some(child) = guard.child.as_mut() {
-                debug!(
-                    pid = child.id(),
-                    "MacOsPowerManager dropped; killing caffeinate child"
+        match self.inner.try_lock() {
+            Ok(mut guard) => {
+                if let Some(child) = guard.child.as_mut() {
+                    debug!(
+                        pid = child.id(),
+                        "MacOsPowerManager dropped; killing caffeinate child"
+                    );
+                    let _ = child.start_kill();
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "MacOsPowerManager::drop: mutex contended; caffeinate child may be orphaned \
+                     — check for stale caffeinate processes"
                 );
-                let _ = child.start_kill();
             }
         }
     }

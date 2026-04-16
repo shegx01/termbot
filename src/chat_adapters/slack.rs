@@ -498,12 +498,16 @@ impl ChatPlatform for SlackPlatform {
         const INITIAL_DELAY_SECS: u64 = 5;
         const MAX_DELAY_SECS: u64 = 300;
 
+        // NOTE: Slack Socket Mode does not replay unacknowledged events on
+        // reconnection (unlike Telegram's getUpdates offset model). Messages
+        // sent during the reconnect window are permanently lost. This is an
+        // inherent limitation of the Socket Mode transport.
         let mut delay_secs = INITIAL_DELAY_SECS;
 
         loop {
             match self.run_websocket_loop(cmd_tx.clone()).await {
                 Ok(()) => {
-                    // Clean disconnect — reset backoff
+                    // Clean disconnect — reset backoff, do NOT double it
                     delay_secs = INITIAL_DELAY_SECS;
                     info!(
                         "Slack WebSocket loop ended, reconnecting in {}s...",
@@ -515,14 +519,13 @@ impl ChatPlatform for SlackPlatform {
                         "Slack WebSocket loop error: {}. Reconnecting in {}s...",
                         e, delay_secs
                     );
+                    // Only double the backoff on errors, not on clean disconnects
+                    delay_secs = (delay_secs * 2).min(MAX_DELAY_SECS);
                 }
             }
 
             self.connected.store(false, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-
-            // Exponential backoff with cap
-            delay_secs = (delay_secs * 2).min(MAX_DELAY_SECS);
 
             // Stop reconnecting if the receiver has been dropped
             if cmd_tx.is_closed() {

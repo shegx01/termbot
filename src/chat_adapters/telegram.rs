@@ -239,6 +239,12 @@ impl TelegramAdapter {
                                                     .await
                                                 {
                                                     Ok(_) => {
+                                                        #[cfg(unix)]
+                                                        {
+                                                            use std::os::unix::fs::PermissionsExt;
+                                                            let perms = std::fs::Permissions::from_mode(0o600);
+                                                            let _ = tokio::fs::set_permissions(&path, perms).await;
+                                                        }
                                                         attachments.push(Attachment {
                                                             filename: path
                                                                 .file_name()
@@ -250,6 +256,7 @@ impl TelegramAdapter {
                                                         });
                                                     }
                                                     Err(e) => {
+                                                        let _ = tokio::fs::remove_file(&path).await;
                                                         tracing::warn!(
                                                             "Telegram: photo download failed: {}",
                                                             e
@@ -309,6 +316,12 @@ impl TelegramAdapter {
                                                     .await
                                                 {
                                                     Ok(_) => {
+                                                        #[cfg(unix)]
+                                                        {
+                                                            use std::os::unix::fs::PermissionsExt;
+                                                            let perms = std::fs::Permissions::from_mode(0o600);
+                                                            let _ = tokio::fs::set_permissions(&path, perms).await;
+                                                        }
                                                         attachments.push(Attachment {
                                                             filename: path
                                                                 .file_name()
@@ -320,6 +333,7 @@ impl TelegramAdapter {
                                                         });
                                                     }
                                                     Err(e) => {
+                                                        let _ = tokio::fs::remove_file(&path).await;
                                                         tracing::warn!(
                                                             "Telegram: document download failed: {}",
                                                             e

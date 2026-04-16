@@ -263,9 +263,12 @@ impl PowerManager for LinuxPowerManager {
                         guard.inhibit_held = false;
                     }
                     Err(e) => {
-                        warn!("try_wait on systemd-inhibit child failed: {}", e);
-                        // Treat as alive to avoid a respawn loop.
-                        return Ok(());
+                        warn!(
+                            "try_wait error on systemd-inhibit child: {}; resetting inhibit state",
+                            e
+                        );
+                        guard.inhibit_held = false;
+                        // The supervisor will call set_inhibit(true) on the next tick
                     }
                 }
             }

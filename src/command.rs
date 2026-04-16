@@ -547,14 +547,12 @@ impl CommandBlocklist {
     /// Check if a command is blocked. Normalizes common evasion patterns
     /// (path prefixes, backslash insertion) before matching. For multi-line
     /// payloads, each line is checked individually in addition to the whole string.
+    /// Also splits on shell chaining operators (`;`, `|`, `&&`, `||`) and checks
+    /// each segment, preventing blocklist bypass via chained commands such as
+    /// `echo hello ; sudo reboot` or `echo $(sudo reboot)`.
     #[must_use = "ignoring a blocklist check is a security risk"]
     pub fn is_blocked(&self, command: &str) -> bool {
-        let normalized = Self::normalize_command(command);
-        if self
-            .patterns
-            .iter()
-            .any(|p| p.is_match(command) || p.is_match(&normalized))
-        {
+        if self.is_blocked_single(command) {
             return true;
         }
         // Also check each line individually (multi-line harness prompts could
@@ -565,16 +563,79 @@ impl CommandBlocklist {
                 if line.is_empty() {
                     continue;
                 }
-                let norm_line = Self::normalize_command(line);
+                if self.is_blocked_single(line) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check a single line/segment for blocklist matches.
+    /// Splits on shell chaining operators and checks each resulting segment,
+    /// then also checks the full string as a whole.
+    fn is_blocked_single(&self, command: &str) -> bool {
+        let normalized = Self::normalize_command(command);
+        // Check the full command first
+        if self
+            .patterns
+            .iter()
+            .any(|p| p.is_match(command) || p.is_match(&normalized))
+        {
+            return true;
+        }
+
+        // Split on shell chaining operators and check each segment.
+        // This prevents bypasses like `echo hello ; sudo reboot` or
+        // `ls | sudo tee /etc/passwd` from evading a `sudo` pattern.
+        let segments: Vec<&str> = command
+            .split(&[';', '|'][..])
+            .flat_map(|s| s.split("&&"))
+            .flat_map(|s| s.split("||"))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Only bother if splitting produced more than one segment
+        if segments.len() > 1 {
+            for seg in &segments {
+                let norm_seg = Self::normalize_command(seg);
                 if self
                     .patterns
                     .iter()
-                    .any(|p| p.is_match(line) || p.is_match(&norm_line))
+                    .any(|p| p.is_match(seg) || p.is_match(&norm_seg))
                 {
                     return true;
                 }
             }
         }
+
+        // Also extract content from $(...) subcommand substitutions
+        // e.g. `echo $(sudo reboot)` → check `sudo reboot`
+        if command.contains("$(") {
+            let mut rest = command;
+            while let Some(start) = rest.find("$(") {
+                rest = &rest[start + 2..];
+                // Find matching closing paren (simple, non-nested)
+                if let Some(end) = rest.find(')') {
+                    let inner = rest[..end].trim();
+                    if !inner.is_empty() {
+                        let norm_inner = Self::normalize_command(inner);
+                        if self
+                            .patterns
+                            .iter()
+                            .any(|p| p.is_match(inner) || p.is_match(&norm_inner))
+                        {
+                            return true;
+                        }
+                    }
+                    rest = &rest[end + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
+
         false
     }
 
@@ -1557,5 +1618,48 @@ mod tests {
             "Expected InvalidHarnessOption, got: {:?}",
             err
         );
+    }
+
+    // ── Blocklist: shell chaining operator bypass prevention ────────────────
+
+    #[test]
+    fn blocklist_shell_chain_semicolon() {
+        let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
+        // Semicolon-chained command — the `sudo reboot` segment must be caught
+        assert!(bl.is_blocked("echo hello ; sudo reboot"));
+        assert!(bl.is_blocked("ls -la;sudo reboot"));
+    }
+
+    #[test]
+    fn blocklist_shell_chain_pipe() {
+        let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
+        assert!(bl.is_blocked("cat /etc/passwd | sudo tee /dev/null"));
+    }
+
+    #[test]
+    fn blocklist_shell_chain_and_and() {
+        let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
+        assert!(bl.is_blocked("echo hello && sudo reboot"));
+    }
+
+    #[test]
+    fn blocklist_shell_chain_or_or() {
+        let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
+        assert!(bl.is_blocked("false || sudo reboot"));
+    }
+
+    #[test]
+    fn blocklist_subcommand_substitution() {
+        let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
+        // $(...) subcommand substitution — inner `sudo reboot` must be caught
+        assert!(bl.is_blocked("echo $(sudo reboot)"));
+    }
+
+    #[test]
+    fn blocklist_chain_safe_commands_not_blocked() {
+        let bl = CommandBlocklist::from_config(&[r"sudo\s+".into()]).unwrap();
+        // Chained safe commands must not be blocked
+        assert!(!bl.is_blocked("echo hello ; ls -la"));
+        assert!(!bl.is_blocked("echo hello && ls -la"));
     }
 }

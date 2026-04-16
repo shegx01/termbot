@@ -602,6 +602,13 @@ pub async fn run(
                             continue;
                         }
 
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let perms = std::fs::Permissions::from_mode(0o600);
+                            let _ = tokio::fs::set_permissions(&tmp_path, perms).await;
+                        }
+
                         // Create per-request response channel
                         let (reply_tx, reply_rx) = mpsc::unbounded_channel::<String>();
                         let request_id = meta.request_id.clone();
