@@ -405,6 +405,11 @@ async fn send_reply(
     slack: Option<&dyn ChatPlatform>,
     discord: Option<&dyn ChatPlatform>,
 ) {
+    // Socket-origin: route to the per-request response channel.
+    if let Some(ref tx) = ctx.socket_reply_tx {
+        let _ = tx.send(text.to_string());
+        return;
+    }
     use crate::chat_adapters::PlatformType;
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
@@ -440,6 +445,11 @@ async fn send_photo_reply(
     slack: Option<&dyn ChatPlatform>,
     discord: Option<&dyn ChatPlatform>,
 ) {
+    // Socket-origin: send a text fallback since the socket channel is text-only.
+    if let Some(ref tx) = ctx.socket_reply_tx {
+        let _ = tx.send(format!("[file: {}]", filename));
+        return;
+    }
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
         PlatformType::Slack => slack,
@@ -470,6 +480,11 @@ async fn send_document_reply(
     slack: Option<&dyn ChatPlatform>,
     discord: Option<&dyn ChatPlatform>,
 ) {
+    // Socket-origin: send a text fallback since the socket channel is text-only.
+    if let Some(ref tx) = ctx.socket_reply_tx {
+        let _ = tx.send(format!("[file: {}]", filename));
+        return;
+    }
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
         PlatformType::Slack => slack,
