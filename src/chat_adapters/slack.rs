@@ -44,6 +44,7 @@ pub fn is_valid_slack_download_url(url: &str) -> bool {
 
 /// Guess the MIME type for a file based on its extension (case-insensitive).
 /// Falls back to `application/octet-stream` for unknown or missing extensions.
+#[allow(dead_code)]
 pub fn guess_mime(filename: &str) -> String {
     let ext = std::path::Path::new(filename)
         .extension()
@@ -385,9 +386,109 @@ impl SlackPlatform {
         attachments
     }
 
-    /// Guess MIME type from filename extension (delegates to the free function).
-    fn guess_mime(&self, filename: &str) -> String {
-        guess_mime(filename)
+    /// Upload a file to Slack using the v2 three-step flow:
+    /// 1. `files.getUploadURLExternal` — obtain upload URL and file_id
+    /// 2. PUT raw bytes to the returned upload URL
+    /// 3. `files.completeUploadExternal` — finalize and share to channel
+    async fn upload_file_v2(
+        &self,
+        file_bytes: Vec<u8>,
+        filename: &str,
+        caption: Option<&str>,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<PlatformMessageId> {
+        // Step 1: Get upload URL
+        let get_url_resp = self
+            .http_client
+            .post("https://slack.com/api/files.getUploadURLExternal")
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .form(&[
+                ("filename", filename.to_string()),
+                ("length", file_bytes.len().to_string()),
+            ])
+            .send()
+            .await
+            .context("Failed to call files.getUploadURLExternal")?;
+
+        let get_url_json: serde_json::Value = get_url_resp
+            .json()
+            .await
+            .context("Failed to parse files.getUploadURLExternal response")?;
+
+        if !get_url_json["ok"].as_bool().unwrap_or(false) {
+            let err = get_url_json["error"]
+                .as_str()
+                .unwrap_or("unknown error");
+            anyhow::bail!("files.getUploadURLExternal failed: {}", err);
+        }
+
+        let upload_url = get_url_json["upload_url"]
+            .as_str()
+            .ok_or_else(|| anyhow!("files.getUploadURLExternal response missing 'upload_url'"))?
+            .to_string();
+        let file_id = get_url_json["file_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("files.getUploadURLExternal response missing 'file_id'"))?
+            .to_string();
+
+        // Step 2: Upload file bytes to the provided URL (Slack-supplied, not user input)
+        self.http_client
+            .put(&upload_url)
+            .body(file_bytes)
+            .send()
+            .await
+            .context("Failed to PUT file bytes to Slack upload URL")?
+            .error_for_status()
+            .context("Slack upload URL returned non-2xx status")?;
+
+        // Step 3: Complete upload and share to channel
+        let mut complete_body = serde_json::json!({
+            "files": [{"id": file_id, "title": filename}],
+            "channel_id": channel_id,
+        });
+
+        if let Some(ts) = thread_ts {
+            complete_body["thread_ts"] = serde_json::Value::String(ts.to_string());
+        }
+        if let Some(cap) = caption {
+            complete_body["initial_comment"] = serde_json::Value::String(cap.to_string());
+        }
+
+        let complete_resp = self
+            .http_client
+            .post("https://slack.com/api/files.completeUploadExternal")
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .json(&complete_body)
+            .send()
+            .await
+            .context("Failed to call files.completeUploadExternal")?;
+
+        let complete_json: serde_json::Value = complete_resp
+            .json()
+            .await
+            .context("Failed to parse files.completeUploadExternal response")?;
+
+        if !complete_json["ok"].as_bool().unwrap_or(false) {
+            let err = complete_json["error"]
+                .as_str()
+                .unwrap_or("unknown error");
+            anyhow::bail!("files.completeUploadExternal failed: {}", err);
+        }
+
+        // Extract ts from the completed file's share info when available
+        let ts = complete_json
+            .pointer("/files/0/shares/public")
+            .or_else(|| complete_json.pointer("/files/0/shares/private"))
+            .and_then(|shares| shares.as_object())
+            .and_then(|map| map.values().next())
+            .and_then(|arr| arr.get(0))
+            .and_then(|share| share.get("ts"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("uploaded")
+            .to_string();
+
+        Ok(PlatformMessageId::Slack(ts))
     }
 }
 
@@ -552,60 +653,8 @@ impl ChatPlatform for SlackPlatform {
         chat_id: &str,
         thread_ts: Option<&str>,
     ) -> Result<PlatformMessageId> {
-        let mut form = reqwest::multipart::Form::new()
-            .text("channels", chat_id.to_string())
-            .text("filename", filename.to_string())
-            .part(
-                "file",
-                reqwest::multipart::Part::bytes(data.to_vec())
-                    .file_name(filename.to_string())
-                    .mime_str(&self.guess_mime(filename))?,
-            );
-
-        if let Some(ts) = thread_ts {
-            form = form.text("thread_ts", ts.to_string());
-        }
-        if let Some(cap) = caption {
-            form = form.text("initial_comment", cap.to_string());
-        }
-
-        // Use the legacy files.upload endpoint which accepts multipart directly.
-        // The v2 flow (getUploadURLExternal → upload → completeUploadExternal)
-        // is a three-step process that doesn't have a single endpoint.
-        let resp = self
-            .http_client
-            .post("https://slack.com/api/files.upload")
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .multipart(form)
-            .send()
+        self.upload_file_v2(data.to_vec(), filename, caption, chat_id, thread_ts)
             .await
-            .context("Failed to upload file to Slack")?;
-
-        let result: serde_json::Value = resp
-            .json()
-            .await
-            .context("Failed to parse files.upload response")?;
-
-        if result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-            // Extract the message ts from the file's share info if available
-            let ts = result
-                .pointer("/file/shares/public")
-                .or_else(|| result.pointer("/file/shares/private"))
-                .and_then(|shares| shares.as_object())
-                .and_then(|map| map.values().next())
-                .and_then(|arr| arr.get(0))
-                .and_then(|share| share.get("ts"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("uploaded")
-                .to_string();
-            Ok(PlatformMessageId::Slack(ts))
-        } else {
-            let err = result
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            Err(anyhow!("files.upload failed: {}", err))
-        }
     }
 
     async fn send_document(
