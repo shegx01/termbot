@@ -202,11 +202,27 @@ impl DeliveryQueue {
 
     /// Return all pending job paths sorted by filename (ULID lexicographic order = creation order).
     pub async fn list_pending(&self) -> Result<Vec<PathBuf>> {
-        let mut entries = tokio::fs::read_dir(&self.pending_dir)
-            .await
-            .with_context(|| {
-                format!("Failed to read pending dir: {}", self.pending_dir.display())
-            })?;
+        let mut entries = match tokio::fs::read_dir(&self.pending_dir).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Directory was removed after initial creation (OS cleanup,
+                // manual deletion, etc.).  Re-create it so the worker self-heals.
+                tokio::fs::create_dir_all(&self.pending_dir)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to re-create pending dir: {}",
+                            self.pending_dir.display()
+                        )
+                    })?;
+                return Ok(Vec::new());
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to read pending dir: {}", self.pending_dir.display())
+                });
+            }
+        };
 
         let mut paths = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {

@@ -256,7 +256,7 @@ async fn run_claude_prompt_inner(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            let _ = event_tx.send(HarnessEvent::Error(e.to_string())).await;
+            let _ = event_tx.send(HarnessEvent::Error(format!("{:#}", e))).await;
             return;
         }
         Err(_) => {
