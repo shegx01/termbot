@@ -217,11 +217,9 @@ impl DeliveryQueue {
         })?;
         drop(pending_dir_file);
 
-        let count = self.pending_count().await.unwrap_or(0);
         tracing::info!(
             schema = %job.schema,
             run_id = %job.run_id,
-            count = count,
             "queue.enqueue"
         );
 

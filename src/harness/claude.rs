@@ -389,6 +389,38 @@ async fn run_claude_prompt_inner(
         }
     }
 
+    // Drain remaining SDK stream to ensure the subprocess is reaped.
+    //
+    // The SDK spawns a background task that reads from the child process's
+    // stdout and a detached task for stderr.  When we break out of the loop
+    // above on error, the stream is only partially consumed — the SDK's
+    // internal `child.wait()` (at the end of the stream) is never reached.
+    // This orphans the Claude subprocess and leaks its stderr pipe FD.
+    //
+    // By draining here (with a bounded timeout), we let the SDK's transport
+    // finish reading stdout, call `child.wait()`, and clean up.  If the
+    // subprocess hangs, the 5-second deadline limits the impact.
+    {
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut drained_cleanly = false;
+        loop {
+            match tokio::time::timeout_at(drain_deadline, stream.next()).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {
+                    drained_cleanly = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        if !drained_cleanly {
+            tracing::warn!(
+                "Claude subprocess drain timed out after 5s; \
+                 stream dropped without clean exit"
+            );
+        }
+    }
+
     // Send final text response
     let text = response_text.trim().to_string();
     if !text.is_empty() {
