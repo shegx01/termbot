@@ -331,10 +331,36 @@ pub async fn drive_harness(
                 };
 
                 // Step 4: Sync attempt.
+                // Rename to `.delivering.json` before attempting delivery so the
+                // retry worker (which only scans `*.json`) cannot pick up the same
+                // file concurrently and cause a duplicate POST.
+                let delivering_path =
+                    match hctx.delivery_queue.mark_delivering(&queue_path).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to mark job as delivering (will be retried by worker): {}",
+                                e
+                            );
+                            // Leave the file in pending/; the retry worker will deliver it.
+                            let pending =
+                                hctx.delivery_queue.pending_count().await.unwrap_or(1);
+                            send_reply(
+                                ctx,
+                                &format!("⏳ queued for retry ({} pending)", pending),
+                                telegram,
+                                slack,
+                                discord,
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+
                 match hctx.webhook_client.deliver(&job, &webhook_info).await {
                     Ok(elapsed) => {
-                        // On success: remove queue file (no retry needed).
-                        let _ = hctx.delivery_queue.remove(&queue_path).await;
+                        // On success: remove the delivering file (no retry needed).
+                        let _ = tokio::fs::remove_file(&delivering_path).await;
                         send_reply(
                             ctx,
                             &format!("✅ delivered to webhook ({}ms)", elapsed.as_millis()),
@@ -345,7 +371,15 @@ pub async fn drive_harness(
                         .await;
                     }
                     Err(_) => {
-                        // On failure: leave queue file; retry worker will pick it up.
+                        // On failure: rename back to `.json` so retry worker picks it up.
+                        if let Err(e) =
+                            hctx.delivery_queue.unmark_delivering(&delivering_path).await
+                        {
+                            tracing::error!(
+                                "Failed to unmark delivering job (manual recovery may be needed): {}",
+                                e
+                            );
+                        }
                         let pending = hctx.delivery_queue.pending_count().await.unwrap_or(1);
                         send_reply(
                             ctx,

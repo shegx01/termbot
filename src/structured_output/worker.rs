@@ -127,6 +127,8 @@ pub fn spawn_retry_worker(
                     if let Err(e) = queue.move_to_dead(path, "schema_removed").await {
                         tracing::error!("Failed to move orphaned job to dead/: {}", e);
                     }
+                    attempt_counts.remove(&job.run_id);
+                    consecutive_failures.remove(&job.schema);
                     continue;
                 }
 
@@ -146,6 +148,8 @@ pub fn spawn_retry_worker(
                             {
                                 tracing::error!("Failed to move aged job to dead/: {}", e);
                             }
+                            attempt_counts.remove(&job.run_id);
+                            consecutive_failures.remove(&job.schema);
                             let _ = events_tx.send(StreamEvent::WebhookStatus {
                                 schema: job.schema.clone(),
                                 run_id: job.run_id.clone(),
@@ -204,16 +208,56 @@ pub fn spawn_retry_worker(
                         });
                     }
                     Err(e) => {
-                        let next_attempt = attempt + 1;
-                        attempt_counts.insert(job.run_id.clone(), next_attempt);
-
-                        // Track consecutive failures by HTTP status for WARN logging.
+                        // Classify the error: permanent 4xx (except 429) errors
+                        // will never succeed on retry, so move them to dead letter
+                        // immediately rather than burning retry budget.
                         let http_status = match &e {
                             super::webhook::DeliveryError::HttpError { status, .. } => {
                                 Some(*status)
                             }
                             _ => None,
                         };
+
+                        let is_permanent = matches!(http_status, Some(s) if
+                            matches!(s, 400 | 401 | 403 | 404)
+                        );
+
+                        if is_permanent {
+                            let status = http_status.unwrap();
+                            tracing::warn!(
+                                schema = %job.schema,
+                                run_id = %job.run_id,
+                                status = status,
+                                error = %e,
+                                "Webhook delivery failed with permanent error, moving to dead/"
+                            );
+                            if let Err(move_err) = queue
+                                .move_to_dead(
+                                    path,
+                                    &format!("permanent_http_error_{}", status),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to move permanently-failed job to dead/: {}",
+                                    move_err
+                                );
+                            }
+                            attempt_counts.remove(&job.run_id);
+                            consecutive_failures.remove(&job.schema);
+                            let _ = events_tx.send(StreamEvent::WebhookStatus {
+                                schema: job.schema.clone(),
+                                run_id: job.run_id.clone(),
+                                status: WebhookStatusKind::Abandoned,
+                                chat: job.source_chat_binding.clone(),
+                            });
+                            continue;
+                        }
+
+                        let next_attempt = attempt + 1;
+                        attempt_counts.insert(job.run_id.clone(), next_attempt);
+
+                        // Track consecutive failures by HTTP status for WARN logging.
                         if let Some(status) = http_status {
                             let entry = consecutive_failures
                                 .entry(job.schema.clone())

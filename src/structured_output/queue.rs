@@ -82,6 +82,17 @@ impl DeliveryQueue {
             }
         }
 
+        // Clean orphaned tmp files from previous crashes.
+        if let Ok(entries) = std::fs::read_dir(&tmp_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    tracing::info!("Cleaning orphaned queue tmp file: {}", path.display());
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+
         // Same-device check on Unix (atomic rename requires same filesystem).
         #[cfg(unix)]
         {
@@ -291,6 +302,43 @@ impl DeliveryQueue {
         let job: DeliveryJob = serde_json::from_slice(&bytes)
             .with_context(|| format!("Failed to deserialize job: {}", path.display()))?;
         Ok(job)
+    }
+
+    /// Rename a pending job file to `<run_id>.delivering.json` to signal that
+    /// synchronous delivery is in progress.
+    ///
+    /// `list_pending()` only scans for `*.json` files (not `*.delivering.json`),
+    /// so the retry worker will not pick up the file while this rename is in effect.
+    ///
+    /// Returns the new path. Call `unmark_delivering` on success or failure to
+    /// restore the file to the retry queue if needed.
+    pub async fn mark_delivering(&self, path: &Path) -> Result<PathBuf> {
+        let delivering_path = path.with_extension("delivering.json");
+        tokio::fs::rename(path, &delivering_path)
+            .await
+            .with_context(|| format!("Failed to mark as delivering: {}", path.display()))?;
+        Ok(delivering_path)
+    }
+
+    /// Rename a `<run_id>.delivering.json` file back to `<run_id>.json` so the
+    /// retry worker can pick it up after a failed synchronous delivery attempt.
+    ///
+    /// Strips the `.delivering` suffix before the `.json` extension to recover
+    /// the original pending path.
+    pub async fn unmark_delivering(&self, delivering_path: &Path) -> Result<PathBuf> {
+        // "foo.delivering.json" → stem is "foo.delivering", strip suffix → "foo"
+        let stem = delivering_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let base = stem.strip_suffix(".delivering").unwrap_or(stem);
+        let pending_path = delivering_path.with_file_name(format!("{}.json", base));
+        tokio::fs::rename(delivering_path, &pending_path)
+            .await
+            .with_context(|| {
+                format!("Failed to unmark delivering: {}", delivering_path.display())
+            })?;
+        Ok(pending_path)
     }
 }
 
