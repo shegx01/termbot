@@ -532,9 +532,15 @@ impl App {
         }
         // Safety-critical variants bypass the debounce window so a crash
         // immediately after cannot leave the on-disk state inconsistent.
+        // Named-session batches must force-persist too: a user expects
+        // `--resume foo` to work after process restart, and without this
+        // an unclean exit between the prompt and the next 10 updates / 5s
+        // window would silently drop the session from disk.
         let force = matches!(
             &update,
-            StateUpdate::MarkDirty | StateUpdate::SetCleanShutdown(_)
+            StateUpdate::MarkDirty
+                | StateUpdate::SetCleanShutdown(_)
+                | StateUpdate::HarnessSessionBatch(_)
         );
         self.store.apply(update);
         self.updates_since_persist += 1;
@@ -1814,6 +1820,39 @@ patterns = []
         let dir = tempdir().unwrap();
         let (mut app, _state_rx) = make_app(dir.path());
         assert!(app.evict_lru_session().is_none());
+    }
+
+    #[tokio::test]
+    async fn harness_session_batch_force_persists_immediately() {
+        // Regression: batches must not wait for the 10-update / 5s debounce,
+        // otherwise an unclean exit drops the session before it hits disk and
+        // a subsequent `--resume` errors "No session named …".
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx) = make_app(dir.path());
+
+        let entry = NamedSessionEntry {
+            session_id: "sid-1".into(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            last_used: Utc::now(),
+        };
+        app.apply_state_update(StateUpdate::HarnessSessionBatch(vec![(
+            "auth".into(),
+            Some(entry),
+        )]))
+        .await;
+
+        // Counter should have been reset by the force-persist.
+        assert_eq!(
+            app.updates_since_persist, 0,
+            "HarnessSessionBatch must bypass the debounce window"
+        );
+
+        // And the entry should be visible on a fresh reload from disk.
+        let reloaded = StateStore::load(dir.path().join("terminus-state.json")).unwrap();
+        assert!(
+            reloaded.snapshot().harness_sessions.contains_key("auth"),
+            "batch should be on disk after a single apply_state_update"
+        );
     }
 
     #[tokio::test]
