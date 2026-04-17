@@ -883,10 +883,17 @@ impl App {
                         .named_harness_sessions
                         .get(name)
                         .is_some_and(|e| !e.session_id.is_empty());
-                    named_notification = Some(if is_resumable {
+                    let primary = if is_resumable {
                         format!("Resuming existing session '{}'", name)
                     } else {
                         format!("Created new session '{}'", name)
+                    };
+                    // Only hint on creation, not on resume — if the user is
+                    // resuming a numeric name, they clearly know it exists.
+                    let hint = (!is_resumable).then(|| numeric_name_hint(name)).flatten();
+                    named_notification = Some(match hint {
+                        Some(h) => format!("{}\n{}", primary, h),
+                        None => primary,
                     });
                 }
 
@@ -1263,6 +1270,13 @@ impl App {
                 resume_id = None;
                 cwd = current_dir_or_dot();
                 using_named_session = true;
+                // Hint on creation for numeric names (e.g. `-n 5`), but
+                // suppress if the interactive-mode `on` already emitted it.
+                let already_resolved =
+                    self.session_mgr.foreground_named_session_resolved() == Some(name.as_str());
+                if !already_resolved {
+                    notification = numeric_name_hint(name);
+                }
             }
         } else {
             // Implicit path — unchanged
@@ -1422,6 +1436,20 @@ async fn cleanup_attachments(attachments: &[Attachment]) {
 /// propagating an empty `PathBuf` into the session index).
 fn current_dir_or_dot() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// If a session name parses as a plain `u32`, return a hint explaining that
+/// `-n` now means `--name` (not `--max-turns`). `-n 5` is still accepted as
+/// a valid session name, but the user very likely meant `-t 5`.
+///
+/// Fires only on session *creation*, so resuming an existing numeric name
+/// stays silent.
+fn numeric_name_hint(name: &str) -> Option<String> {
+    name.parse::<u32>().ok().map(|_| {
+        format!(
+            "Hint: '{name}' is a valid session name, but if you meant --max-turns use `-t {name}` (the `-n` short flag is now --name).",
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1843,5 +1871,32 @@ patterns = []
     fn current_dir_or_dot_never_returns_empty_path() {
         let p = super::current_dir_or_dot();
         assert!(!p.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn numeric_name_hint_fires_on_plain_integer() {
+        let hint = super::numeric_name_hint("5").expect("should produce a hint");
+        assert!(
+            hint.contains("--max-turns"),
+            "hint should mention --max-turns"
+        );
+        assert!(
+            hint.contains("-t 5"),
+            "hint should suggest the -t short flag"
+        );
+    }
+
+    #[test]
+    fn numeric_name_hint_silent_for_alphanumeric_names() {
+        assert!(super::numeric_name_hint("auth").is_none());
+        assert!(super::numeric_name_hint("v1").is_none());
+        assert!(super::numeric_name_hint("5auth").is_none());
+        assert!(super::numeric_name_hint("auth-5").is_none());
+    }
+
+    #[test]
+    fn numeric_name_hint_silent_for_oversized_number() {
+        // u32::MAX is 4294967295; anything larger overflows the parse.
+        assert!(super::numeric_name_hint("99999999999999999999").is_none());
     }
 }
