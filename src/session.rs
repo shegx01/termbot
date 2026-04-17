@@ -307,4 +307,23 @@ impl SessionManager {
         self.sessions.clear();
         self.foreground = None;
     }
+
+    /// Test-only: register a foreground session without spawning tmux.
+    /// Use from unit tests that exercise `handle_command` paths requiring
+    /// a foreground session.
+    #[cfg(test)]
+    pub fn install_test_foreground(&mut self, name: &str) {
+        self.sessions.insert(
+            name.to_string(),
+            SessionState {
+                name: name.to_string(),
+                status: SessionStatus::Foreground,
+                created_at: tokio::time::Instant::now(),
+                active_harness: None,
+                harness_options: HarnessOptions::default(),
+                named_session_resolved: None,
+            },
+        );
+        self.foreground = Some(name.to_string());
+    }
 }

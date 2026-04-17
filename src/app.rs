@@ -674,6 +674,13 @@ impl App {
         // Harness paths (HarnessPrompt, StdinInput->harness) handle their own cleanup
         // inside the spawned harness task.
         let harness_will_handle = matches!(cmd, ParsedCommand::HarnessPrompt { .. })
+            || matches!(
+                cmd,
+                ParsedCommand::HarnessOn {
+                    initial_prompt: Some(_),
+                    ..
+                }
+            )
             || (matches!(cmd, ParsedCommand::StdinInput { .. })
                 && self.session_mgr.foreground_harness().is_some());
         if !harness_will_handle && !msg.attachments.is_empty() {
@@ -1964,5 +1971,212 @@ patterns = []
     fn numeric_name_hint_silent_for_oversized_number() {
         // u32::MAX is 4294967295; anything larger overflows the parse.
         assert!(super::numeric_name_hint("99999999999999999999").is_none());
+    }
+
+    // ─── Mock harness + end-to-end HarnessOn/initial_prompt coverage ─────────
+
+    /// Records each `run_prompt` call so tests can assert the App wired
+    /// through the expected prompt / session_id.
+    #[derive(Clone)]
+    struct RecordingHarness {
+        calls: Arc<std::sync::Mutex<Vec<RecordingCall>>>,
+        kind: crate::harness::HarnessKind,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordingCall {
+        prompt: String,
+        resume_id: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::harness::Harness for RecordingHarness {
+        fn kind(&self) -> crate::harness::HarnessKind {
+            self.kind
+        }
+        fn supports_resume(&self) -> bool {
+            true
+        }
+        async fn run_prompt(
+            &self,
+            prompt: &str,
+            _attachments: &[Attachment],
+            _cwd: &std::path::Path,
+            session_id: Option<&str>,
+            _options: &HarnessOptions,
+        ) -> Result<mpsc::Receiver<crate::harness::HarnessEvent>> {
+            self.calls.lock().unwrap().push(RecordingCall {
+                prompt: prompt.to_string(),
+                resume_id: session_id.map(String::from),
+            });
+            let (tx, rx) = mpsc::channel(2);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(crate::harness::HarnessEvent::Text("ok".to_string()))
+                    .await;
+                let _ = tx
+                    .send(crate::harness::HarnessEvent::Done {
+                        session_id: "mock-sid-1".to_string(),
+                    })
+                    .await;
+            });
+            Ok(rx)
+        }
+        fn get_session_id(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn set_session_id(&self, _: &str, _: String) {}
+    }
+
+    fn install_recording_claude(app: &mut App) -> Arc<std::sync::Mutex<Vec<RecordingCall>>> {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let harness = RecordingHarness {
+            calls: Arc::clone(&calls),
+            kind: crate::harness::HarnessKind::Claude,
+        };
+        app.harnesses
+            .insert(crate::harness::HarnessKind::Claude, Box::new(harness));
+        calls
+    }
+
+    fn bootstrap_foreground_session(app: &mut App) {
+        // App::new doesn't create a tmux session by default; for these tests
+        // we just register one in the session manager directly.
+        app.session_mgr.install_test_foreground("test-session");
+    }
+
+    fn fake_telegram_msg(text: &str) -> IncomingMessage {
+        IncomingMessage {
+            user_id: "12345".to_string(),
+            text: text.to_string(),
+            platform: PlatformType::Telegram,
+            reply_context: ReplyContext {
+                platform: PlatformType::Telegram,
+                chat_id: "chat-1".to_string(),
+                thread_ts: None,
+                socket_reply_tx: None,
+            },
+            attachments: vec![],
+            socket_request_id: None,
+            socket_client_name: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_on_with_initial_prompt_fires_send_harness_prompt() {
+        // G4 (coverage review): the new `on <flags> <prompt>` form must
+        // actually call send_harness_prompt with the trailing prompt.
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx) = make_app(dir.path());
+        bootstrap_foreground_session(&mut app);
+        let calls = install_recording_claude(&mut app);
+
+        let msg = fake_telegram_msg(": claude on --name review please look at the bag");
+        app.handle_command(&msg).await;
+
+        // Give the spawned Done emitter a chance to run.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "expected exactly one run_prompt call, got {:?}",
+            recorded
+        );
+        assert_eq!(recorded[0].prompt, "please look at the bag");
+        // New session — no resume_id yet.
+        assert!(recorded[0].resume_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn harness_on_without_initial_prompt_does_not_fire_prompt() {
+        // Regression guard: bare `on --name foo` should NOT send a prompt,
+        // even though initial_prompt support exists.
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx) = make_app(dir.path());
+        bootstrap_foreground_session(&mut app);
+        let calls = install_recording_claude(&mut app);
+
+        let msg = fake_telegram_msg(": claude on --name review");
+        app.handle_command(&msg).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "bare `on --name` must not fire a prompt: {:?}",
+            calls.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn zombie_entry_in_state_resumes_to_error() {
+        // G5: an old-format state file with an empty-session_id entry is
+        // loaded into the App but `--resume` on it errors cleanly (not a
+        // panic, not a successful "resume" with no conversation). The
+        // guard is `!entry.session_id.is_empty()` at the resume resolver.
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("terminus-state.json");
+
+        // Pre-seed state with a zombie entry (empty session_id).
+        {
+            let mut store = StateStore::load(&state_path).unwrap();
+            let zombie = NamedSessionEntry {
+                session_id: String::new(),
+                cwd: std::path::PathBuf::from("/tmp"),
+                last_used: Utc::now(),
+            };
+            store.apply(StateUpdate::HarnessSessionBatch(vec![(
+                "ghost".into(),
+                Some(zombie),
+            )]));
+            store.persist().unwrap();
+        }
+
+        let config = make_test_config(dir.path());
+        let store = StateStore::load(&state_path).unwrap();
+        let (state_tx, _rx) = mpsc::channel::<StateUpdate>(64);
+        let app = App::new(&config, store, state_tx).unwrap();
+
+        // The zombie loaded, but the resume filter treats it as "not found".
+        assert!(
+            app.named_harness_sessions.contains_key("ghost"),
+            "zombie should survive the load (we don't scrub on startup)"
+        );
+        let entry = &app.named_harness_sessions["ghost"];
+        assert!(
+            entry.session_id.is_empty(),
+            "zombie should have empty session_id as seeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_session_preserves_last_used_across_reload() {
+        // G10: `last_used` must round-trip through the state file so LRU
+        // ordering is stable across restarts. A silent field drop would
+        // make every reload look freshly-used and defeat the LRU policy.
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("terminus-state.json");
+
+        let stamp = Utc::now() - chrono::Duration::minutes(42);
+        {
+            let mut store = StateStore::load(&state_path).unwrap();
+            let entry = NamedSessionEntry {
+                session_id: "sid-1".into(),
+                cwd: std::path::PathBuf::from("/tmp/project"),
+                last_used: stamp,
+            };
+            store.apply(StateUpdate::HarnessSessionBatch(vec![(
+                "auth".into(),
+                Some(entry),
+            )]));
+            store.persist().unwrap();
+        }
+
+        let reloaded = StateStore::load(&state_path).unwrap();
+        let entry = &reloaded.snapshot().harness_sessions["auth"];
+        // Serde on chrono DateTime<Utc> is RFC3339 with nanos — full
+        // equality is fine.
+        assert_eq!(entry.last_used, stamp);
     }
 }

@@ -246,8 +246,23 @@ impl ParsedCommand {
                 // `: claude on --resume review please look at the bag`
                 //   (flags first, then a prompt — we enable the mode AND
                 //   fire the prompt as the first message.)
+                //
+                // `: claude on <prompt>` (no flags) is rejected: `on` is
+                // a mode toggle, not a one-shot — if the user wants a
+                // quick prompt they should use `: claude <prompt>`. This
+                // also prevents muscle-memory typos like `: claude on hi`
+                // from silently entering interactive mode and burning
+                // a Claude call on a stray word.
                 if let Some(on_args) = after_harness.strip_prefix("on ") {
-                    let (options, prompt) = split_prompt_options(on_args.trim())?;
+                    let trimmed = on_args.trim();
+                    let (options, prompt) = split_prompt_options(trimmed)?;
+                    if options.is_empty() {
+                        return Err(ParseError::InvalidHarnessOption(format!(
+                            "`on` expects flags (e.g. `--name foo`, `--resume bar`). \
+                             For a one-shot prompt use `: claude {}` instead.",
+                            trimmed
+                        )));
+                    }
                     let initial_prompt = if prompt.is_empty() {
                         None
                     } else {
@@ -1957,21 +1972,59 @@ mod tests {
     }
 
     #[test]
-    fn parse_on_without_flags_treats_all_as_prompt() {
-        // Backward-compat path: previously `: claude on foo` errored; now it
-        // enters interactive mode and sends `foo` as the initial prompt.
-        let cmd = ParsedCommand::parse(": claude on hello there", ':').unwrap();
+    fn parse_on_with_quoted_system_prompt_then_initial_prompt() {
+        // G1: quoted multi-word flag value followed by a prompt. Previously
+        // untested — exercises the token round-trip through
+        // `split_prompt_options` → `parse_harness_options_tokens`.
+        let cmd = ParsedCommand::parse(
+            ": claude on --system-prompt \"You are a Rust expert\" review this",
+            ':',
+        )
+        .unwrap();
         match cmd {
             ParsedCommand::HarnessOn {
                 options,
                 initial_prompt,
                 ..
             } => {
-                assert!(options.is_empty());
-                assert_eq!(initial_prompt.as_deref(), Some("hello there"));
+                assert_eq!(
+                    options.system_prompt.as_deref(),
+                    Some("You are a Rust expert")
+                );
+                assert_eq!(initial_prompt.as_deref(), Some("review this"));
             }
             other => panic!("Expected HarnessOn, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_on_name_and_resume_rejected() {
+        // G2: mutex validation fires for `on` mode as well as one-shot.
+        let err = ParsedCommand::parse(": claude on --name auth --resume auth", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("Cannot use both"));
+    }
+
+    #[test]
+    fn parse_on_without_flags_is_rejected() {
+        // `: claude on <prompt>` without flags is disallowed: `on` is a
+        // mode toggle, not a one-shot, and silently entering interactive
+        // mode on a muscle-memory typo like `: claude on hi` would burn
+        // a Claude call on a stray word. The error tells the user how to
+        // do what they probably meant.
+        let err = ParsedCommand::parse(": claude on hello there", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("on` expects flags"),
+            "error should explain `on` needs flags: {}",
+            msg
+        );
+        assert!(
+            msg.contains(": claude hello there"),
+            "error should suggest the one-shot form: {}",
+            msg
+        );
     }
 
     #[test]
