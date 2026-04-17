@@ -1816,6 +1816,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_em_dashed_name_on_mode() {
+        // iOS autocorrect turns `--` into `—`; the normalizer should
+        // fold it back so long flags keep working from mobile chat.
+        let cmd = ParsedCommand::parse(": claude on \u{2014}name auth", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn { options, .. } => {
+                assert_eq!(options.name, Some("auth".into()));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_em_dashed_resume_one_shot() {
+        let cmd = ParsedCommand::parse(": claude \u{2014}resume auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.resume, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_name_and_resume_rejected() {
         let err = ParsedCommand::parse(": claude --name auth --resume auth fix", ':').unwrap_err();
         assert!(matches!(err, ParseError::InvalidHarnessOption(_)));

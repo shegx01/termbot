@@ -178,9 +178,17 @@ impl TmuxClient {
     }
 }
 
-/// Normalize Unicode smart/curly quotes into plain ASCII equivalents.
-/// Mobile keyboards (Telegram iOS/Android, Slack) auto-replace straight
-/// quotes with typographic variants that shells don't recognize.
+/// Normalize Unicode typographic characters that mobile keyboards
+/// auto-replace (curly quotes, em-dashes) into plain ASCII equivalents.
+/// Telegram iOS, Slack iOS, and macOS autocorrect all replace straight
+/// quotes and `--` with typographic variants the shell-style parser
+/// doesn't recognize — leaving `—name auth` to be treated as prompt text
+/// instead of a flag.
+///
+/// Em-dash (U+2014) is normalized to `--` because iOS autocorrect turns
+/// consecutive hyphens into an em-dash mid-typing. En-dash (U+2013) is
+/// intentionally left alone: it's rarely an autocorrect result and is
+/// commonly used legitimately in number ranges (e.g. "pages 5–10").
 pub(crate) fn normalize_quotes(input: &str) -> String {
     input
         .replace(['\u{201C}', '\u{201D}'], "\"") // left/right double quotation marks ""
@@ -189,6 +197,7 @@ pub(crate) fn normalize_quotes(input: &str) -> String {
         .replace('\u{2032}', "'") // prime ′
         .replace('\u{201A}', ",") // single low-9 quotation mark ‚
         .replace('\u{201E}', "\"") // double low-9 quotation mark „
+        .replace('\u{2014}', "--") // em-dash — (mobile keyboards autocorrect `--` → `—`)
 }
 
 #[cfg(test)]
@@ -225,5 +234,31 @@ mod tests {
             normalize_quotes("claude -p \u{201C}what is 2+2?\u{201D}"),
             "claude -p \"what is 2+2?\""
         );
+    }
+
+    #[test]
+    fn normalize_em_dash_flag_prefix() {
+        // iOS autocorrect turns `--name auth` into `—name auth`, which the
+        // parser would otherwise treat as prompt text.
+        assert_eq!(
+            normalize_quotes("\u{2014}name auth fix bug"),
+            "--name auth fix bug"
+        );
+    }
+
+    #[test]
+    fn normalize_em_dash_in_middle_of_input() {
+        assert_eq!(
+            normalize_quotes("claude on \u{2014}resume auth"),
+            "claude on --resume auth"
+        );
+    }
+
+    #[test]
+    fn en_dash_is_not_normalized() {
+        // En-dash (U+2013) is common in legitimate text ranges like
+        // "pages 5–10" and is rarely an autocorrect result, so we leave it.
+        let input = "pages 5\u{2013}10";
+        assert_eq!(normalize_quotes(input), input);
     }
 }
