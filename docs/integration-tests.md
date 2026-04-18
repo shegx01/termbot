@@ -32,6 +32,7 @@ TERMINUS_HAS_OPENCODE=1 cargo test -- --ignored <test_name>
 - `ac2_interactive_two_prompts_reuse_session` — session resume via captured sessionID
 - `ac3_bogus_session_id_surfaces_error_path` — invalid `--session` yields error/Done
 - `ac4_tool_use_visibility_with_agent_build` — agent=build triggers `HarnessEvent::ToolUse` with structured input/output
+- `subcommand_models_returns_non_empty_output` — `run_subcommand(Models)` returns non-empty output mentioning at least one known provider (requires `opencode-authenticated`)
 
 **Environment variables:**
 - `TERMINUS_HAS_OPENCODE=1` — required to run any gated opencode integration test

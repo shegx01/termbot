@@ -172,6 +172,29 @@ Optional `[harness.opencode]` overrides (see `terminus.example.toml`):
 - `model`: pass `-m <value>` to `opencode run` (default: opencode's own default)
 - `agent`: pass `--agent <value>` to `opencode run` (default: opencode's own default)
 
+**Supported subcommands from chat** (`: opencode <sub> [args]`):
+- `: opencode models [provider]` — list configured models, optionally filtered by provider
+- `: opencode stats [--days N] [--tools] [--models] [--project]` — token/cost usage
+- `: opencode sessions [--max-count N]` — recent session IDs (alias for `session list`)
+- `: opencode providers` — configured providers (alias for `auth list`)
+- `: opencode export <sessionID>` — export one session as JSON
+
+**Blocked from chat** (return a clear error; run in terminal): `uninstall`,
+`upgrade`, `auth login/logout`, `serve`, `web`, `acp`, `attach`, `import`, `mcp`,
+`agent`, `github`, `debug`, `tui`.
+
+**Per-prompt flags** (`: opencode [flags] <prompt>`):
+- `--name <x>` / `--resume <x>` / `--continue <x>` — named session
+- `--continue` (no value, followed by another flag or end of flags) — continue opencode's last session (maps to `opencode run --continue`)
+- `--title <str>` — human-readable session title
+- `--share` — ask opencode for a shareable URL
+- `--pure` — run without external plugins
+- `--fork` — fork the session before continuing (requires `--continue` or `--resume`)
+- `-m <model>` / `--agent <name>` inherited as config only (not per-prompt yet)
+
+Subcommand output is wrapped in a fenced code block and truncated at 3000
+chars. For long outputs, run the CLI in your terminal.
+
 **Known limitations:**
 - Cross-harness state-persist-failure (state file only persists one entry per
   key; the `{kind}:{name}` prefix scheme prevents collisions between harnesses

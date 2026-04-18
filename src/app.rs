@@ -697,6 +697,7 @@ impl App {
         // Harness paths (HarnessPrompt, StdinInput->harness) handle their own cleanup
         // inside the spawned harness task.
         let harness_will_handle = matches!(cmd, ParsedCommand::HarnessPrompt { .. })
+            || matches!(cmd, ParsedCommand::HarnessSubcommand { .. })
             || matches!(
                 cmd,
                 ParsedCommand::HarnessOn {
@@ -1112,6 +1113,44 @@ impl App {
                     )
                     .await;
                 }
+            }
+            ParsedCommand::HarnessSubcommand {
+                harness,
+                subcommand,
+                args,
+            } => {
+                if harness != HarnessKind::Opencode {
+                    // Parser should only emit this for opencode, but be defensive.
+                    self.send_error(
+                        &msg.reply_context,
+                        &format!("HarnessSubcommand not supported for {}", harness.name()),
+                    )
+                    .await;
+                    return;
+                }
+                let reply = match self
+                    .opencode
+                    .run_subcommand(subcommand.clone(), &args)
+                    .await
+                {
+                    Ok(out) if out.is_empty() => {
+                        format!("opencode {:?}: (no output)", subcommand)
+                    }
+                    Ok(out) => {
+                        const MAX: usize = 3000;
+                        if out.len() > MAX {
+                            let truncated: String = out.chars().take(MAX).collect();
+                            format!(
+                                "```\n{}\n```\n… (truncated; run in terminal for full output)",
+                                truncated
+                            )
+                        } else {
+                            format!("```\n{}\n```", out)
+                        }
+                    }
+                    Err(e) => format!("opencode error: {}", e),
+                };
+                self.send_reply(&msg.reply_context, &reply).await;
             }
             ParsedCommand::ShellCommand { cmd } => {
                 // Snapshot pane before command so we can diff afterward

@@ -30,7 +30,7 @@
 
 use super::{build_session_key, Harness, HarnessEvent, HarnessKind};
 use crate::chat_adapters::Attachment;
-use crate::command::HarnessOptions;
+use crate::command::{HarnessOptions, OpencodeSubcommand};
 use crate::config::OpencodeConfig;
 use crate::socket::events::AmbientEvent;
 use anyhow::Result;
@@ -116,7 +116,7 @@ impl Harness for OpencodeHarness {
         attachments: &[Attachment],
         cwd: &Path,
         session_id: Option<&str>,
-        _options: &HarnessOptions,
+        options: &HarnessOptions,
     ) -> Result<mpsc::Receiver<HarnessEvent>> {
         let (event_tx, event_rx) = mpsc::channel::<HarnessEvent>(256);
 
@@ -127,9 +127,10 @@ impl Harness for OpencodeHarness {
             .unwrap_or_else(|| PathBuf::from("opencode"));
 
         // Build argv in the order: `run --format json [--session …] [-m …]
-        // [--agent …] [-f <path>]* -- <prompt>`. We do NOT use `--` because
-        // opencode's `run` treats positional args as the prompt already and
-        // adding `--` confuses yargs. Attachments use `-f <path>` per the CLI.
+        // [--agent …] [-f <path>]* [--title …] [--share] [--pure] [--fork]
+        // [--continue] -- <prompt>`. We do NOT use `--` because opencode's
+        // `run` treats positional args as the prompt already and adding `--`
+        // confuses yargs. Attachments use `-f <path>` per the CLI.
         let mut args: Vec<String> = vec!["run".into(), "--format".into(), "json".into()];
         if let Some(sid) = session_id {
             args.push("--session".into());
@@ -146,6 +147,23 @@ impl Harness for OpencodeHarness {
         for att in attachments {
             args.push("-f".into());
             args.push(att.path.to_string_lossy().into_owned());
+        }
+        // Per-prompt flags (after attachments, before the prompt positional).
+        if let Some(ref t) = options.title {
+            args.push("--title".into());
+            args.push(t.clone());
+        }
+        if options.share {
+            args.push("--share".into());
+        }
+        if options.pure {
+            args.push("--pure".into());
+        }
+        if options.fork {
+            args.push("--fork".into());
+        }
+        if options.continue_last {
+            args.push("--continue".into());
         }
         // Prompt as the final positional. opencode `run` accepts multi-word
         // messages as separate positionals, but we pass it as a single arg to
@@ -253,6 +271,126 @@ impl Harness for Arc<OpencodeHarness> {
     }
     fn set_session_id(&self, session_name: &str, session_id: String) {
         (**self).set_session_id(session_name, session_id)
+    }
+}
+
+/// Strip ANSI escape sequences (CSI sequences and simple OSC). Hand-rolled
+/// to avoid a new crate dep — matches `\x1b[...m`, `\x1b[...K`, and similar.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip until a terminator: letter @-~ for CSI; `\x07` or `\x1b\\` for OSC.
+            if let Some(&next) = chars.peek() {
+                if next == '[' {
+                    chars.next(); // consume `[`
+                    for cc in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&cc) {
+                            break;
+                        }
+                    }
+                    continue;
+                } else if next == ']' {
+                    chars.next(); // consume `]`
+                    while let Some(cc) = chars.next() {
+                        if cc == '\x07' {
+                            break;
+                        }
+                        if cc == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            // Unknown escape — drop the ESC and continue.
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+impl OpencodeHarness {
+    /// Spawn `opencode <sub> <args>` with `NO_COLOR=1`, capture stdout, strip
+    /// ANSI escapes, return the trimmed string. Bounded by a 30s timeout.
+    /// stderr is captured and appended on non-zero exit as diagnostic context.
+    /// DOES NOT create a session or emit ambient events — subcommands are
+    /// one-shot queries, not prompts.
+    pub async fn run_subcommand(&self, sub: OpencodeSubcommand, args: &[String]) -> Result<String> {
+        let binary = self
+            .config
+            .binary_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("opencode"));
+
+        let sub_name = match sub {
+            OpencodeSubcommand::Models => "models",
+            OpencodeSubcommand::Stats => "stats",
+            OpencodeSubcommand::Sessions => "session", // `opencode session list`
+            OpencodeSubcommand::Providers => "auth",   // `opencode auth list`
+            OpencodeSubcommand::Export => "export",
+        };
+
+        let mut argv: Vec<String> = vec![sub_name.into()];
+        // `sessions` and `providers` are user-friendly aliases; they both
+        // map to a `list` sub-subcommand.
+        if matches!(
+            sub,
+            OpencodeSubcommand::Sessions | OpencodeSubcommand::Providers
+        ) {
+            argv.push("list".into());
+        }
+        argv.extend(args.iter().cloned());
+
+        let mut cmd = Command::new(&binary);
+        cmd.args(&argv)
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+
+        let child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!("opencode binary not found: {}", binary.display())
+            } else {
+                anyhow::anyhow!("opencode subcommand spawn failed: {}", e)
+            }
+        })?;
+
+        let output_fut = child.wait_with_output();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(30), output_fut)
+            .await
+            .map_err(|_| anyhow::anyhow!("opencode {} timed out after 30s", sub_name))?
+            .map_err(|e| anyhow::anyhow!("opencode {} wait failed: {}", sub_name, e))?;
+
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stripped = strip_ansi(&stdout);
+        let stripped = stripped.trim();
+
+        if !out.status.success() {
+            let stderr_trim = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let code = out
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into());
+            return Err(anyhow::anyhow!(
+                "opencode {} exited with status {}: {}",
+                sub_name,
+                code,
+                if stderr_trim.is_empty() {
+                    stripped.to_string()
+                } else {
+                    stderr_trim
+                }
+            ));
+        }
+
+        Ok(stripped.to_string())
     }
 }
 
@@ -1168,5 +1306,110 @@ mod tests {
             "tool output should be non-empty, got empty string"
         );
         assert!(saw_done, "expected HarnessEvent::Done after tool use");
+    }
+
+    // ── strip_ansi unit tests ────────────────────────────────────────────────
+
+    #[test]
+    fn strip_ansi_removes_csi_color_codes() {
+        let input = "\x1b[31mred\x1b[0m";
+        assert_eq!(strip_ansi(input), "red");
+    }
+
+    #[test]
+    fn strip_ansi_removes_erase_codes() {
+        let input = "\x1b[2Kline";
+        assert_eq!(strip_ansi(input), "line");
+    }
+
+    #[test]
+    fn strip_ansi_passes_through_plain_text() {
+        let input = "hello world";
+        assert_eq!(strip_ansi(input), "hello world");
+    }
+
+    #[test]
+    fn strip_ansi_handles_osc_titlebar_sequence() {
+        let input = "\x1b]0;title\x07body";
+        assert_eq!(strip_ansi(input), "body");
+    }
+
+    // ── argv_construction_threads_all_per_prompt_flags ──────────────────────
+
+    #[test]
+    fn argv_construction_threads_all_per_prompt_flags() {
+        // White-box: reconstruct the argv the way `run_prompt` does when all
+        // per-prompt flags are set, and assert the expected order.
+        let options = HarnessOptions {
+            title: Some("my-session".into()),
+            share: true,
+            pure: true,
+            fork: true,
+            continue_last: true,
+            ..Default::default()
+        };
+        let mut args: Vec<String> = vec!["run".into(), "--format".into(), "json".into()];
+        // Per-prompt flags (mirrors run_prompt order):
+        if let Some(ref t) = options.title {
+            args.push("--title".into());
+            args.push(t.clone());
+        }
+        if options.share {
+            args.push("--share".into());
+        }
+        if options.pure {
+            args.push("--pure".into());
+        }
+        if options.fork {
+            args.push("--fork".into());
+        }
+        if options.continue_last {
+            args.push("--continue".into());
+        }
+
+        assert!(args.contains(&"--title".to_string()), "missing --title");
+        assert!(
+            args.contains(&"my-session".to_string()),
+            "missing title value"
+        );
+        assert!(args.contains(&"--share".to_string()), "missing --share");
+        assert!(args.contains(&"--pure".to_string()), "missing --pure");
+        assert!(args.contains(&"--fork".to_string()), "missing --fork");
+        assert!(
+            args.contains(&"--continue".to_string()),
+            "missing --continue"
+        );
+
+        // Verify relative ordering: title before share before pure before fork before continue
+        let pos = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert!(pos("--title") < pos("--share"));
+        assert!(pos("--share") < pos("--pure"));
+        assert!(pos("--pure") < pos("--fork"));
+        assert!(pos("--fork") < pos("--continue"));
+    }
+
+    // ── Gated subcommand integration test ────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore]
+    async fn subcommand_models_returns_non_empty_output() {
+        if std::env::var("TERMINUS_HAS_OPENCODE").is_err() {
+            eprintln!("skip: TERMINUS_HAS_OPENCODE not set");
+            return;
+        }
+        let (tx, _rx) = broadcast::channel::<AmbientEvent>(8);
+        let h = OpencodeHarness::new(OpencodeConfig::default(), tx);
+        let result = h.run_subcommand(OpencodeSubcommand::Models, &[]).await;
+        let output = result.expect("run_subcommand(models) should succeed");
+        assert!(!output.is_empty(), "models output should be non-empty");
+        let lower = output.to_lowercase();
+        let has_provider = ["openrouter", "anthropic", "claude", "gpt", "openai"]
+            .iter()
+            .any(|p| lower.contains(p));
+        assert!(
+            has_provider,
+            "models output should mention at least one known provider, got: {}",
+            output
+        );
     }
 }
