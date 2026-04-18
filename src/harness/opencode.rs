@@ -17,10 +17,16 @@
 //! - `{"type":"step_start", "sessionID":"ses_…", "part":{…}}` — captured for session id
 //! - `{"type":"text", "sessionID":"…", "part":{"text":"…"}}` — translated to `Text`
 //! - `{"type":"step_finish", …}` — terminal; stops the read loop
+//! - `{"type":"tool_use", …, "part":{"tool":"bash","state":{"status":"completed","input":{…},"output":"…"}}}` — translated to `ToolUse`
 //!
-//! Tool-use events are DEFERRED — the default agent in probe sessions did not
-//! emit any `tool_*` event types. The additive `HarnessEvent::ToolUse { input,
-//! output }` fields are ready for the follow-up PR that adds them.
+//! Tool-use events are atomic (no separate running/pending events in `--format
+//! json` mode). Each carries the full call + result in a single JSON line.
+//!
+//! ## Integration tests
+//!
+//! Live-binary tests are gated `#[ignore]` + `TERMINUS_HAS_OPENCODE=1`.
+//! Run with `TERMINUS_HAS_OPENCODE=1 cargo test -- --ignored`. See
+//! `docs/integration-tests.md` for preconditions.
 
 use super::{build_session_key, Harness, HarnessEvent, HarnessKind};
 use crate::chat_adapters::Attachment;
@@ -365,6 +371,21 @@ async fn run_opencode_inner(
                         TranslatedEvent::StepFinish => {
                             received_finish = true;
                         }
+                        TranslatedEvent::ToolUse {
+                            tool,
+                            description,
+                            input,
+                            output,
+                        } => {
+                            let _ = event_tx
+                                .send(HarnessEvent::ToolUse {
+                                    tool,
+                                    description,
+                                    input,
+                                    output,
+                                })
+                                .await;
+                        }
                     }
                 }
                 if received_finish {
@@ -456,11 +477,13 @@ async fn run_opencode_inner(
 /// {"type":"step_start", "sessionID":"ses_…", "part":{…}}
 /// {"type":"text", "sessionID":"…", "part":{"text":"…"}}
 /// {"type":"step_finish", …}
+/// {"type":"tool_use", "sessionID":"…", "part":{"tool":"bash","state":{"status":"completed","input":{…},"output":"…"}}}
 /// ```
 ///
-/// TODO: tool-use events when an agent with tools enabled is used
-/// (agent="build" likely triggers them). Add a tool-use event type +
-/// translation + accumulator in a follow-up PR.
+/// Tool-use events are atomic — one event per call with both input and output
+/// present. No accumulator is needed. The `status` field may be `"completed"`
+/// or `"error"`; on error the `output` field is suppressed and the `description`
+/// includes the error message from `part.state.error`.
 pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<TranslatedEvent>> {
     let ty = event.get("type").and_then(|t| t.as_str())?;
     match ty {
@@ -477,6 +500,71 @@ pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<Translate
         }
         "step_start" => None,
         "step_finish" => Some(vec![TranslatedEvent::StepFinish]),
+        "tool_use" => {
+            let part = event.get("part")?;
+            let tool = part.get("tool").and_then(|v| v.as_str())?.to_string();
+            let state = part.get("state")?;
+            let status = state.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let title = state
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let input_json = state
+                .get("input")
+                .map(|v| serde_json::to_string(v).unwrap_or_default());
+            let output_str = state
+                .get("output")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let description = match status {
+                "completed" => {
+                    if title.is_empty() {
+                        tool.clone()
+                    } else {
+                        title
+                    }
+                }
+                "error" => {
+                    let err_msg = state
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool failed");
+                    format!(
+                        "{} ({})",
+                        if title.is_empty() {
+                            tool.clone()
+                        } else {
+                            title
+                        },
+                        err_msg
+                    )
+                }
+                other => format!(
+                    "{} (status: {})",
+                    if title.is_empty() {
+                        tool.clone()
+                    } else {
+                        title
+                    },
+                    other
+                ),
+            };
+
+            let output = if status == "completed" {
+                output_str
+            } else {
+                None
+            };
+
+            Some(vec![TranslatedEvent::ToolUse {
+                tool,
+                description,
+                input: input_json,
+                output,
+            }])
+        }
         _ => None,
     }
 }
@@ -486,6 +574,12 @@ pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<Translate
 pub(crate) enum TranslatedEvent {
     Text(String),
     StepFinish,
+    ToolUse {
+        tool: String,
+        description: String,
+        input: Option<String>,
+        output: Option<String>,
+    },
 }
 
 #[allow(dead_code)]
@@ -558,6 +652,102 @@ mod tests {
     fn translate_event_missing_type_returns_none() {
         let ev = serde_json::json!({"part": {"text": "orphan"}});
         assert!(translate_event(&ev).is_none());
+    }
+
+    #[test]
+    fn translate_event_tool_use_completed_extracts_structured_fields() {
+        let ev = serde_json::json!({
+            "type": "tool_use",
+            "timestamp": 1776515159863u64,
+            "sessionID": "ses_abc",
+            "part": {
+                "id": "prt_1",
+                "messageID": "msg_1",
+                "sessionID": "ses_abc",
+                "type": "tool",
+                "tool": "bash",
+                "callID": "call_56a0895561b54640b5d00822",
+                "state": {
+                    "status": "completed",
+                    "input": {"command": "echo hello", "description": "Echo hello"},
+                    "output": "hello\n",
+                    "metadata": {"output": "hello\n", "exit": 0, "truncated": false},
+                    "title": "Echo hello",
+                    "time": {"start": 0, "end": 1}
+                }
+            }
+        });
+        let out = translate_event(&ev).expect("tool_use event should translate");
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            TranslatedEvent::ToolUse {
+                tool,
+                description,
+                input,
+                output,
+            } => {
+                assert_eq!(tool, "bash");
+                assert_eq!(description, "Echo hello");
+                let input_str = input.as_deref().expect("input should be Some");
+                assert!(
+                    input_str.contains("echo hello"),
+                    "input should contain the command, got: {}",
+                    input_str
+                );
+                assert_eq!(output.as_deref(), Some("hello\n"));
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_event_tool_use_error_status_has_no_output() {
+        let ev = serde_json::json!({
+            "type": "tool_use",
+            "sessionID": "ses_abc",
+            "part": {
+                "tool": "bash",
+                "state": {
+                    "status": "error",
+                    "input": {"command": "fail"},
+                    "error": "boom",
+                    "title": "Run fail"
+                }
+            }
+        });
+        let out = translate_event(&ev).expect("tool_use error event should translate");
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            TranslatedEvent::ToolUse {
+                description,
+                output,
+                ..
+            } => {
+                assert!(
+                    description.contains("boom"),
+                    "description should include error message, got: {}",
+                    description
+                );
+                assert!(output.is_none(), "output should be None on error status");
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_event_tool_use_missing_state_returns_none() {
+        // Malformed: part has no `state` key
+        let ev = serde_json::json!({
+            "type": "tool_use",
+            "sessionID": "ses_abc",
+            "part": {
+                "tool": "bash"
+            }
+        });
+        assert!(
+            translate_event(&ev).is_none(),
+            "missing state should return None"
+        );
     }
 
     // ── build_session_key / session_key ──────────────────────────────────────
@@ -805,6 +995,70 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
+    async fn ac2_interactive_two_prompts_reuse_session() {
+        if std::env::var("TERMINUS_HAS_OPENCODE").is_err() {
+            eprintln!("skip: TERMINUS_HAS_OPENCODE not set");
+            return;
+        }
+        let (tx, _rx) = broadcast::channel::<AmbientEvent>(8);
+        let h = OpencodeHarness::new(OpencodeConfig::default(), tx);
+        let opts = HarnessOptions::default();
+        let cwd = std::env::temp_dir();
+
+        // First prompt — no session_id; capture the session from Done event.
+        let mut rx1 = h
+            .run_prompt("say hello", &[], &cwd, None, &opts)
+            .await
+            .expect("run_prompt ok");
+
+        let mut captured_session_id: Option<String> = None;
+        while let Some(ev) = tokio::time::timeout(std::time::Duration::from_secs(120), rx1.recv())
+            .await
+            .expect("timeout on first prompt")
+        {
+            match ev {
+                HarnessEvent::Done { session_id } if !session_id.is_empty() => {
+                    captured_session_id = Some(session_id);
+                    break;
+                }
+                HarnessEvent::Done { .. } => break,
+                HarnessEvent::Error(e) => panic!("first prompt error: {}", e),
+                _ => {}
+            }
+        }
+
+        let sid = captured_session_id.expect("first prompt should yield a session_id");
+
+        // Second prompt — resume the same session.
+        let mut rx2 = h
+            .run_prompt("say goodbye", &[], &cwd, Some(&sid), &opts)
+            .await
+            .expect("run_prompt ok");
+
+        let mut second_session_id: Option<String> = None;
+        while let Some(ev) = tokio::time::timeout(std::time::Duration::from_secs(120), rx2.recv())
+            .await
+            .expect("timeout on second prompt")
+        {
+            match ev {
+                HarnessEvent::Done { session_id } => {
+                    second_session_id = Some(session_id);
+                    break;
+                }
+                HarnessEvent::Error(e) => panic!("second prompt error: {}", e),
+                _ => {}
+            }
+        }
+
+        let sid2 = second_session_id.expect("second prompt should yield a session_id");
+        assert_eq!(
+            sid, sid2,
+            "both prompts should report the same opencode sessionID"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
     async fn ac3_bogus_session_id_surfaces_error_path() {
         if std::env::var("TERMINUS_HAS_OPENCODE").is_err() {
             eprintln!("skip: TERMINUS_HAS_OPENCODE not set");
@@ -840,5 +1094,79 @@ mod tests {
             }
         }
         assert!(saw_error_or_done, "expected a clean error/Done path");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn ac4_tool_use_visibility_with_agent_build() {
+        if std::env::var("TERMINUS_HAS_OPENCODE").is_err() {
+            eprintln!("skip: TERMINUS_HAS_OPENCODE not set");
+            return;
+        }
+        let (tx, _rx) = broadcast::channel::<AmbientEvent>(8);
+        let config = OpencodeConfig {
+            agent: Some("build".to_string()),
+            ..OpencodeConfig::default()
+        };
+        let h = OpencodeHarness::new(config, tx);
+        let opts = HarnessOptions::default();
+        let cwd = std::env::temp_dir();
+
+        let mut rx = h
+            .run_prompt(
+                "run the bash command `echo hello` and tell me the output",
+                &[],
+                &cwd,
+                None,
+                &opts,
+            )
+            .await
+            .expect("run_prompt ok");
+
+        let mut saw_tool_use = false;
+        let mut saw_done = false;
+        let mut tool_name = String::new();
+        let mut tool_input: Option<String> = None;
+        let mut tool_output: Option<String> = None;
+
+        while let Some(ev) = tokio::time::timeout(std::time::Duration::from_secs(180), rx.recv())
+            .await
+            .expect("timeout waiting for tool_use/Done")
+        {
+            match ev {
+                HarnessEvent::ToolUse {
+                    tool,
+                    input,
+                    output,
+                    ..
+                } => {
+                    saw_tool_use = true;
+                    tool_name = tool;
+                    tool_input = input;
+                    tool_output = output;
+                }
+                HarnessEvent::Done { .. } => {
+                    saw_done = true;
+                    break;
+                }
+                HarnessEvent::Error(e) => panic!("harness error: {}", e),
+                _ => {}
+            }
+        }
+
+        assert!(saw_tool_use, "expected at least one HarnessEvent::ToolUse");
+        assert!(!tool_name.is_empty(), "tool name should be non-empty");
+        let input_str = tool_input.expect("tool input should be Some");
+        assert!(
+            input_str.to_lowercase().contains("echo"),
+            "tool input should mention 'echo', got: {}",
+            input_str
+        );
+        let output_str = tool_output.expect("tool output should be Some on completed tool");
+        assert!(
+            !output_str.is_empty(),
+            "tool output should be non-empty, got empty string"
+        );
+        assert!(saw_done, "expected HarnessEvent::Done after tool use");
     }
 }

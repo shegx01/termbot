@@ -260,3 +260,6 @@ envelope and drain pending requests within `shutdown_drain_secs`.
 Unit tests cover command parsing and blocklist (command.rs) and output buffer line counting / noise filtering (buffer.rs). No integration tests yet -- tmux operations require a live tmux server.
 
 Run with: `cargo test`
+
+Integration tests (e.g. opencode end-to-end) are gated by `#[ignore]` + env
+vars. See `docs/integration-tests.md` for how to run them.
