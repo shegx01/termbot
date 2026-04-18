@@ -61,7 +61,7 @@ stayawake_on_battery = false
 # ---------------------------------------------------------------------------
 # Named Harness Sessions
 # ---------------------------------------------------------------------------
-# Controls the maximum number of named Claude sessions (--name / --resume)
+# Controls the maximum number of named sessions (Claude and opencode) (--name / --resume)
 # kept in the session index. When the cap is reached, the least-recently-used
 # session is evicted. Default: 50.
 #

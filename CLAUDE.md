@@ -31,7 +31,13 @@ src/
   state_store.rs    Atomic JSON state file (Telegram offset, chat bindings, wake
                     watermarks) owned exclusively by App; adapters send updates
                     via mpsc::Sender<StateUpdate>
-  claude.rs         Claude Code SDK integration (claude-agent-sdk-rust crate)
+  harness/
+    mod.rs          Harness trait (async_trait), HarnessEvent, HarnessKind,
+                    HarnessOptions; shared session-key builder
+    claude.rs       Claude Code SDK integration (claude-agent-sdk-rust crate)
+    opencode.rs     opencode CLI-subprocess harness; translate_event, sanitize_stderr
+    codex.rs        Codex harness stub
+    gemini.rs       Gemini harness stub
   chat_adapters/
     mod.rs          ChatPlatform trait (async_trait), IncomingMessage,
                     ReplyContext (with optional socket_reply_tx for socket-
@@ -162,9 +168,9 @@ as a short-lived child process with `kill_on_drop(true)`. Mirrors the
   `sessionID` it sees on stdout and persists the name → id mapping under a
   prefixed key `opencode:<name>` in `terminus-state.json`.
 - Ambient events: `HarnessStarted` / `HarnessFinished` at prompt boundaries.
-- Tool-use event translation is deferred; the `HarnessEvent::ToolUse` variant
-  carries optional `input`/`output` fields ready for the follow-up PR that
-  adds the event type.
+- Tool-use events: terminus translates opencode's atomic tool_use JSON events
+  (emitted when opencode uses a tool-enabled agent) into `HarnessEvent::ToolUse`
+  with structured `tool`, `description`, `input`, and `output` fields.
 - No persistent sidecar, no port binding, no shutdown hook needed.
 
 Optional `[harness.opencode]` overrides (see `terminus.example.toml`):
@@ -179,9 +185,10 @@ Optional `[harness.opencode]` overrides (see `terminus.example.toml`):
 - `: opencode providers` — configured providers (alias for `auth list`)
 - `: opencode export <sessionID>` — export one session as JSON
 
-**Blocked from chat** (return a clear error; run in terminal): `uninstall`,
-`upgrade`, `auth login/logout`, `serve`, `web`, `acp`, `attach`, `import`, `mcp`,
-`agent`, `github`, `debug`, `tui`.
+**Blocked from chat** (return a clear error; run in terminal): `acp`, `agent`,
+`attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`,
+`session`, `tui`, `uninstall`, `upgrade`, `web`. Note: `session list` / `session ls`
+and `auth list` / `auth ls` ARE supported as safe read-only aliases.
 
 **Per-prompt flags** (`: opencode [flags] <prompt>`):
 - `--name <x>` / `--resume <x>` / `--continue <x>` — named session
@@ -199,7 +206,6 @@ chars. For long outputs, run the CLI in your terminal.
 - Cross-harness state-persist-failure (state file only persists one entry per
   key; the `{kind}:{name}` prefix scheme prevents collisions between harnesses
   but the underlying state-store write path is shared). Not opencode-specific.
-- Tool-use events are deferred to a follow-up PR.
 
 ### Platform adapters
 

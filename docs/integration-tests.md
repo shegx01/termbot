@@ -23,7 +23,7 @@ TERMINUS_HAS_OPENCODE=1 cargo test -- --ignored <test_name>
 
 **Preconditions:**
 - `opencode` on `PATH`; `opencode --version` succeeds
-- opencode must be authenticated (`opencode providers` or `opencode auth login`)
+- opencode must be authenticated (`opencode auth list` or `opencode auth login`)
 - Default model / agent configured in opencode (check with `opencode run "hi"` in a terminal)
 - Port 4096 is **not** required (the CLI-subprocess harness does not bind a port)
 

@@ -32,9 +32,11 @@ terminus gives you remote access to terminal sessions and AI harnesses from your
 | Platform  | Text | Inbound attachments | Notes |
 |-----------|:----:|:-------------------:|-------|
 | Telegram  |  ✓   |          ✓          | Long-polling; most complete integration |
-| Slack     |  ✓   |          ~          | Socket Mode; inbound files not yet wired |
+| Slack     |  ✓   |         ✓*          | Socket Mode; *images only, non-image documents not forwarded yet |
 | Discord   |  ✓   |          ✗          | Gateway; inbound attachments deferred |
 | WebSocket |  ✓   |          ✓          | Binary-frame upload; opt-in |
+
+\* Slack image attachments are downloaded and forwarded to AI harnesses; non-image file types (PDFs, documents, etc.) are not yet wired.
 
 **AI harnesses** (the `: <name>` prefixed commands):
 
@@ -45,7 +47,7 @@ terminus gives you remote access to terminal sessions and AI harnesses from your
 | codex    |   stub   |    stub     |      stub      |      stub       |       stub        |    stub     |
 | gemini   |   stub   |    stub     |      stub      |      stub       |       stub        |    stub     |
 
-¹ Requires `[harness.opencode] agent = "build"` or another tool-enabled agent
+¹ Tool-use events are forwarded when opencode emits them; tool-enabled agents (e.g. "build") emit tool_use JSON events, others may not
 ² Opencode CLI has no schema-constrained output surface -- use the claude harness for `--schema` workflows
 
 ---
@@ -389,7 +391,7 @@ Optional overrides:
 
 **Requirements:** `opencode` on PATH (same pattern as `tmux`). Run `opencode auth login` once before using any `: opencode ...` commands.
 
-**Blocked from chat** (run in your terminal instead): `uninstall`, `upgrade`, `auth login/logout`, `serve`, `web`, `acp`, `attach`, `import`, `mcp`, `agent`, `github`, `debug`. Terminus returns a clear error if you try these from chat.
+**Blocked from chat** (run in your terminal instead): `acp`, `agent`, `attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`, `session`, `tui`, `uninstall`, `upgrade`, `web`. Terminus returns a clear error if you try these from chat. Note: `session list` / `session ls` and `auth list` / `auth ls` ARE supported as safe read-only aliases.
 
 ### Multiple platforms
 
@@ -585,7 +587,7 @@ Use `--resume` when you know the session exists and want to catch typos. `--cont
 - On resume, the stored working directory is passed to the SDK for context
 - Sessions are LRU-evicted when the index exceeds `max_named_sessions` (default 50, configurable in `[harness]` section)
 - `--name` and `--resume` are mutually exclusive
-- Only works with harnesses that support resume (currently Claude)
+- Only works with harnesses that support resume (currently Claude and opencode)
 
 **Breaking change:** `-n` was previously the short flag for `--max-turns`. It now means `--name`. Use `-t` for `--max-turns`.
 
