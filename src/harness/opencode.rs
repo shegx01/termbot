@@ -104,13 +104,14 @@ impl OpencodeHarness {
                 Ok(Ok(())) => info!("opencode sidecar shut down cleanly"),
                 Ok(Err(e)) => warn!("opencode sidecar close returned error: {}", e),
                 Err(_) => {
-                    warn!("opencode sidecar shutdown timed out after 2s; dropping (SIGKILL via Drop)");
+                    warn!(
+                        "opencode sidecar shutdown timed out after 2s; dropping (SIGKILL via Drop)"
+                    );
                     drop(sc); // Drop impl on OpencodeServer sends SIGKILL
                 }
             }
         }
     }
-
 }
 
 /// Format a `catch_unwind` payload into a chat-friendly error message.
@@ -153,11 +154,7 @@ fn map_sidecar_error(err: SdkError, config: &OpencodeConfig, port: u16) -> anyho
         }
         SdkError::CLINotFound(ref cli) => {
             if let Some(ref p) = config.binary_path {
-                anyhow!(
-                    "opencode binary at {:?} not executable: {}",
-                    p,
-                    cli.message
-                )
+                anyhow!("opencode binary at {:?} not executable: {}", p, cli.message)
             } else {
                 anyhow!("opencode not on PATH")
             }
@@ -880,7 +877,12 @@ fn translate_tool_part(
             let input = state
                 .get("input")
                 .map(|v| truncate_json(v, 4096))
-                .or_else(|| state.get("title").and_then(|v| v.as_str()).map(String::from));
+                .or_else(|| {
+                    state
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                });
             let entry = accumulator.entry(call_id.clone()).or_default();
             entry.tool = tool_name;
             entry.input = input.clone();
@@ -894,19 +896,13 @@ fn translate_tool_part(
             } else {
                 partial.tool
             };
-            let input = partial.input.or_else(|| {
-                state
-                    .get("input")
-                    .map(|v| truncate_json(v, 4096))
-            });
+            let input = partial
+                .input
+                .or_else(|| state.get("input").map(|v| truncate_json(v, 4096)));
             let output = state
                 .get("output")
                 .map(|v| truncate_json(v, 4096))
-                .or_else(|| {
-                    state
-                        .get("result")
-                        .map(|v| truncate_json(v, 4096))
-                });
+                .or_else(|| state.get("result").map(|v| truncate_json(v, 4096)));
             let desc = if partial.description.is_empty() {
                 describe_tool_input(&tool, state)
             } else {
@@ -988,11 +984,7 @@ fn emit_started(ambient_tx: &Option<broadcast::Sender<AmbientEvent>>, session_id
     }
 }
 
-fn emit_finish(
-    ambient_tx: &Option<broadcast::Sender<AmbientEvent>>,
-    run_id: &str,
-    status: &str,
-) {
+fn emit_finish(ambient_tx: &Option<broadcast::Sender<AmbientEvent>>, run_id: &str, status: &str) {
     if let Some(ref tx) = ambient_tx {
         let _ = tx.send(AmbientEvent::HarnessFinished {
             harness: HarnessKind::Opencode.name().to_string(),
@@ -1066,7 +1058,11 @@ mod tests {
         let mut acc: HashMap<String, PartialToolPart> = HashMap::new();
 
         // Running: should accumulate, emit nothing.
-        let out = translate_event("message.part.updated", &running_event("c1", "Bash", "ls"), &mut acc);
+        let out = translate_event(
+            "message.part.updated",
+            &running_event("c1", "Bash", "ls"),
+            &mut acc,
+        );
         assert!(out.is_none() || out.as_ref().map(|v| v.is_empty()).unwrap_or(true));
         assert_eq!(acc.len(), 1, "running should accumulate one entry");
 
@@ -1098,7 +1094,11 @@ mod tests {
     fn accumulator_running_then_error_emits_with_no_output() {
         let mut acc: HashMap<String, PartialToolPart> = HashMap::new();
 
-        let _ = translate_event("message.part.updated", &running_event("c2", "Read", "/x"), &mut acc);
+        let _ = translate_event(
+            "message.part.updated",
+            &running_event("c2", "Read", "/x"),
+            &mut acc,
+        );
         let out = translate_event(
             "message.part.updated",
             &error_event("c2", "Read", "/x", "permission denied"),
@@ -1240,7 +1240,11 @@ mod tests {
         // Both events must have arrived on the subscriber.
         let ev1 = rx.try_recv().expect("HarnessStarted must be received");
         match ev1 {
-            AmbientEvent::HarnessStarted { ref harness, ref run_id, .. } => {
+            AmbientEvent::HarnessStarted {
+                ref harness,
+                ref run_id,
+                ..
+            } => {
                 assert_eq!(harness, "OpenCode");
                 assert_eq!(run_id, session_id);
             }
@@ -1249,7 +1253,11 @@ mod tests {
 
         let ev2 = rx.try_recv().expect("HarnessFinished must be received");
         match ev2 {
-            AmbientEvent::HarnessFinished { ref harness, ref run_id, ref status } => {
+            AmbientEvent::HarnessFinished {
+                ref harness,
+                ref run_id,
+                ref status,
+            } => {
                 assert_eq!(harness, "OpenCode");
                 assert_eq!(run_id, session_id);
                 assert_eq!(status, "ok");
@@ -1313,14 +1321,19 @@ mod tests {
         emit_started(&None, "sess_noop");
         // Some bus: must send exactly one event, proving the channel works.
         emit_started(&Some(tx), "sess_with_bus");
-        let ev = rx.try_recv().expect("Some-bus call must deliver exactly one event");
+        let ev = rx
+            .try_recv()
+            .expect("Some-bus call must deliver exactly one event");
         match ev {
             AmbientEvent::HarnessStarted { ref run_id, .. } => {
                 assert_eq!(run_id, "sess_with_bus");
             }
             other => panic!("wrong variant: {:?}", other),
         }
-        assert!(rx.try_recv().is_err(), "None-bus call must not have emitted anything");
+        assert!(
+            rx.try_recv().is_err(),
+            "None-bus call must not have emitted anything"
+        );
     }
 
     // ─── map_sidecar_error coverage (Fix C3-HIGH-1) ──────────────────────────
@@ -1376,13 +1389,18 @@ mod tests {
 
     #[test]
     fn map_error_io_addr_in_use_includes_port() {
-        let err =
-            SdkError::Io(std::io::Error::new(std::io::ErrorKind::AddrInUse, "addr in use"));
+        let err = SdkError::Io(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "addr in use",
+        ));
         let mapped = map_sidecar_error(err, &OpencodeConfig::default(), 4099);
         let msg = format!("{:#}", mapped);
         assert_eq!(
             msg,
-            format!("127.0.0.1:{} in use, check for another opencode instance", 4099)
+            format!(
+                "127.0.0.1:{} in use, check for another opencode instance",
+                4099
+            )
         );
     }
 
@@ -1407,8 +1425,11 @@ mod tests {
         let mut acc: HashMap<String, PartialToolPart> = HashMap::new();
 
         // Running c1 and c2 — no emissions, two accumulator entries.
-        let out1 =
-            translate_event("message.part.updated", &running_event("c1", "Bash", "ls"), &mut acc);
+        let out1 = translate_event(
+            "message.part.updated",
+            &running_event("c1", "Bash", "ls"),
+            &mut acc,
+        );
         assert!(out1.is_none() || out1.as_ref().unwrap().is_empty());
         let out2 = translate_event(
             "message.part.updated",
@@ -1460,7 +1481,10 @@ mod tests {
         assert_eq!(tool2, "Read");
         assert!(input2.as_deref().unwrap_or("").contains("/etc/hosts"));
         assert!(output2.as_deref().unwrap_or("").contains("127.0.0.1"));
-        assert!(acc.is_empty(), "accumulator must drain after last completed");
+        assert!(
+            acc.is_empty(),
+            "accumulator must drain after last completed"
+        );
 
         // Cross-talk guard — the two emissions must be genuinely distinct.
         assert_ne!(tool1, tool2);
@@ -1515,7 +1539,12 @@ mod tests {
         .expect("second completed must emit (current stateless-emit behavior)");
         assert_eq!(out.len(), 1, "must emit exactly one ToolUse");
         match &out[0] {
-            TranslatedEvent::ToolUse { tool, input, output, .. } => {
+            TranslatedEvent::ToolUse {
+                tool,
+                input,
+                output,
+                ..
+            } => {
                 // Tool name falls back to the event payload's value.
                 assert_eq!(tool, "Bash");
                 // Input and output are copied from the event state.
@@ -1530,7 +1559,10 @@ mod tests {
             }
             other => panic!("expected ToolUse, got {:?}", other),
         }
-        assert!(acc.is_empty(), "second completed must leave accumulator empty");
+        assert!(
+            acc.is_empty(),
+            "second completed must leave accumulator empty"
+        );
     }
 
     // ─── Arc<OpencodeHarness> forwarding (Fix C3-MEDIUM-6) ──────────────────
@@ -1545,7 +1577,10 @@ mod tests {
         let h: Arc<OpencodeHarness> = Arc::new(inner);
 
         // kind() forwards.
-        assert_eq!(<Arc<OpencodeHarness> as Harness>::kind(&h), HarnessKind::Opencode);
+        assert_eq!(
+            <Arc<OpencodeHarness> as Harness>::kind(&h),
+            HarnessKind::Opencode
+        );
         // supports_resume forwards.
         assert_eq!(
             <Arc<OpencodeHarness> as Harness>::supports_resume(&h),
@@ -1553,11 +1588,7 @@ mod tests {
         );
 
         // set via Arc → read via inner.
-        <Arc<OpencodeHarness> as Harness>::set_session_id(
-            &h,
-            "alpha",
-            "sess_alpha".to_string(),
-        );
+        <Arc<OpencodeHarness> as Harness>::set_session_id(&h, "alpha", "sess_alpha".to_string());
         assert_eq!(
             (*h).get_session_id("alpha"),
             Some("sess_alpha".to_string()),

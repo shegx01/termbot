@@ -610,9 +610,18 @@ mod tests {
 
     #[test]
     fn harness_kind_from_str_opencode_returns_opencode() {
-        assert_eq!(HarnessKind::from_str("opencode"), Some(HarnessKind::Opencode));
-        assert_eq!(HarnessKind::from_str("OpenCode"), Some(HarnessKind::Opencode));
-        assert_eq!(HarnessKind::from_str("OPENCODE"), Some(HarnessKind::Opencode));
+        assert_eq!(
+            HarnessKind::from_str("opencode"),
+            Some(HarnessKind::Opencode)
+        );
+        assert_eq!(
+            HarnessKind::from_str("OpenCode"),
+            Some(HarnessKind::Opencode)
+        );
+        assert_eq!(
+            HarnessKind::from_str("OPENCODE"),
+            Some(HarnessKind::Opencode)
+        );
     }
 
     #[test]
@@ -675,7 +684,10 @@ mod tests {
         let result = format_tool_event_full("Bash", "ignored", Some("ls -la"), Some("total 42"));
         assert!(result.contains("ls -la"), "expected input preview");
         assert!(result.contains("total 42"), "expected output preview");
-        assert!(!result.contains("ignored"), "description should be ignored when structured fields present");
+        assert!(
+            !result.contains("ignored"),
+            "description should be ignored when structured fields present"
+        );
     }
 
     #[test]

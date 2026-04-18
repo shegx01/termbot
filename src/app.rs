@@ -132,11 +132,7 @@ impl App {
         let (ambient_tx, _) = broadcast::channel::<AmbientEvent>(512);
 
         // Build the opencode harness with the ambient bus.
-        let opencode_cfg = config
-            .harness
-            .opencode
-            .clone()
-            .unwrap_or_default();
+        let opencode_cfg = config.harness.opencode.clone().unwrap_or_default();
         let opencode = Arc::new(OpencodeHarness::new(opencode_cfg, ambient_tx.clone()));
         harnesses.insert(
             HarnessKind::Opencode,
@@ -1235,11 +1231,7 @@ impl App {
     ///
     // TODO: remove legacy fallback — trigger: next minor release OR state-file
     // shows zero unprefixed keys for 14 consecutive days, whichever first.
-    fn lookup_named_session(
-        &self,
-        kind: HarnessKind,
-        name: &str,
-    ) -> Option<&NamedSessionEntry> {
+    fn lookup_named_session(&self, kind: HarnessKind, name: &str) -> Option<&NamedSessionEntry> {
         let prefixed = build_session_key(kind, name);
         self.named_harness_sessions
             .get(&prefixed)
@@ -2247,7 +2239,8 @@ patterns = []
             last_used: Utc::now(),
         };
         app.named_harness_sessions.insert("auth".into(), legacy);
-        app.named_harness_sessions.insert("claude:auth".into(), prefixed_entry);
+        app.named_harness_sessions
+            .insert("claude:auth".into(), prefixed_entry);
 
         let found = app.lookup_named_session(HarnessKind::Claude, "auth");
         assert!(found.is_some());

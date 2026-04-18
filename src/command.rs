@@ -2135,7 +2135,11 @@ mod tests {
     fn parse_opencode_bare_prompt() {
         let cmd = ParsedCommand::parse(": opencode write a haiku", ':').unwrap();
         match cmd {
-            ParsedCommand::HarnessPrompt { harness, prompt, options } => {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                prompt,
+                options,
+            } => {
                 assert_eq!(harness, HarnessKind::Opencode);
                 assert_eq!(prompt, "write a haiku");
                 assert!(options.name.is_none());
@@ -2148,7 +2152,11 @@ mod tests {
     fn parse_opencode_resume_flag() {
         let cmd = ParsedCommand::parse(": opencode --resume auth what did you do?", ':').unwrap();
         match cmd {
-            ParsedCommand::HarnessPrompt { harness, options, prompt } => {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
                 assert_eq!(harness, HarnessKind::Opencode);
                 assert_eq!(options.resume.as_deref(), Some("auth"));
                 assert_eq!(prompt, "what did you do?");
