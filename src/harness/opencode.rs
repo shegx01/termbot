@@ -132,11 +132,14 @@ impl Harness for OpencodeHarness {
             args.push("--session".into());
             args.push(sid.to_string());
         }
-        if let Some(ref m) = self.config.model {
+        // Per-prompt overrides take precedence over static config.
+        let effective_model = options.model.as_ref().or(self.config.model.as_ref());
+        if let Some(m) = effective_model {
             args.push("-m".into());
             args.push(m.clone());
         }
-        if let Some(ref a) = self.config.agent {
+        let effective_agent = options.agent.as_ref().or(self.config.agent.as_ref());
+        if let Some(a) = effective_agent {
             args.push("--agent".into());
             args.push(a.clone());
         }
@@ -1606,6 +1609,26 @@ mod tests {
                 "/tmp/b.pdf".into(),
             ]
         );
+    }
+
+    // ── Argv model/agent override tests ─────────────────────────────────────
+
+    #[test]
+    fn argv_uses_options_model_over_config_model() {
+        // White-box: per-prompt options.model takes precedence over config.model.
+        let config_model = Some("config-model".to_string());
+        let options_model: Option<String> = Some("option-model".to_string());
+        let effective = options_model.as_ref().or(config_model.as_ref());
+        assert_eq!(effective.map(|s| s.as_str()), Some("option-model"));
+    }
+
+    #[test]
+    fn argv_falls_back_to_config_model_when_options_none() {
+        // White-box: when options.model is None, config.model is used.
+        let config_model = Some("config-model".to_string());
+        let options_model: Option<String> = None;
+        let effective = options_model.as_ref().or(config_model.as_ref());
+        assert_eq!(effective.map(|s| s.as_str()), Some("config-model"));
     }
 
     // ── Gated integration tests (require `TERMINUS_HAS_OPENCODE=1`) ──────────

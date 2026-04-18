@@ -193,11 +193,12 @@ and `auth list` / `auth ls` ARE supported as safe read-only aliases.
 **Per-prompt flags** (`: opencode [flags] <prompt>`):
 - `--name <x>` / `--resume <x>` / `--continue <x>` — named session
 - `--continue` (no value, followed by another flag or end of flags) — continue opencode's last session (maps to `opencode run --continue`)
+- `--model <provider/model>` (alias: `-m`) — model override; overrides `[harness.opencode] model` when passed per-prompt
+- `--agent <name>` — agent override (e.g. "build" for tool-use); overrides `[harness.opencode] agent` when passed per-prompt
 - `--title <str>` — human-readable session title
 - `--share` — ask opencode for a shareable URL
 - `--pure` — run without external plugins
 - `--fork` — fork the session before continuing (requires `--continue` or `--resume`)
-- `-m <model>` / `--agent <name>` inherited as config only (not per-prompt yet)
 
 Subcommand output is wrapped in a fenced code block and truncated at 3000
 chars. For long outputs, run the CLI in your terminal.

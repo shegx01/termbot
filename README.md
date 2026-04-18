@@ -47,7 +47,7 @@ terminus gives you remote access to terminal sessions and AI harnesses from your
 | codex    |   stub   |    stub     |      stub      |      stub       |       stub        |    stub     |
 | gemini   |   stub   |    stub     |      stub      |      stub       |       stub        |    stub     |
 
-¹ Tool-use events are forwarded when opencode emits them; tool-enabled agents (e.g. "build") emit tool_use JSON events, others may not
+¹ Tool-use events are forwarded when opencode emits them; tool-enabled agents (e.g. "build") emit tool_use JSON events, others may not. Set `agent = "build"` in `[harness.opencode]` config or pass `--agent build` per-prompt
 ² Opencode CLI has no schema-constrained output surface -- use the claude harness for `--schema` workflows
 
 ---

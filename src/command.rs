@@ -58,6 +58,8 @@ pub struct HarnessOptions {
     pub name: Option<String>,
     /// Strict resume of a named session (--resume / --continue).
     pub resume: Option<String>,
+    /// Opencode-only: override the agent (`--agent <name>`). e.g., "build" to enable tool-use.
+    pub agent: Option<String>,
     /// Human-readable session title (opencode `--title`).
     pub title: Option<String>,
     /// Share flag — opencode generates a share URL for the session.
@@ -86,6 +88,7 @@ impl HarnessOptions {
             && self.schema.is_none()
             && self.name.is_none()
             && self.resume.is_none()
+            && self.agent.is_none()
             && self.title.is_none()
             && !self.share
             && !self.pure
@@ -135,6 +138,9 @@ impl HarnessOptions {
         }
         if let Some(ref r) = self.resume {
             parts.push(format!("resume={}", r));
+        }
+        if let Some(ref a) = self.agent {
+            parts.push(format!("agent={}", a));
         }
         if let Some(ref t) = self.title {
             parts.push(format!("title={}", t));
@@ -725,6 +731,10 @@ fn parse_harness_options_tokens(
                 let val = get_value!();
                 opts.title = Some(val);
             }
+            "--agent" => {
+                let val = get_value!();
+                opts.agent = Some(val);
+            }
             "--share" => {
                 opts.share = true;
             }
@@ -744,7 +754,7 @@ fn parse_harness_options_tokens(
                     )));
                 }
                 return Err(ParseError::InvalidHarnessOption(format!(
-                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema, --name, --resume, --continue, --title, --share, --pure, --fork",
+                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema, --name, --resume, --continue, --agent, --title, --share, --pure, --fork",
                     other
                 )));
             }
@@ -2896,5 +2906,106 @@ mod tests {
                 args: vec!["\u{2013}provider".into(), "openrouter".into()],
             }
         );
+    }
+
+    // ── --model / --agent per-prompt flag tests ──────────────────────────────
+
+    #[test]
+    fn parse_opencode_model_flag_per_prompt() {
+        let cmd =
+            ParsedCommand::parse(": opencode --model ollama-cloud/glm-5.1 say hi", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                prompt,
+                options,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.model.as_deref(), Some("ollama-cloud/glm-5.1"));
+                assert_eq!(prompt, "say hi");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_agent_flag_per_prompt() {
+        let cmd = ParsedCommand::parse(": opencode --agent build run bash ls", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                prompt,
+                options,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.agent.as_deref(), Some("build"));
+                assert_eq!(prompt, "run bash ls");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_on_with_model_flag() {
+        let cmd = ParsedCommand::parse(": opencode on --model ollama-cloud/glm-5.1", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                harness,
+                options,
+                initial_prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.model.as_deref(), Some("ollama-cloud/glm-5.1"));
+                assert!(initial_prompt.is_none());
+            }
+            other => panic!("expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_on_with_agent_flag() {
+        let cmd = ParsedCommand::parse(": opencode on --agent build", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                harness, options, ..
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.agent.as_deref(), Some("build"));
+            }
+            other => panic!("expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_model_and_agent_combined() {
+        let cmd = ParsedCommand::parse(": opencode --model foo --agent bar do it", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.model.as_deref(), Some("foo"));
+                assert_eq!(options.agent.as_deref(), Some("bar"));
+                assert_eq!(prompt, "do it");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn harness_options_is_empty_false_when_agent_set() {
+        let opts = HarnessOptions {
+            agent: Some("build".into()),
+            ..Default::default()
+        };
+        assert!(!opts.is_empty());
+    }
+
+    #[test]
+    fn harness_options_summary_includes_agent() {
+        let opts = HarnessOptions {
+            agent: Some("build".into()),
+            ..Default::default()
+        };
+        assert_eq!(opts.summary(), "agent=build");
     }
 }

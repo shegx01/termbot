@@ -79,7 +79,9 @@ stayawake_on_battery = false
 # [harness.opencode]
 # binary_path = "/usr/local/bin/opencode"   # default: resolved via PATH
 # model = "openrouter/anthropic/claude-haiku-4-5"  # default: opencode's own default
+#                                           # can also override per-prompt with --model / -m
 # agent = "build"                           # default: opencode's own default
+#                                           # can also override per-prompt with --agent
 
 # ---------------------------------------------------------------------------
 # Structured Output (--schema)
