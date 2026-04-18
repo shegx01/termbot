@@ -143,13 +143,40 @@ Uses `claude-agent-sdk-rust` crate, not terminal scraping. Claude prompts spawn 
 - Session names follow the same rules as terminal session names (alphanumeric, hyphens, underscores, max 64 chars).
 - Both flags work in one-shot (`: claude --name auth fix bug`) and interactive (`: claude on --name auth`) modes.
 - `--name` and `--resume` are mutually exclusive.
-- Only works with harnesses that support resume (currently Claude only).
+- Only works with harnesses that support resume (Claude and opencode).
 
 **Session persistence:** Named sessions persist across restarts. The session index (name -> session_id + working directory) is stored in `terminus-state.json` via StateStore. The Claude SDK persists conversation state in `.claude/`. On resume, the stored working directory is passed to the SDK.
 
 **LRU eviction:** Named sessions are capped at `max_named_sessions` (default 50, configurable in `[harness]` section of `terminus.toml`). When the cap is reached, the least-recently-used session is evicted.
 
 **Breaking change:** The `-n` short flag was reassigned from `--max-turns` to `--name`. Use `-t` for `--max-turns` instead.
+
+### opencode integration
+
+Uses the `opencode` CLI directly — each prompt spawns `opencode run --format json`
+as a short-lived child process with `kill_on_drop(true)`. Mirrors the
+`claude-agent-sdk-rust` subprocess pattern, NOT an HTTP sidecar.
+
+- Config is inherited from opencode's own config (model, agent, provider, auth).
+- Session resume uses `--session <ses_id>`. Terminus captures the first
+  `sessionID` it sees on stdout and persists the name → id mapping under a
+  prefixed key `opencode:<name>` in `terminus-state.json`.
+- Ambient events: `HarnessStarted` / `HarnessFinished` at prompt boundaries.
+- Tool-use event translation is deferred; the `HarnessEvent::ToolUse` variant
+  carries optional `input`/`output` fields ready for the follow-up PR that
+  adds the event type.
+- No persistent sidecar, no port binding, no shutdown hook needed.
+
+Optional `[harness.opencode]` overrides (see `terminus.example.toml`):
+- `binary_path`: override the opencode CLI location (default: resolved via PATH)
+- `model`: pass `-m <value>` to `opencode run` (default: opencode's own default)
+- `agent`: pass `--agent <value>` to `opencode run` (default: opencode's own default)
+
+**Known limitations:**
+- Cross-harness state-persist-failure (state file only persists one entry per
+  key; the `{kind}:{name}` prefix scheme prevents collisions between harnesses
+  but the underlying state-store write path is shared). Not opencode-specific.
+- Tool-use events are deferred to a follow-up PR.
 
 ### Platform adapters
 
@@ -223,6 +250,7 @@ envelope and drain pending requests within `shutdown_drain_secs`.
 
 - **Single-user only.** Auth checks are per-platform (telegram_user_id, slack_user_id, discord_user_id in config).
 - **tmux must be on PATH.** All session operations shell out to `tmux`.
+- **opencode must be on PATH** (or `binary_path` set in `[harness.opencode]`). The opencode harness shells out to the CLI.
 - **No shared mutable state.** The main loop owns all mutable state directly; platform adapters only send/receive through channels.
 - **Rate limiting is per-platform.** `edit_throttle_ms` config controls minimum gap between message edits to stay within Telegram/Slack API limits.
 - **Startup reconciliation.** On restart, surviving `term-*` tmux sessions are auto-reconnected. Chat binding is re-established on first user message (chat IDs are not persisted to disk).

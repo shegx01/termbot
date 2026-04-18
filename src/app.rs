@@ -14,7 +14,8 @@ use crate::command::{CommandBlocklist, HarnessOptions, ParsedCommand};
 use crate::config::Config;
 use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
-use crate::harness::{drive_harness, Harness, HarnessContext, HarnessKind};
+use crate::harness::opencode::OpencodeHarness;
+use crate::harness::{build_session_key, drive_harness, Harness, HarnessContext, HarnessKind};
 use crate::power::types::PowerSignal;
 use crate::session::{self, SessionManager};
 use crate::socket::events::AmbientEvent;
@@ -94,6 +95,10 @@ pub struct App {
     /// `mark_clean_shutdown` so the worker can check between-jobs and break out
     /// of an active drain loop without waiting for the next await point.
     retry_worker_shutdown_flag: Arc<AtomicBool>,
+    /// Opencode CLI-subprocess harness (kept as a typed Arc for direct access
+    /// alongside the type-erased entry in `harnesses`).
+    #[allow(dead_code)]
+    pub opencode: Arc<OpencodeHarness>,
 }
 
 impl App {
@@ -116,13 +121,20 @@ impl App {
         let retry_worker_shutdown = Arc::new(tokio::sync::Notify::new());
         let retry_worker_shutdown_flag = Arc::new(AtomicBool::new(false));
 
+        let (stream_tx, _) = broadcast::channel::<StreamEvent>(256);
+        let (ambient_tx, _) = broadcast::channel::<AmbientEvent>(512);
+
         let mut harnesses: HashMap<HarnessKind, Box<dyn Harness>> = HashMap::new();
         harnesses.insert(
             HarnessKind::Claude,
             Box::new(ClaudeHarness::new().with_schema_registry(Arc::clone(&schema_registry))),
         );
-        let (stream_tx, _) = broadcast::channel::<StreamEvent>(256);
-        let (ambient_tx, _) = broadcast::channel::<AmbientEvent>(512);
+        let opencode_cfg = config.harness.opencode.clone().unwrap_or_default();
+        let opencode = Arc::new(OpencodeHarness::new(opencode_cfg, ambient_tx.clone()));
+        harnesses.insert(
+            HarnessKind::Opencode,
+            Box::new(Arc::clone(&opencode)) as Box<dyn Harness>,
+        );
 
         // Hydrate active chat sets from persisted state.
         let snapshot = store.snapshot();
@@ -134,6 +146,16 @@ impl App {
         // knows whether the *previous* run exited cleanly.
         let startup_was_clean = snapshot.last_clean_shutdown;
         let named_harness_sessions = snapshot.harness_sessions.clone();
+        let legacy_count = named_harness_sessions
+            .keys()
+            .filter(|k| !k.contains(':'))
+            .count();
+        if legacy_count > 0 {
+            tracing::info!(
+                legacy_keys = legacy_count,
+                "unprefixed legacy named-session keys remaining"
+            );
+        }
 
         let mut app = Self {
             blocklist,
@@ -165,6 +187,7 @@ impl App {
             ambient_tx,
             retry_worker_shutdown: Arc::clone(&retry_worker_shutdown),
             retry_worker_shutdown_flag: Arc::clone(&retry_worker_shutdown_flag),
+            opencode,
         };
 
         // Immediately mark state dirty in memory (sets last_clean_shutdown=false)
@@ -875,7 +898,7 @@ impl App {
                 // a subsequent `--resume foo`.
                 let mut named_notification: Option<String> = None;
                 if let Some(ref resume_name) = options.resume {
-                    match self.named_harness_sessions.get(resume_name) {
+                    match self.lookup_named_session(kind, resume_name) {
                         Some(entry) if !entry.session_id.is_empty() => {
                             named_notification =
                                 Some(format!("Resuming session '{}'", resume_name));
@@ -894,8 +917,7 @@ impl App {
                     }
                 } else if let Some(ref name) = options.name {
                     let is_resumable = self
-                        .named_harness_sessions
-                        .get(name)
+                        .lookup_named_session(kind, name)
                         .is_some_and(|e| !e.session_id.is_empty());
                     let primary = if is_resumable {
                         format!("Resuming existing session '{}'", name)
@@ -1202,6 +1224,22 @@ impl App {
         self.session_mgr.interrupt_foreground().await
     }
 
+    /// Look up a named session by harness kind + name.
+    ///
+    /// Tries the prefixed key `{kind}:{name}` first (new format), then falls
+    /// back to the bare `name` for legacy unprefixed keys that pre-date the
+    /// cross-harness isolation scheme.
+    ///
+    /// TODO: remove legacy fallback once state-file shows zero unprefixed keys
+    /// for 14 consecutive days (tracked in
+    /// .omc/plans/opencode-harness-followups.md).
+    fn lookup_named_session(&self, kind: HarnessKind, name: &str) -> Option<&NamedSessionEntry> {
+        let prefixed = build_session_key(kind, name);
+        self.named_harness_sessions
+            .get(&prefixed)
+            .or_else(|| self.named_harness_sessions.get(name))
+    }
+
     /// Evict the least-recently-used named session, returning its name.
     fn evict_lru_session(&mut self) -> Option<String> {
         let oldest = self
@@ -1267,7 +1305,7 @@ impl App {
 
         if let Some(ref resume_name) = options.resume {
             // --resume: strict lookup, error if not found (or has no session_id yet)
-            match self.named_harness_sessions.get(resume_name) {
+            match self.lookup_named_session(*kind, resume_name) {
                 Some(entry) if !entry.session_id.is_empty() => {
                     session_name = resume_name.clone();
                     resume_id = Some(entry.session_id.clone());
@@ -1289,8 +1327,7 @@ impl App {
         } else if let Some(ref name) = options.name {
             // --name: create-or-resume (upsert)
             if let Some(entry) = self
-                .named_harness_sessions
-                .get(name)
+                .lookup_named_session(*kind, name)
                 .filter(|e| !e.session_id.is_empty())
             {
                 session_name = name.clone();
@@ -1379,13 +1416,14 @@ impl App {
                 });
 
                 if using_named_session {
+                    // Use a prefixed key for cross-harness isolation.
+                    let prefixed_key = build_session_key(*kind, &session_name);
                     // Prefer the session_id returned from this run; otherwise
                     // fall back to the existing entry's id so that a zero-output
                     // resume still refreshes `last_used` (prevents the session
                     // from becoming a stale eviction target).
                     let effective_sid = session_id.or_else(|| {
-                        self.named_harness_sessions
-                            .get(&session_name)
+                        self.lookup_named_session(*kind, &session_name)
                             .map(|e| e.session_id.clone())
                             .filter(|s| !s.is_empty())
                     });
@@ -1398,7 +1436,7 @@ impl App {
 
                         // Evict LRU if at cap (before inserting, in case this is a new name)
                         let mut batch_ops: Vec<(String, Option<NamedSessionEntry>)> = Vec::new();
-                        if !self.named_harness_sessions.contains_key(&session_name)
+                        if !self.named_harness_sessions.contains_key(&prefixed_key)
                             && self.named_harness_sessions.len() >= self.max_named_sessions
                         {
                             if let Some(evicted) = self.evict_lru_session() {
@@ -1406,8 +1444,8 @@ impl App {
                             }
                         }
                         self.named_harness_sessions
-                            .insert(session_name.clone(), entry.clone());
-                        batch_ops.push((session_name, Some(entry)));
+                            .insert(prefixed_key.clone(), entry.clone());
+                        batch_ops.push((prefixed_key, Some(entry)));
 
                         // Atomic persist
                         if let Err(e) = self

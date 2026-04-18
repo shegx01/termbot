@@ -212,6 +212,27 @@ fn default_queue_dir() -> PathBuf {
 pub struct HarnessConfig {
     /// Maximum named harness sessions before LRU eviction (default: 50).
     pub max_named_sessions: Option<usize>,
+    /// Opencode CLI-subprocess harness configuration.  Optional — when absent,
+    /// the harness resolves `opencode` from PATH and inherits the user's own
+    /// CLI config (default model, agent, provider, auth).
+    #[serde(default)]
+    pub opencode: Option<OpencodeConfig>,
+}
+
+/// Configuration for the Opencode CLI-subprocess harness.
+///
+/// All fields are optional. When a field is `None`, the corresponding CLI flag
+/// is omitted from `opencode run ...` and the binary falls back to the user's
+/// own opencode config defaults (from `~/.config/opencode` etc).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OpencodeConfig {
+    /// Override path to the `opencode` binary. When `None`, resolves via PATH.
+    pub binary_path: Option<PathBuf>,
+    /// Optional model override in `provider/model` format
+    /// (e.g. `"openrouter/anthropic/claude-haiku-4-5"`). Passed via `-m`.
+    pub model: Option<String>,
+    /// Optional agent override (e.g. `"build"`). Passed via `--agent`.
+    pub agent: Option<String>,
 }
 
 impl Default for StructuredOutputConfig {

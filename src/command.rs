@@ -2109,4 +2109,90 @@ mod tests {
         };
         assert!(!opts.is_empty());
     }
+
+    // ── opencode parser tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_opencode_bare_prompt() {
+        let cmd = ParsedCommand::parse(": opencode hi there", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessPrompt {
+                harness: HarnessKind::Opencode,
+                prompt: "hi there".into(),
+                options: HarnessOptions::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_name_and_prompt() {
+        let cmd = ParsedCommand::parse(": opencode --name auth fix the login bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.name, Some("auth".into()));
+                assert!(options.resume.is_none());
+                assert_eq!(prompt, "fix the login bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_resume_and_prompt() {
+        let cmd = ParsedCommand::parse(": opencode --resume auth status?", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.resume, Some("auth".into()));
+                assert!(options.name.is_none());
+                assert_eq!(prompt, "status?");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_name_without_prompt() {
+        let cmd = ParsedCommand::parse(": opencode on --name auth", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                harness,
+                options,
+                initial_prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.name, Some("auth".into()));
+                assert!(initial_prompt.is_none());
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_on_toggle() {
+        let cmd = ParsedCommand::parse(": opencode on --name session1", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn { harness, .. } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_mutual_exclusion_rejected() {
+        let err = ParsedCommand::parse(": opencode --name foo --resume bar hi", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("Cannot use both"));
+    }
 }

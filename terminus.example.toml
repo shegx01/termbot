@@ -69,6 +69,19 @@ stayawake_on_battery = false
 # max_named_sessions = 50
 
 # ---------------------------------------------------------------------------
+# opencode CLI harness overrides
+# ---------------------------------------------------------------------------
+# Optional: override opencode CLI settings for the opencode harness.
+# If this entire block is omitted, terminus uses opencode's own CLI defaults
+# (config, auth, default model). The opencode binary must be on PATH unless
+# binary_path is explicitly set.
+#
+# [harness.opencode]
+# binary_path = "/usr/local/bin/opencode"   # default: resolved via PATH
+# model = "openrouter/anthropic/claude-haiku-4-5"  # default: opencode's own default
+# agent = "build"                           # default: opencode's own default
+
+# ---------------------------------------------------------------------------
 # Structured Output (--schema)
 # ---------------------------------------------------------------------------
 # Named JSON schemas for `: harness --schema <name> <prompt>` commands.
