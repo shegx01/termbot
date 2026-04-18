@@ -263,3 +263,22 @@ Run with: `cargo test`
 
 Integration tests (e.g. opencode end-to-end) are gated by `#[ignore]` + env
 vars. See `docs/integration-tests.md` for how to run them.
+
+## Agent orchestration
+
+When delegating work to subagents (via the `Task` / `Agent` tool), **always use
+`sonnet` or `haiku` — not `opus`** unless the task genuinely requires deep
+architectural reasoning that smaller models demonstrably cannot handle. Pick
+the model by scope:
+
+- **`haiku`**: lookups, single-file edits, small bug fixes, doc tweaks,
+  grep-and-report tasks
+- **`sonnet`** (default): multi-file refactors, feature implementations,
+  test suites, plan execution, integration work
+- **`opus`**: reserved for genuinely hard problems — cross-system architecture
+  reviews, deep debugging of subtle concurrency bugs, consensus-mode
+  Planner/Architect/Critic passes. Flag in your prompt why opus is warranted.
+
+Opus is expensive and rate-limited; defaulting to sonnet/haiku keeps cycles
+available for the cases that truly need them. If you're unsure, start with
+sonnet and escalate only if the output is insufficient.
