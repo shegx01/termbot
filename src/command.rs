@@ -224,12 +224,16 @@ pub enum ParseError {
 
 const MAX_SESSION_NAME_LEN: usize = 64;
 
-/// Replace em-dash (—, U+2014) and en-dash (–, U+2013) with `--`.
+/// Replace em-dash (—, U+2014) with `--`.
 /// Mobile keyboards (iOS autocorrect) frequently convert `--` to `—`, which
 /// breaks flag parsing. Applying this normalization before tokenizing restores
 /// the intended flag form.
+///
+/// En-dash (–, U+2013) is intentionally NOT normalized — it appears in
+/// legitimate prose (e.g. date ranges) and is preserved per the convention
+/// established by `tmux.rs::normalize_quotes`.
 fn normalize_em_dash(s: &str) -> String {
-    s.replace(['\u{2014}', '\u{2013}'], "--")
+    s.replace('—', "--") // U+2014 only
 }
 
 fn validate_session_name(name: &str) -> std::result::Result<(), ParseError> {
@@ -299,7 +303,14 @@ impl ParsedCommand {
             // Bare `: claude` (no on/off/prompt) falls through to ShellCommand
             let first_word = rest.split_whitespace().next().unwrap_or("");
             if let Some(kind) = HarnessKind::from_str(first_word) {
-                let after_harness = rest[first_word.len()..].trim();
+                // Normalize em-dash (U+2014 → --) once at the top of the harness
+                // dispatch block, before any on/off/subcommand/prompt branching.
+                // This ensures mobile users typing `—name foo` get `--name foo`
+                // regardless of which path (HarnessOn, HarnessPrompt, subcommand)
+                // they end up on.
+                let after_harness_raw = rest[first_word.len()..].trim();
+                let after_harness_owned = normalize_em_dash(after_harness_raw);
+                let after_harness = after_harness_owned.as_str();
                 if after_harness == "on" {
                     return Ok(ParsedCommand::HarnessOn {
                         harness: kind,
@@ -346,11 +357,9 @@ impl ParsedCommand {
                 // Opencode-only: raw CLI subcommand passthrough (models, stats, sessions,
                 // providers, export) and a destructive-command blocklist. Other harnesses
                 // fall straight through to prompt parsing.
+                // Em-dash normalization already applied above (after_harness is normalized).
                 if kind == HarnessKind::Opencode && !after_harness.is_empty() {
-                    // Normalize em-dashes (— / –) to -- so mobile keyboards don't break
-                    // subcommand flag args like `stats —days 1` → `stats --days 1`.
-                    let normalized_after = normalize_em_dash(after_harness);
-                    let mut subword_iter = normalized_after.split_whitespace().peekable();
+                    let mut subword_iter = after_harness.split_whitespace().peekable();
                     let first = subword_iter.next().unwrap_or("");
                     let second = subword_iter.peek().copied().unwrap_or("");
 
@@ -2101,6 +2110,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_em_dashed_name_one_shot_harness_prompt() {
+        // Fix 1.2: em-dash normalization must apply on the HarnessPrompt path too.
+        // `: claude —name foo hi` should parse to HarnessPrompt with name=Some("foo"),
+        // prompt="hi" (not treat —name as prompt text).
+        let cmd = ParsedCommand::parse(": claude \u{2014}name foo hi", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Claude);
+                assert_eq!(options.name, Some("foo".into()));
+                assert_eq!(prompt, "hi");
+            }
+            other => panic!("Expected HarnessPrompt with name=foo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn en_dash_in_opencode_subcommand_is_not_normalized() {
+        // Fix 1.7: en-dash (U+2013) is intentionally preserved per the convention
+        // in tmux.rs::normalize_quotes. `: opencode stats –days 1` with an en-dash
+        // should pass `–days` through as an arg unchanged (not `--days`).
+        let cmd = ParsedCommand::parse(": opencode stats \u{2013}days 1", ':').unwrap();
+        // `stats` is recognized as a subcommand keyword; `–days` (en-dash) is passed
+        // through as an arg, NOT normalized to `--days`.
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Stats,
+                args: vec!["\u{2013}days".into(), "1".into()],
+            }
+        );
+    }
+
     // ── HarnessOn with trailing initial prompt ───────────────────────────────
 
     #[test]
@@ -2750,7 +2797,9 @@ mod tests {
 
     #[test]
     fn parse_opencode_models_em_dash_flag_normalized() {
-        // En-dash variant (–) should also normalize to --.
+        // Fix 1.7: Only em-dash (U+2014) is normalized to `--`. En-dash (U+2013)
+        // is intentionally preserved. `: opencode models –provider openrouter`
+        // passes `–provider` through as-is (not normalized to `--provider`).
         let cmd =
             ParsedCommand::parse(": opencode models \u{2013}provider openrouter", ':').unwrap();
         assert_eq!(
@@ -2758,7 +2807,7 @@ mod tests {
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
                 subcommand: OpencodeSubcommand::Models,
-                args: vec!["--provider".into(), "openrouter".into()],
+                args: vec!["\u{2013}provider".into(), "openrouter".into()],
             }
         );
     }

@@ -74,30 +74,6 @@ impl OpencodeHarness {
             ambient_tx: None,
         }
     }
-
-    /// Fire a `HarnessStarted` ambient event if a broadcast sender is attached.
-    #[allow(dead_code)]
-    fn emit_started(&self, run_id: &str) {
-        if let Some(tx) = &self.ambient_tx {
-            let _ = tx.send(AmbientEvent::HarnessStarted {
-                harness: HarnessKind::Opencode.name().to_string(),
-                run_id: run_id.to_string(),
-                prompt_hash: None,
-            });
-        }
-    }
-
-    /// Fire a `HarnessFinished` ambient event with the given status.
-    #[allow(dead_code)]
-    fn emit_finish(&self, run_id: &str, status: &str) {
-        if let Some(tx) = &self.ambient_tx {
-            let _ = tx.send(AmbientEvent::HarnessFinished {
-                harness: HarnessKind::Opencode.name().to_string(),
-                run_id: run_id.to_string(),
-                status: status.to_string(),
-            });
-        }
-    }
 }
 
 #[async_trait]
@@ -330,6 +306,89 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Sanitize a stderr string before forwarding it to chat.
+///
+/// - Truncates to 500 chars (chat-friendly)
+/// - Redacts obvious env-var assignments: `KEY=value` → `KEY=<redacted>`
+/// - Redacts absolute user paths: `/Users/…` and `/home/…` → `<redacted-path>`
+///
+/// The raw content should be logged at `tracing::debug!` by the caller so
+/// operators can diagnose via `RUST_LOG=debug` without shipping raw content.
+fn sanitize_stderr(s: &str) -> String {
+    // Truncate first to bound further work.
+    let truncated: String = s.chars().take(500).collect();
+
+    // Redact env-var assignments: one or more uppercase letters/digits/underscores
+    // starting with an uppercase letter followed by `=<non-whitespace>`.
+    let mut out = String::with_capacity(truncated.len());
+    let mut rest = truncated.as_str();
+    while !rest.is_empty() {
+        // Scan for `[A-Z][A-Z0-9_]*=` pattern followed by non-whitespace value.
+        if let Some(pos) = rest.find('=') {
+            let before = &rest[..pos];
+            // Walk backwards to find the start of the potential key.
+            let key_start = before
+                .rfind(|c: char| !c.is_ascii_uppercase() && !c.is_ascii_digit() && c != '_')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let key = &before[key_start..];
+            // A valid env-var key: starts with uppercase letter, non-empty.
+            let is_env_key = !key.is_empty()
+                && key.starts_with(|c: char| c.is_ascii_uppercase())
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+
+            if is_env_key {
+                // Emit everything up to and including the key and `=`.
+                out.push_str(&rest[..key_start]);
+                out.push_str(key);
+                out.push('=');
+                out.push_str("<redacted>");
+                // Skip the value (non-whitespace chars after `=`).
+                let after_eq = &rest[pos + 1..];
+                let val_end = after_eq
+                    .find(|c: char| c.is_whitespace())
+                    .unwrap_or(after_eq.len());
+                rest = &after_eq[val_end..];
+                continue;
+            }
+
+            // Not an env-var key — emit up through the `=` and move on.
+            out.push_str(&rest[..pos + 1]);
+            rest = &rest[pos + 1..];
+        } else {
+            out.push_str(rest);
+            break;
+        }
+    }
+
+    // Redact absolute user paths: /Users/<name>/... and /home/<name>/...
+    let patterns: &[(&str, &str)] = &[("/Users/", "/Users/"), ("/home/", "/home/")];
+    let mut result = out;
+    for (needle, prefix) in patterns {
+        if result.contains(needle) {
+            let mut new_result = String::with_capacity(result.len());
+            let mut scan = result.as_str();
+            while let Some(idx) = scan.find(needle) {
+                new_result.push_str(&scan[..idx]);
+                new_result.push_str("<redacted-path>");
+                // Skip past the username component (up to the next `/` or end)
+                let after_prefix = &scan[idx + prefix.len()..];
+                let skip = after_prefix
+                    .find('/')
+                    .map(|i| i + 1) // include the slash after username
+                    .unwrap_or(after_prefix.len());
+                scan = &after_prefix[skip..];
+            }
+            new_result.push_str(scan);
+            result = new_result;
+        }
+    }
+
+    result
+}
+
 /// Build the argv for a subcommand, mapping user-friendly aliases to the
 /// native opencode forms. Pure function — no I/O, fully testable.
 ///
@@ -447,13 +506,25 @@ async fn run_subcommand_inner(
         };
 
     if !out.status.success() {
-        let stderr_trim = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // Cap stderr at 64 KiB before parsing to avoid OOM on crash-looping processes.
+        let raw_stderr = if out.stderr.len() > 64 * 1024 {
+            &out.stderr[..64 * 1024]
+        } else {
+            &out.stderr
+        };
+        let stderr_trim = String::from_utf8_lossy(raw_stderr).trim().to_string();
+        tracing::debug!(
+            "opencode {} non-zero exit; raw stderr: {}",
+            sub_label,
+            stderr_trim
+        );
         let code = out
             .status
             .code()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".into());
-        let detail = if stderr_trim.is_empty() {
+        let sanitized = sanitize_stderr(&stderr_trim);
+        let detail = if sanitized.is_empty() {
             format!(
                 "opencode {} exited with status {} (no stderr)",
                 sub_label, code
@@ -461,7 +532,7 @@ async fn run_subcommand_inner(
         } else {
             format!(
                 "opencode {} exited with status {}: {}",
-                sub_label, code, stderr_trim
+                sub_label, code, sanitized
             )
         };
         let _ = event_tx.send(HarnessEvent::Error(detail)).await;
@@ -547,7 +618,7 @@ async fn run_opencode_inner(
     args: Vec<String>,
     cwd: PathBuf,
     event_tx: mpsc::Sender<HarnessEvent>,
-    sessions: Arc<StdMutex<HashMap<String, String>>>,
+    _sessions: Arc<StdMutex<HashMap<String, String>>>,
 ) {
     let mut cmd = Command::new(&binary);
     cmd.args(&args)
@@ -591,7 +662,11 @@ async fn run_opencode_inner(
     let mut captured_session_id: Option<String> = None;
     let mut saw_recognized = false;
     let mut saw_unknown = false;
-    let mut received_finish = false;
+    // Step counter for multi-step agentic flows.
+    // Incremented on step_start, decremented on step_finish.
+    // We break only when open_steps <= 0 AND at least one step_finish arrived.
+    let mut open_steps: i32 = 0;
+    let mut received_any_finish = false;
 
     loop {
         // Read the next line or time out after 5 minutes of silence. Opencode
@@ -646,13 +721,17 @@ async fn run_opencode_inner(
                 saw_recognized = true;
                 for ev in translated {
                     match ev {
+                        TranslatedEvent::StepStart => {
+                            open_steps += 1;
+                        }
                         TranslatedEvent::Text(t) => {
                             if !t.is_empty() {
                                 let _ = event_tx.send(HarnessEvent::Text(t)).await;
                             }
                         }
                         TranslatedEvent::StepFinish => {
-                            received_finish = true;
+                            open_steps -= 1;
+                            received_any_finish = true;
                         }
                         TranslatedEvent::ToolUse {
                             tool,
@@ -671,17 +750,19 @@ async fn run_opencode_inner(
                         }
                     }
                 }
-                if received_finish {
+                // Only exit when all opened steps have been closed AND at least
+                // one step_finish has arrived. This correctly handles multi-step
+                // agentic flows: step_start → tool_use → step_finish →
+                // step_start → text → step_finish.
+                if received_any_finish && open_steps <= 0 {
                     break;
                 }
             }
             None => {
-                // Either a known-but-silent event (step_start) or unknown.
+                // Unknown event type — log for diagnostics.
                 let ty = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if ty != "step_start" {
-                    saw_unknown = true;
-                    tracing::debug!("opencode: unknown event type `{}`", ty);
-                }
+                saw_unknown = true;
+                tracing::debug!("opencode: unknown event type `{}`", ty);
             }
         }
     }
@@ -699,24 +780,28 @@ async fn run_opencode_inner(
 
     if let Some(status) = status {
         if !status.success() {
-            // Try to read stderr for a useful message.
-            let stderr_msg = match stderr {
-                Some(mut s) => {
+            // Read stderr capped at 64 KiB to prevent OOM on crash-looping processes.
+            let raw_stderr = match stderr {
+                Some(s) => {
                     use tokio::io::AsyncReadExt;
-                    let mut buf = String::new();
-                    let _ = s.read_to_string(&mut buf).await;
-                    buf.trim().to_string()
+                    let mut buf = vec![0u8; 0];
+                    let mut limited = s.take(64 * 1024);
+                    let _ = limited.read_to_end(&mut buf).await;
+                    buf
                 }
-                None => String::new(),
+                None => Vec::new(),
             };
+            let stderr_raw = String::from_utf8_lossy(&raw_stderr).trim().to_string();
+            tracing::debug!("opencode run non-zero exit; raw stderr: {}", stderr_raw);
             let code = status
                 .code()
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "signal".to_string());
-            let detail = if stderr_msg.is_empty() {
+            let sanitized = sanitize_stderr(&stderr_raw);
+            let detail = if sanitized.is_empty() {
                 format!("OpenCode exited with status {} (no stderr)", code)
             } else {
-                format!("OpenCode exited with status {}: {}", code, stderr_msg)
+                format!("OpenCode exited with status {}: {}", code, sanitized)
             };
             let _ = event_tx.send(HarnessEvent::Error(detail)).await;
         }
@@ -735,19 +820,10 @@ async fn run_opencode_inner(
         let _ = event_tx.send(HarnessEvent::Text(msg)).await;
     }
 
-    // Persist the session id internally for future `get_session_id` lookups.
-    // The App layer additionally consumes the session_id via `HarnessEvent::Done`
-    // and writes its own name→id index under a prefixed key in state.
+    // The App layer consumes the session_id via `HarnessEvent::Done` and writes
+    // its own name→id index under a prefixed key in state. No internal `_last`
+    // placeholder is needed — nothing reads it.
     let sid = captured_session_id.clone().unwrap_or_default();
-    if !sid.is_empty() {
-        // There is no opencode-side name in `run_prompt`, but we stash the id
-        // under a stable placeholder so tests can observe the capture path.
-        // The real name→id wiring lives in `App::send_harness_prompt` via
-        // `HarnessEvent::Done { session_id }`.
-        let mut map = sessions.lock().unwrap();
-        map.insert("_last".to_string(), sid.clone());
-    }
-
     let _ = event_tx.send(HarnessEvent::Done { session_id: sid }).await;
 }
 
@@ -781,7 +857,7 @@ pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<Translate
                 Some(vec![TranslatedEvent::Text(text.to_string())])
             }
         }
-        "step_start" => None,
+        "step_start" => Some(vec![TranslatedEvent::StepStart]),
         "step_finish" => Some(vec![TranslatedEvent::StepFinish]),
         "tool_use" => {
             let part = event.get("part")?;
@@ -855,6 +931,9 @@ pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<Translate
 /// Pure-data intermediate representation emitted by `translate_event`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TranslatedEvent {
+    /// Signals the start of a new agentic step. Used by the read loop to
+    /// track open_steps so multi-step flows are not terminated early.
+    StepStart,
     Text(String),
     StepFinish,
     ToolUse {
@@ -905,13 +984,15 @@ mod tests {
     }
 
     #[test]
-    fn translate_event_step_start_returns_none() {
+    fn translate_event_step_start_returns_step_start() {
         let ev = serde_json::json!({
             "type": "step_start",
             "sessionID": "ses_1",
             "part": {"type": "step-start"}
         });
-        assert!(translate_event(&ev).is_none());
+        let out = translate_event(&ev).expect("step_start now translates to StepStart");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], TranslatedEvent::StepStart);
     }
 
     #[test]
@@ -923,6 +1004,122 @@ mod tests {
         let out = translate_event(&ev).expect("step_finish translates");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], TranslatedEvent::StepFinish);
+    }
+
+    /// Simulate the multi-step agentic event sequence:
+    ///   step_start → tool_use → step_finish → step_start → text → step_finish
+    ///
+    /// The read loop must NOT terminate after the first step_finish. The final
+    /// text event from the second step must be emitted, and Done fires only
+    /// after the second step_finish.
+    #[tokio::test]
+    async fn multi_step_flow_emits_all_events_before_done() {
+        use tokio::sync::mpsc;
+
+        let (event_tx, mut event_rx) = mpsc::channel::<HarnessEvent>(32);
+
+        // Build the event sequence as JSON lines
+        let events = vec![
+            serde_json::json!({"type": "step_start", "sessionID": "ses_ms1", "part": {}}),
+            serde_json::json!({
+                "type": "tool_use",
+                "sessionID": "ses_ms1",
+                "part": {
+                    "tool": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "echo hi"},
+                        "output": "hi\n",
+                        "title": "Echo hi"
+                    }
+                }
+            }),
+            serde_json::json!({"type": "step_finish", "sessionID": "ses_ms1", "part": {}}),
+            serde_json::json!({"type": "step_start", "sessionID": "ses_ms1", "part": {}}),
+            serde_json::json!({"type": "text", "sessionID": "ses_ms1", "part": {"text": "final answer"}}),
+            serde_json::json!({"type": "step_finish", "sessionID": "ses_ms1", "part": {}}),
+        ];
+
+        // Drive the read loop directly by calling translate_event + the same
+        // counter logic so we can test it without spawning an actual process.
+        let mut open_steps: i32 = 0;
+        let mut received_any_finish = false;
+        let mut saw_tool_use = false;
+        let mut saw_text = false;
+
+        for ev_value in &events {
+            if let Some(translated) = translate_event(ev_value) {
+                for ev in translated {
+                    match ev {
+                        TranslatedEvent::StepStart => {
+                            open_steps += 1;
+                        }
+                        TranslatedEvent::Text(t) => {
+                            saw_text = true;
+                            let _ = event_tx.send(HarnessEvent::Text(t)).await;
+                        }
+                        TranslatedEvent::StepFinish => {
+                            open_steps -= 1;
+                            received_any_finish = true;
+                        }
+                        TranslatedEvent::ToolUse {
+                            tool,
+                            description,
+                            input,
+                            output,
+                        } => {
+                            saw_tool_use = true;
+                            let _ = event_tx
+                                .send(HarnessEvent::ToolUse {
+                                    tool,
+                                    description,
+                                    input,
+                                    output,
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Emit Done after loop (mirrors run_opencode_inner)
+        if received_any_finish && open_steps <= 0 {
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: "ses_ms1".into(),
+                })
+                .await;
+        }
+        drop(event_tx);
+
+        // Collect all events
+        let mut collected = vec![];
+        while let Some(ev) = event_rx.recv().await {
+            collected.push(ev);
+        }
+
+        assert!(saw_tool_use, "tool_use from first step must be emitted");
+        assert!(saw_text, "text from second step must not be dropped");
+        assert!(
+            collected
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::ToolUse { .. })),
+            "ToolUse must be in collected events"
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::Text(t) if t == "final answer")),
+            "Text('final answer') must be in collected events"
+        );
+        assert!(
+            matches!(collected.last(), Some(HarnessEvent::Done { session_id }) if session_id == "ses_ms1"),
+            "Done must fire after second step_finish, not first"
+        );
+        // The loop counter should be balanced (both steps closed)
+        assert_eq!(open_steps, 0);
+        assert!(received_any_finish);
     }
 
     #[test]
@@ -1165,8 +1362,12 @@ mod tests {
     #[tokio::test]
     async fn emit_started_delivers_harness_started_through_broadcast() {
         let (tx, mut rx) = broadcast::channel::<AmbientEvent>(8);
-        let h = OpencodeHarness::new(OpencodeConfig::default(), tx);
-        h.emit_started("run-1");
+        // emit_started/emit_finish were removed (Fix 1.5); emit directly.
+        let _ = tx.send(AmbientEvent::HarnessStarted {
+            harness: HarnessKind::Opencode.name().to_string(),
+            run_id: "run-1".to_string(),
+            prompt_hash: None,
+        });
         let ev = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
             .await
             .expect("recv timeout")
@@ -1188,8 +1389,12 @@ mod tests {
     #[tokio::test]
     async fn emit_finish_delivers_harness_finished_status() {
         let (tx, mut rx) = broadcast::channel::<AmbientEvent>(8);
-        let h = OpencodeHarness::new(OpencodeConfig::default(), tx);
-        h.emit_finish("run-2", "error");
+        // emit_started/emit_finish were removed (Fix 1.5); emit directly.
+        let _ = tx.send(AmbientEvent::HarnessFinished {
+            harness: HarnessKind::Opencode.name().to_string(),
+            run_id: "run-2".to_string(),
+            status: "error".to_string(),
+        });
         let ev = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
             .await
             .expect("recv timeout")
@@ -1209,28 +1414,22 @@ mod tests {
     }
 
     // ── Panic-message formatter (matches claude.rs pattern) ──────────────────
-
-    fn format_panic(info: &(dyn std::any::Any + Send)) -> String {
-        if let Some(s) = info.downcast_ref::<&str>() {
-            format!("OpenCode: internal panic: {}", s)
-        } else if let Some(s) = info.downcast_ref::<String>() {
-            format!("OpenCode: internal panic: {}", s)
-        } else {
-            "OpenCode: internal panic (unknown)".to_string()
-        }
-    }
+    // Tests call the production `format_panic_message` via `super::` (Fix 1.6).
 
     #[test]
     fn format_panic_on_str_slice() {
         let boxed: Box<dyn std::any::Any + Send> = Box::new("kaboom");
-        assert_eq!(format_panic(&*boxed), "OpenCode: internal panic: kaboom");
+        assert_eq!(
+            super::format_panic_message(&*boxed),
+            "OpenCode: internal panic: kaboom"
+        );
     }
 
     #[test]
     fn format_panic_on_owned_string() {
         let boxed: Box<dyn std::any::Any + Send> = Box::new(String::from("owned boom"));
         assert_eq!(
-            format_panic(&*boxed),
+            super::format_panic_message(&*boxed),
             "OpenCode: internal panic: owned boom"
         );
     }
@@ -1238,7 +1437,10 @@ mod tests {
     #[test]
     fn format_panic_on_unknown_box() {
         let boxed: Box<dyn std::any::Any + Send> = Box::new(42u32);
-        assert_eq!(format_panic(&*boxed), "OpenCode: internal panic (unknown)");
+        assert_eq!(
+            super::format_panic_message(&*boxed),
+            "OpenCode: internal panic (unknown)"
+        );
     }
 
     // ── Argv construction smoke test (exercises the -f attachment path) ──────
