@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod opencode;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,6 +18,7 @@ pub enum HarnessKind {
     Claude,
     Gemini,
     Codex,
+    Opencode,
 }
 
 impl HarnessKind {
@@ -26,6 +28,7 @@ impl HarnessKind {
             "claude" => Some(Self::Claude),
             "gemini" => Some(Self::Gemini),
             "codex" => Some(Self::Codex),
+            "opencode" => Some(Self::Opencode),
             _ => None,
         }
     }
@@ -35,8 +38,19 @@ impl HarnessKind {
             Self::Claude => "Claude",
             Self::Gemini => "Gemini",
             Self::Codex => "Codex",
+            Self::Opencode => "OpenCode",
         }
     }
+}
+
+/// Build the prefixed key used to index a named harness session in state.
+///
+/// Format: `{kind-lowercase}:{name}` (e.g. `claude:auth`, `opencode:build`).
+/// Using a prefix prevents collisions when the same human-readable name is
+/// used across different harnesses (users expect `claude --name foo` and
+/// `opencode --name foo` to be distinct conversations).
+pub fn build_session_key(kind: HarnessKind, name: &str) -> String {
+    format!("{}:{}", kind.name().to_lowercase(), name)
 }
 
 /// Events streamed from a harness session to the chat delivery layer.
@@ -44,7 +58,17 @@ impl HarnessKind {
 #[derive(Debug, Clone)]
 pub enum HarnessEvent {
     /// Harness is using a tool (Read, Write, Edit, Bash, etc.)
-    ToolUse { tool: String, description: String },
+    ///
+    /// `input` / `output` are additive structured fields populated by harnesses
+    /// whose stream protocol separates tool call from tool result (e.g. the
+    /// opencode CLI-subprocess harness). When `None`, display falls back to the
+    /// legacy `description` string used by the Claude SDK harness.
+    ToolUse {
+        tool: String,
+        description: String,
+        input: Option<String>,
+        output: Option<String>,
+    },
     /// Text from the harness response
     Text(String),
     /// A file produced by the harness (image, document, data file, etc.)
@@ -104,7 +128,17 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Format a tool use event for display in chat.
-pub fn format_tool_event(tool: &str, description: &str) -> String {
+///
+/// When `input` is `Some`, prefers the structured input over the legacy
+/// `description` string. When `output` is also `Some`, a short preview is
+/// appended after an arrow. Falls back to `description` when both structured
+/// fields are `None` (preserves Claude-SDK harness behavior).
+pub fn format_tool_event_full(
+    tool: &str,
+    description: &str,
+    input: Option<&str>,
+    output: Option<&str>,
+) -> String {
     let icon = match tool {
         "Read" => "📖",
         "Write" => "📝",
@@ -118,11 +152,28 @@ pub fn format_tool_event(tool: &str, description: &str) -> String {
         _ => "🔧",
     };
 
-    if description.is_empty() {
-        format!("{} {}", icon, tool)
-    } else {
-        format!("{} {} {}", icon, tool, truncate(description, 80))
-    }
+    // Prefer structured input/output when the harness provided them.
+    let body = match (input, output) {
+        (Some(i), Some(o)) if !i.is_empty() && !o.is_empty() => {
+            format!("{} → {}", truncate(i, 60), truncate(o, 40))
+        }
+        (Some(i), _) if !i.is_empty() => truncate(i, 80),
+        _ => {
+            if description.is_empty() {
+                return format!("{} {}", icon, tool);
+            }
+            truncate(description, 80)
+        }
+    };
+
+    format!("{} {} {}", icon, tool, body)
+}
+
+/// Legacy two-arg formatter. Kept for call sites that don't have structured
+/// `input` / `output`. Forwards to `format_tool_event_full`.
+#[allow(dead_code)]
+pub fn format_tool_event(tool: &str, description: &str) -> String {
+    format_tool_event_full(tool, description, None, None)
 }
 
 /// Read-only context passed into `drive_harness`.
@@ -164,7 +215,12 @@ pub async fn drive_harness(
 
     while let Some(event) = event_rx.recv().await {
         match event {
-            HarnessEvent::ToolUse { tool, description } => {
+            HarnessEvent::ToolUse {
+                tool,
+                description,
+                input,
+                output,
+            } => {
                 got_any_output = true;
 
                 if last_tool_name.as_deref() == Some(&tool) {
@@ -177,7 +233,12 @@ pub async fn drive_harness(
                     }
                     consecutive_count = 0;
                     last_tool_name = Some(tool.clone());
-                    tool_lines.push(format_tool_event(&tool, &description));
+                    tool_lines.push(format_tool_event_full(
+                        &tool,
+                        &description,
+                        input.as_deref(),
+                        output.as_deref(),
+                    ));
                 }
 
                 // Flush batch every 3s or every 5 distinct tool lines

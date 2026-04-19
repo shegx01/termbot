@@ -284,6 +284,8 @@ async fn run_claude_prompt_inner(
                     .send(HarnessEvent::ToolUse {
                         tool: "Thinking".to_string(),
                         description: String::new(),
+                        input: None,
+                        output: None,
                     })
                     .await;
                 thinking_sent = true;
@@ -330,6 +332,8 @@ async fn run_claude_prompt_inner(
                                 .send(HarnessEvent::ToolUse {
                                     tool: tool_name,
                                     description: input_desc,
+                                    input: None,
+                                    output: None,
                                 })
                                 .await;
                         }

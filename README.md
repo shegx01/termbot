@@ -2,7 +2,53 @@
 
 Control your terminal from Telegram, Slack, Discord, or any WebSocket client. Built in Rust.
 
-terminus gives you remote access to terminal sessions and Claude Code from your phone or from code. Run shell commands, manage tmux sessions, send images, and have multi-turn AI conversations -- through chat platforms or a programmatic WebSocket API.
+terminus gives you remote access to terminal sessions and AI harnesses from your phone or from code. Run shell commands, manage tmux sessions, send images, and have multi-turn AI conversations -- through chat platforms or a programmatic WebSocket API.
+
+---
+
+## Contents
+
+- [Support matrix](#support-matrix)
+- [Quick start](#quick-start)
+- [What can it do?](#what-can-it-do)
+- [Requirements](#requirements)
+- [Configuration](#configuration)
+- [Commands reference](#commands-reference)
+- [Named sessions](#named-sessions)
+- [Structured Output (--schema)](#structured-output---schema)
+- [Socket API](#socket-api)
+- [How it works](#how-it-works)
+- [Security](#security)
+- [Configuration reference](#configuration-reference)
+- [Architecture](#architecture)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Support matrix
+
+**Chat platforms** (inbound + outbound messages):
+
+| Platform  | Text | Inbound attachments | Notes |
+|-----------|:----:|:-------------------:|-------|
+| Telegram  |  ✓   |          ✓          | Long-polling; most complete integration |
+| Slack     |  ✓   |         ✓*          | Socket Mode; *images only, non-image documents not forwarded yet |
+| Discord   |  ✓   |          ✗          | Gateway; inbound attachments deferred |
+| WebSocket |  ✓   |          ✓          | Binary-frame upload; opt-in |
+
+\* Slack image attachments are downloaded and forwarded to AI harnesses; non-image file types (PDFs, documents, etc.) are not yet wired.
+
+**AI harnesses** (the `: <name>` prefixed commands):
+
+| Harness  | One-shot | Interactive | Named sessions | Tool-use events | Structured output | Attachments |
+|----------|:--------:|:-----------:|:--------------:|:---------------:|:-----------------:|:-----------:|
+| claude   |    ✓     |      ✓      |       ✓        |        ✓        |         ✓         |      ✓      |
+| opencode |    ✓     |      ✓      |       ✓        |       ✓¹        |         ✗²        |      ✓      |
+| codex    |   stub   |    stub     |      stub      |      stub       |       stub        |    stub     |
+| gemini   |   stub   |    stub     |      stub      |      stub       |       stub        |    stub     |
+
+¹ Tool-use events are forwarded when opencode emits them; tool-enabled agents (e.g. "build") emit tool_use JSON events, others may not. Set `agent = "build"` in `[harness.opencode]` config or pass `--agent build` per-prompt
+² Opencode CLI has no schema-constrained output surface -- use the claude harness for `--schema` workflows
 
 ---
 
@@ -124,6 +170,28 @@ Show me the test gaps.           # still the same session
 : claude off
 ```
 
+**OpenCode** -- prompt a different AI via the `opencode` CLI:
+
+```
+: opencode explain this codebase
+: opencode on --name review
+What does the auth module do?
+Is this idiomatic Rust?
+: opencode off
+```
+
+**OpenCode CLI subcommands** -- query opencode directly from chat:
+
+```
+: opencode models openrouter        # list configured models
+: opencode stats --days 7           # token usage + cost
+: opencode sessions                 # recent session IDs
+: opencode providers                # configured providers
+: opencode export ses_abc...        # dump a session as JSON
+```
+
+**Full flag + subcommand reference:** [docs/opencode.md](docs/opencode.md)
+
 **Programmatic access** -- drive terminus from scripts, agents, or dashboards via WebSocket:
 
 ```bash
@@ -144,14 +212,17 @@ websocat ws://127.0.0.1:7645 -H "Authorization: Bearer tk_live_..."
 
 ## Requirements
 
-- **Rust 1.70+** (for building)
+- **Rust 1.70+** (for building from source)
 - **tmux** (for terminal sessions)
 - **Claude Code CLI** (for `: claude` commands -- `npm i -g @anthropic-ai/claude-code`)
+- **opencode** (optional, for `: opencode` commands -- see [OpenCode integration](#opencode-integration-optional))
 - At least one of: Telegram bot token, Slack bot + app tokens, Discord bot token, or Socket API enabled
 
 ---
 
 ## Configuration
+
+The `[blocklist]` and `[streaming]` sections are the same across all platforms. See the Telegram example below for the full defaults -- the other platform snippets omit them for brevity.
 
 ### Telegram only
 
@@ -300,6 +371,31 @@ token = "tk_live_your-32-character-minimum-secret"
 ```
 
 The socket API is opt-in (`enabled = false` by default). Each client authenticates with a named Bearer token. See [Socket API](#socket-api) below for usage and [docs/socket.md](docs/socket.md) for the full wire protocol reference.
+
+### OpenCode integration (optional)
+
+Opencode runs as a subprocess -- terminus spawns `opencode run --format json` per prompt and inherits the user's opencode CLI config (default model, agent, provider, auth). No extra terminus config is required if `opencode` is on PATH and authenticated.
+
+Optional overrides:
+
+```toml
+[harness.opencode]
+# Override the opencode binary location (default: resolved via PATH)
+# binary_path = "/usr/local/bin/opencode"
+
+# Per-run model override (passed as `-m <model>` to opencode run)
+# model = "openrouter/anthropic/claude-haiku-4-5"
+
+# Per-run agent override (passed as `--agent <name>`). Use "build" for
+# tool-use-enabled agents.
+# agent = "build"
+```
+
+**Requirements:** `opencode` on PATH (same pattern as `tmux`). Run `opencode auth login` once before using any `: opencode ...` commands.
+
+**Blocked from chat** (run in your terminal instead): `acp`, `agent`, `attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`, `session`, `tui`, `uninstall`, `upgrade`, `web`. Terminus returns a clear error if you try these from chat. Note: `session list` / `session ls` and `auth list` / `auth ls` ARE supported as safe read-only aliases.
+
+See [docs/opencode.md](docs/opencode.md) for the full CLI reference.
 
 ### Multiple platforms
 
@@ -495,7 +591,7 @@ Use `--resume` when you know the session exists and want to catch typos. `--cont
 - On resume, the stored working directory is passed to the SDK for context
 - Sessions are LRU-evicted when the index exceeds `max_named_sessions` (default 50, configurable in `[harness]` section)
 - `--name` and `--resume` are mutually exclusive
-- Only works with harnesses that support resume (currently Claude)
+- Only works with harnesses that support resume (currently Claude and opencode)
 
 **Breaking change:** `-n` was previously the short flag for `--max-turns`. It now means `--name`. Use `-t` for `--max-turns`.
 
@@ -969,6 +1065,7 @@ src/
   harness/
     mod.rs             Harness trait, event types, streaming driver
     claude.rs          Claude Code SDK integration (streaming, images, file delivery)
+    opencode.rs        OpenCode CLI subprocess harness (JSON event stream, multi-step)
     gemini.rs          Gemini harness (planned)
     codex.rs           Codex harness (planned)
   chat_adapters/
@@ -1008,7 +1105,7 @@ cmd_tx (mpsc) ──────────> tokio::select! core loop (main.rs)
                             └── Socket per-connection tasks (subscription filtering)
 ```
 
-The harness system is extensible via the `Harness` trait. Currently only Claude is implemented; Gemini and Codex have stubs ready for future integration. Each harness supports streaming events (`ToolUse`, `Text`, `File`, `Done`, `Error`) and optional multi-turn session resume.
+The harness system is extensible via the `Harness` trait. Claude and OpenCode are fully implemented; Gemini and Codex have stubs ready for future integration. Each harness supports streaming events (`ToolUse`, `Text`, `File`, `Done`, `Error`) and optional multi-turn session resume.
 
 ---
 
@@ -1060,6 +1157,12 @@ terminus normalizes curly quotes automatically. If you still see issues, check t
 <summary>Images not working with Claude</summary>
 
 Images are only supported in harness mode. Enter Claude mode first with `: claude on`, then send a photo. Sending images to the terminal (without an active harness) will show an error.
+</details>
+
+<details>
+<summary>OpenCode commands not working</summary>
+
+Opencode must be installed and authenticated: install from [opencode.ai](https://opencode.ai) and run `opencode auth login`. Verify with `opencode models` in your terminal. If terminus can't find it, set `binary_path` in `[harness.opencode]`. Blocked subcommands (auth login/logout, serve, web, etc.) must be run in your terminal, not via chat.
 </details>
 
 <details>

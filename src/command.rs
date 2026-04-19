@@ -6,6 +6,24 @@ use regex::Regex;
 use crate::harness::HarnessKind;
 use crate::tmux::normalize_quotes;
 
+/// Opencode-only CLI subcommand for read-only passthrough.
+///
+/// Only emitted for the opencode harness; other harnesses fall through to
+/// their current parse paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpencodeSubcommand {
+    /// `opencode models [provider]` — list available models.
+    Models,
+    /// `opencode stats [--days N] [--tools] [--models] [--project]` — usage stats.
+    Stats,
+    /// `opencode session list [--max-count N] [--format ...]` — list sessions.
+    Sessions,
+    /// `opencode auth list` — list configured providers. User-facing keyword: `providers`.
+    Providers,
+    /// `opencode export <sessionID>` — export one session as JSON.
+    Export,
+}
+
 /// CLI-style options that can be passed with `: claude on [options]`.
 ///
 /// These options persist for the duration of the harness session (until
@@ -40,6 +58,19 @@ pub struct HarnessOptions {
     pub name: Option<String>,
     /// Strict resume of a named session (--resume / --continue).
     pub resume: Option<String>,
+    /// Opencode-only: override the agent (`--agent <name>`). e.g., "build" to enable tool-use.
+    pub agent: Option<String>,
+    /// Human-readable session title (opencode `--title`).
+    pub title: Option<String>,
+    /// Share flag — opencode generates a share URL for the session.
+    pub share: bool,
+    /// Pure mode — opencode runs without external plugins.
+    pub pure: bool,
+    /// Fork the session before continuing (requires --continue or --resume).
+    pub fork: bool,
+    /// "Continue last session" — opencode `-c` without a specific name.
+    /// Distinguished from `resume: Option<String>` (name-based resume).
+    pub continue_last: bool,
 }
 
 impl HarnessOptions {
@@ -57,6 +88,12 @@ impl HarnessOptions {
             && self.schema.is_none()
             && self.name.is_none()
             && self.resume.is_none()
+            && self.agent.is_none()
+            && self.title.is_none()
+            && !self.share
+            && !self.pure
+            && !self.fork
+            && !self.continue_last
     }
 
     /// Build a human-readable summary of active options for the ON confirmation message.
@@ -102,6 +139,24 @@ impl HarnessOptions {
         if let Some(ref r) = self.resume {
             parts.push(format!("resume={}", r));
         }
+        if let Some(ref a) = self.agent {
+            parts.push(format!("agent={}", a));
+        }
+        if let Some(ref t) = self.title {
+            parts.push(format!("title={}", t));
+        }
+        if self.share {
+            parts.push("share".to_string());
+        }
+        if self.pure {
+            parts.push("pure".to_string());
+        }
+        if self.fork {
+            parts.push("fork".to_string());
+        }
+        if self.continue_last {
+            parts.push("continue-last".to_string());
+        }
         parts.join(", ")
     }
 }
@@ -141,6 +196,14 @@ pub enum ParsedCommand {
     HarnessOff {
         harness: HarnessKind,
     },
+    /// Raw CLI subcommand passthrough (e.g. `: opencode models openrouter`).
+    /// Only emitted for opencode; other harnesses fall through to their current
+    /// parse paths. Execution captures stdout and surfaces it to chat.
+    HarnessSubcommand {
+        harness: HarnessKind,
+        subcommand: OpencodeSubcommand,
+        args: Vec<String>,
+    },
     ShellCommand {
         cmd: String,
     },
@@ -166,6 +229,18 @@ pub enum ParseError {
 }
 
 const MAX_SESSION_NAME_LEN: usize = 64;
+
+/// Replace em-dash (—, U+2014) with `--`.
+/// Mobile keyboards (iOS autocorrect) frequently convert `--` to `—`, which
+/// breaks flag parsing. Applying this normalization before tokenizing restores
+/// the intended flag form.
+///
+/// En-dash (–, U+2013) is intentionally NOT normalized — it appears in
+/// legitimate prose (e.g. date ranges) and is preserved per the convention
+/// established by `tmux.rs::normalize_quotes`.
+fn normalize_em_dash(s: &str) -> String {
+    s.replace('—', "--") // U+2014 only
+}
 
 fn validate_session_name(name: &str) -> std::result::Result<(), ParseError> {
     if name.is_empty() {
@@ -234,7 +309,14 @@ impl ParsedCommand {
             // Bare `: claude` (no on/off/prompt) falls through to ShellCommand
             let first_word = rest.split_whitespace().next().unwrap_or("");
             if let Some(kind) = HarnessKind::from_str(first_word) {
-                let after_harness = rest[first_word.len()..].trim();
+                // Normalize em-dash (U+2014 → --) once at the top of the harness
+                // dispatch block, before any on/off/subcommand/prompt branching.
+                // This ensures mobile users typing `—name foo` get `--name foo`
+                // regardless of which path (HarnessOn, HarnessPrompt, subcommand)
+                // they end up on.
+                let after_harness_raw = rest[first_word.len()..].trim();
+                let after_harness_owned = normalize_em_dash(after_harness_raw);
+                let after_harness = after_harness_owned.as_str();
                 if after_harness == "on" {
                     return Ok(ParsedCommand::HarnessOn {
                         harness: kind,
@@ -259,7 +341,8 @@ impl ParsedCommand {
                     if options.is_empty() {
                         return Err(ParseError::InvalidHarnessOption(format!(
                             "`on` expects flags (e.g. `--name foo`, `--resume bar`). \
-                             For a one-shot prompt use `: claude {}` instead.",
+                             For a one-shot prompt use `: {} {}` instead.",
+                            kind.name().to_lowercase(),
                             trimmed
                         )));
                     }
@@ -277,6 +360,88 @@ impl ParsedCommand {
                 if after_harness == "off" {
                     return Ok(ParsedCommand::HarnessOff { harness: kind });
                 }
+
+                // Opencode-only: raw CLI subcommand passthrough (models, stats, sessions,
+                // providers, export) and a destructive-command blocklist. Other harnesses
+                // fall straight through to prompt parsing.
+                // Em-dash normalization already applied above (after_harness is normalized).
+                if kind == HarnessKind::Opencode && !after_harness.is_empty() {
+                    let mut subword_iter = after_harness.split_whitespace().peekable();
+                    let first = subword_iter.next().unwrap_or("");
+                    let second = subword_iter.peek().copied().unwrap_or("");
+
+                    // Match user-friendly 1-word aliases and native 2-word opencode forms.
+                    let (sub, consumed_two) = match (first, second) {
+                        // 1-word aliases (our user-friendly forms)
+                        ("models", _) => (Some(OpencodeSubcommand::Models), false),
+                        ("stats", _) => (Some(OpencodeSubcommand::Stats), false),
+                        ("sessions", _) => (Some(OpencodeSubcommand::Sessions), false),
+                        ("providers", _) => (Some(OpencodeSubcommand::Providers), false),
+                        ("export", _) => (Some(OpencodeSubcommand::Export), false),
+                        // 2-word native opencode forms — consume both words
+                        ("session", "list") | ("session", "ls") => {
+                            (Some(OpencodeSubcommand::Sessions), true)
+                        }
+                        ("auth", "list") | ("auth", "ls") => {
+                            (Some(OpencodeSubcommand::Providers), true)
+                        }
+                        _ => (None, false),
+                    };
+
+                    if let Some(subcommand) = sub {
+                        // Consume the second word if the native 2-word form was matched.
+                        if consumed_two {
+                            let _ = subword_iter.next();
+                        }
+                        let rest_args: Vec<String> = subword_iter.map(String::from).collect();
+
+                        // `export` REQUIRES an argument; reject early with a helpful message.
+                        if matches!(subcommand, OpencodeSubcommand::Export) && rest_args.is_empty()
+                        {
+                            return Err(ParseError::InvalidHarnessOption(
+                                "`: opencode export` needs a sessionID (e.g. `: opencode export ses_01HABCDEF...`)".into()
+                            ));
+                        }
+                        return Ok(ParsedCommand::HarnessSubcommand {
+                            harness: kind,
+                            subcommand,
+                            args: rest_args,
+                        });
+                    }
+
+                    // Blocklist: destructive / interactive / TTY-bound subcommands.
+                    // Return a chat-safe error — DO NOT silently treat these as prompts.
+                    // Note: bare `session` and `auth` (without a recognized sub-word) also
+                    // fall into this blocklist.
+                    const BLOCKED: &[&str] = &[
+                        "uninstall",
+                        "upgrade",
+                        "auth",
+                        "session",
+                        "login",
+                        "logout",
+                        "serve",
+                        "web",
+                        "acp",
+                        "attach",
+                        "import",
+                        "mcp",
+                        "agent",
+                        "github",
+                        "debug",
+                        "tui",
+                    ];
+                    if BLOCKED.contains(&first) {
+                        return Err(ParseError::InvalidHarnessOption(format!(
+                            "`opencode {}` is not available from chat — run it in your terminal. \
+                             Safe chat subcommands: models, stats, sessions, providers, export.",
+                            first
+                        )));
+                    }
+
+                    // Fallthrough: not a subcommand, treat as prompt (existing behavior).
+                }
+
                 if !after_harness.is_empty() {
                     // Extract any leading --flags before the actual prompt text.
                     // e.g. `: claude --schema=foo my prompt` → options={schema: "foo"}, prompt="my prompt"
@@ -332,16 +497,32 @@ fn split_prompt_options(input: &str) -> std::result::Result<(HarnessOptions, Str
     let tokens = shell_tokenize(&normalized);
 
     // Find the split point: first token that doesn't start with `-`.
+    //
+    // Boolean flags (`--share`, `--pure`, `--fork`) and the conditional
+    // `--continue` (bare, no name) must NOT consume the next token as a value.
+    // `--continue` is treated as boolean when the next token starts with `-`
+    // or there is no next token.
+    const BOOLEAN_FLAGS: &[&str] = &["--share", "--pure", "--fork"];
+
     let mut flag_end = 0;
     let mut i = 0;
     while i < tokens.len() {
         let token = &tokens[i];
         if token.starts_with('-') {
-            // This is a flag.  If it's `--flag value` (not `--flag=value`),
-            // the next token is the value — consume it too.
-            if let Some(idx) = token.find('=') {
-                let _ = idx; // `--flag=value` form, single token
+            // `--flag=value` form — single token, no look-ahead needed.
+            if token.contains('=') {
                 i += 1;
+            } else if BOOLEAN_FLAGS.contains(&token.as_str()) {
+                // Boolean flag — no value token.
+                i += 1;
+            } else if token == "--continue" {
+                // Bare `--continue`: boolean if no next token or next is a flag.
+                let next = tokens.get(i + 1).map(|t| t.as_str()).unwrap_or("");
+                if next.is_empty() || next.starts_with('-') {
+                    i += 1;
+                } else {
+                    i += 2; // `--continue <name>` form
+                }
             } else {
                 // `--flag value` form — skip flag and value.
                 i += 2;
@@ -522,10 +703,46 @@ fn parse_harness_options_tokens(
                 validate_harness_session_name(&val, flag)?;
                 opts.name = Some(val);
             }
-            "--resume" | "--continue" => {
+            "--resume" => {
                 let val = get_value!();
                 validate_harness_session_name(&val, flag)?;
                 opts.resume = Some(val);
+            }
+            "--continue" => {
+                // Peek at the next token: if it starts with `--` or there is no
+                // next token, treat as bare `--continue` (continue last session).
+                // Otherwise behave as an alias for `--resume <name>`.
+                let next_is_flag_or_missing = match eq_value {
+                    Some(_) => false, // `--continue=name` form always takes the value
+                    None => {
+                        let peek = tokens.get(i + 1).map(|t| t.as_str()).unwrap_or("");
+                        peek.is_empty() || peek.starts_with('-')
+                    }
+                };
+                if next_is_flag_or_missing && eq_value.is_none() {
+                    opts.continue_last = true;
+                } else {
+                    let val = get_value!();
+                    validate_harness_session_name(&val, flag)?;
+                    opts.resume = Some(val);
+                }
+            }
+            "--title" => {
+                let val = get_value!();
+                opts.title = Some(val);
+            }
+            "--agent" => {
+                let val = get_value!();
+                opts.agent = Some(val);
+            }
+            "--share" => {
+                opts.share = true;
+            }
+            "--pure" => {
+                opts.pure = true;
+            }
+            "--fork" => {
+                opts.fork = true;
             }
             other => {
                 // Better error for short-flag=value syntax (e.g. `-m=opus`)
@@ -537,7 +754,7 @@ fn parse_harness_options_tokens(
                     )));
                 }
                 return Err(ParseError::InvalidHarnessOption(format!(
-                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema, --name, --resume/--continue",
+                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema, --name, --resume, --continue, --agent, --title, --share, --pure, --fork",
                     other
                 )));
             }
@@ -554,6 +771,16 @@ fn parse_harness_options_tokens(
     if opts.name.is_some() && opts.resume.is_some() {
         return Err(ParseError::InvalidHarnessOption(
             "Cannot use both --name and --resume/--continue".to_string(),
+        ));
+    }
+    if opts.continue_last && (opts.resume.is_some() || opts.name.is_some()) {
+        return Err(ParseError::InvalidHarnessOption(
+            "Cannot use bare --continue with --name or --resume".to_string(),
+        ));
+    }
+    if opts.fork && !opts.continue_last && opts.resume.is_none() {
+        return Err(ParseError::InvalidHarnessOption(
+            "--fork requires --continue or --resume to be set".to_string(),
         ));
     }
 
@@ -1894,6 +2121,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_em_dashed_name_one_shot_harness_prompt() {
+        // Fix 1.2: em-dash normalization must apply on the HarnessPrompt path too.
+        // `: claude —name foo hi` should parse to HarnessPrompt with name=Some("foo"),
+        // prompt="hi" (not treat —name as prompt text).
+        let cmd = ParsedCommand::parse(": claude \u{2014}name foo hi", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Claude);
+                assert_eq!(options.name, Some("foo".into()));
+                assert_eq!(prompt, "hi");
+            }
+            other => panic!("Expected HarnessPrompt with name=foo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn en_dash_in_opencode_subcommand_is_not_normalized() {
+        // Fix 1.7: en-dash (U+2013) is intentionally preserved per the convention
+        // in tmux.rs::normalize_quotes. `: opencode stats –days 1` with an en-dash
+        // should pass `–days` through as an arg unchanged (not `--days`).
+        let cmd = ParsedCommand::parse(": opencode stats \u{2013}days 1", ':').unwrap();
+        // `stats` is recognized as a subcommand keyword; `–days` (en-dash) is passed
+        // through as an arg, NOT normalized to `--days`.
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Stats,
+                args: vec!["\u{2013}days".into(), "1".into()],
+            }
+        );
+    }
+
     // ── HarnessOn with trailing initial prompt ───────────────────────────────
 
     #[test]
@@ -2028,6 +2293,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_on_without_flags_opencode_names_opencode() {
+        // `: opencode on hello` must suggest `: opencode hello`, not `: claude hello`.
+        let err = ParsedCommand::parse(": opencode on hello", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(": opencode hello"),
+            "error should suggest `: opencode hello`, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn parse_on_without_flags_gemini_names_gemini() {
+        // `: gemini on hello` must suggest `: gemini hello`, not `: claude hello`.
+        let err = ParsedCommand::parse(": gemini on hello", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(": gemini hello"),
+            "error should suggest `: gemini hello`, got: {}",
+            msg
+        );
+    }
+
+    #[test]
     fn parse_name_and_resume_rejected() {
         let err = ParsedCommand::parse(": claude --name auth --resume auth fix", ':').unwrap_err();
         assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
@@ -2108,5 +2399,613 @@ mod tests {
             ..Default::default()
         };
         assert!(!opts.is_empty());
+    }
+
+    // ── opencode parser tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_opencode_bare_prompt() {
+        let cmd = ParsedCommand::parse(": opencode hi there", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessPrompt {
+                harness: HarnessKind::Opencode,
+                prompt: "hi there".into(),
+                options: HarnessOptions::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_name_and_prompt() {
+        let cmd = ParsedCommand::parse(": opencode --name auth fix the login bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.name, Some("auth".into()));
+                assert!(options.resume.is_none());
+                assert_eq!(prompt, "fix the login bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_resume_and_prompt() {
+        let cmd = ParsedCommand::parse(": opencode --resume auth status?", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.resume, Some("auth".into()));
+                assert!(options.name.is_none());
+                assert_eq!(prompt, "status?");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_name_without_prompt() {
+        let cmd = ParsedCommand::parse(": opencode on --name auth", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                harness,
+                options,
+                initial_prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.name, Some("auth".into()));
+                assert!(initial_prompt.is_none());
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_on_toggle() {
+        let cmd = ParsedCommand::parse(": opencode on --name session1", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn { harness, .. } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_on_em_dashed_name() {
+        // iOS keyboard autocorrects `--` to `—` (U+2014). Should still parse as --name.
+        let parsed = ParsedCommand::parse(": opencode on \u{2014}name review hi", ':').unwrap();
+        match parsed {
+            ParsedCommand::HarnessOn {
+                harness,
+                options,
+                initial_prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.name.as_deref(), Some("review"));
+                assert_eq!(initial_prompt.as_deref(), Some("hi"));
+            }
+            other => panic!("expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_mutual_exclusion_rejected() {
+        let err = ParsedCommand::parse(": opencode --name foo --resume bar hi", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("Cannot use both"));
+    }
+
+    // ── HarnessSubcommand + blocklist tests ──────────────────────────────────
+
+    #[test]
+    fn parse_opencode_subcommand_models() {
+        let cmd = ParsedCommand::parse(": opencode models", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Models,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_subcommand_models_with_provider() {
+        let cmd = ParsedCommand::parse(": opencode models openrouter", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Models,
+                args: vec!["openrouter".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_subcommand_stats() {
+        let cmd = ParsedCommand::parse(": opencode stats --days 7", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Stats,
+                args: vec!["--days".into(), "7".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_subcommand_sessions() {
+        let cmd = ParsedCommand::parse(": opencode sessions", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Sessions,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_subcommand_providers() {
+        let cmd = ParsedCommand::parse(": opencode providers", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Providers,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_subcommand_export() {
+        let cmd = ParsedCommand::parse(": opencode export ses_01HABCDEF", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Export,
+                args: vec!["ses_01HABCDEF".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_subcommand_export_without_id_rejected() {
+        let err = ParsedCommand::parse(": opencode export", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("sessionID"));
+    }
+
+    #[test]
+    fn parse_opencode_blocked_subcommand_bare_auth() {
+        // Bare `auth` (no sub-word) is blocked.
+        let err = ParsedCommand::parse(": opencode auth", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("not available from chat"), "got: {}", msg);
+    }
+
+    #[test]
+    fn parse_opencode_blocked_subcommand_auth_login() {
+        // `auth login` is NOT a recognized form (only `auth list`/`auth ls` are).
+        // After failing to match the 2-word native form, `auth` hits the blocklist.
+        let err = ParsedCommand::parse(": opencode auth login", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("not available from chat"), "got: {}", msg);
+    }
+
+    #[test]
+    fn parse_opencode_blocked_subcommand_tui() {
+        let err = ParsedCommand::parse(": opencode tui", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("not available from chat"));
+    }
+
+    #[test]
+    fn parse_opencode_blocked_subcommand_upgrade() {
+        let err = ParsedCommand::parse(": opencode upgrade", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+    }
+
+    #[test]
+    fn parse_opencode_blocked_subcommands_all_rejected() {
+        let blocked = [
+            "uninstall",
+            "upgrade",
+            "login",
+            "logout",
+            "serve",
+            "web",
+            "acp",
+            "attach",
+            "import",
+            "mcp",
+            "agent",
+            "github",
+            "debug",
+            "tui",
+            "session",
+            "auth",
+        ];
+        for kw in &blocked {
+            let input = format!(": opencode {}", kw);
+            match ParsedCommand::parse(&input, ':') {
+                Err(ParseError::InvalidHarnessOption(msg)) => {
+                    assert!(
+                        msg.contains("not available from chat")
+                            || msg.contains("run it in your terminal")
+                            || msg.contains("Safe chat subcommands"),
+                        "blocked keyword `{}` did not surface a terminal-only error; got: {}",
+                        kw,
+                        msg
+                    );
+                }
+                other => panic!(
+                    "blocked keyword `{}` should be rejected, got {:?}",
+                    kw, other
+                ),
+            }
+        }
+    }
+
+    // Verify other harnesses don't get the subcommand path (fall through to prompt).
+    #[test]
+    fn parse_claude_models_is_prompt_not_subcommand() {
+        let cmd = ParsedCommand::parse(": claude models openrouter", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessPrompt {
+                harness: HarnessKind::Claude,
+                prompt: "models openrouter".into(),
+                options: HarnessOptions::default(),
+            }
+        );
+    }
+
+    // ── Per-prompt flag tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_opencode_title_flag() {
+        let cmd = ParsedCommand::parse(": opencode --title mywork fix the bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.title.as_deref(), Some("mywork"));
+                assert_eq!(prompt, "fix the bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_share_flag() {
+        let cmd = ParsedCommand::parse(": opencode --share fix the bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert!(options.share);
+                assert_eq!(prompt, "fix the bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_pure_flag() {
+        let cmd = ParsedCommand::parse(": opencode --pure fix the bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert!(options.pure);
+                assert_eq!(prompt, "fix the bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_fork_with_resume() {
+        let cmd =
+            ParsedCommand::parse(": opencode --resume auth --fork continue the work", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert!(options.fork);
+                assert_eq!(options.resume.as_deref(), Some("auth"));
+                assert_eq!(prompt, "continue the work");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_fork_without_resume_rejected() {
+        let err = ParsedCommand::parse(": opencode --fork fix the bug", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("--fork requires"));
+    }
+
+    #[test]
+    fn parse_opencode_continue_last() {
+        // Bare `--continue` (next token is another flag `--share`) → continue_last = true
+        let cmd = ParsedCommand::parse(": opencode --continue --share fix the bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert!(options.continue_last, "continue_last should be true");
+                assert!(options.resume.is_none(), "resume should be None");
+                assert_eq!(prompt, "fix the bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_continue_with_name() {
+        // `--continue <name>` → resume = Some(name) (existing behavior preserved)
+        let cmd = ParsedCommand::parse(": opencode --continue auth fix the bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.resume.as_deref(), Some("auth"));
+                assert!(!options.continue_last);
+                assert_eq!(prompt, "fix the bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_continue_last_with_name_rejected() {
+        // `--continue` (bare, followed by `--share`) combined with `--name` is an error
+        let err =
+            ParsedCommand::parse(": opencode --name auth --continue --share fix the bug", ':')
+                .unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("Cannot use bare --continue"));
+    }
+
+    #[test]
+    fn parse_opencode_fork_with_continue_last() {
+        // `--continue --fork`: `--continue` sees `--fork` as next (a flag) → continue_last=true,
+        // then `--fork` is also parsed → fork=true. Both together are valid.
+        let cmd = ParsedCommand::parse(": opencode --continue --fork fix the bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert!(options.continue_last);
+                assert!(options.fork);
+                assert_eq!(prompt, "fix the bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    // ── Native opencode form tests ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_opencode_session_list_maps_to_sessions_subcommand() {
+        let cmd = ParsedCommand::parse(": opencode session list", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Sessions,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_session_ls_maps_to_sessions_subcommand() {
+        let cmd = ParsedCommand::parse(": opencode session ls", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Sessions,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_auth_list_maps_to_providers_subcommand() {
+        let cmd = ParsedCommand::parse(": opencode auth list", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Providers,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_auth_ls_maps_to_providers_subcommand() {
+        let cmd = ParsedCommand::parse(": opencode auth ls", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Providers,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_bare_session_is_blocked() {
+        let err = ParsedCommand::parse(": opencode session", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("not available from chat"), "got: {}", msg);
+    }
+
+    #[test]
+    fn parse_opencode_bare_auth_is_blocked() {
+        // Verify via a freshly-named test (the old `parse_opencode_blocked_subcommand_bare_auth`
+        // tests the same behavior; this one is the canonical name requested).
+        let err = ParsedCommand::parse(": opencode auth", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("not available from chat"), "got: {}", msg);
+    }
+
+    #[test]
+    fn parse_opencode_stats_em_dash_days_normalized() {
+        // iOS autocorrect: `—days` should become `--days` after em-dash normalization.
+        let cmd = ParsedCommand::parse(": opencode stats \u{2014}days 1", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Stats,
+                args: vec!["--days".into(), "1".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_models_em_dash_flag_normalized() {
+        // Fix 1.7: Only em-dash (U+2014) is normalized to `--`. En-dash (U+2013)
+        // is intentionally preserved. `: opencode models –provider openrouter`
+        // passes `–provider` through as-is (not normalized to `--provider`).
+        let cmd =
+            ParsedCommand::parse(": opencode models \u{2013}provider openrouter", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Models,
+                args: vec!["\u{2013}provider".into(), "openrouter".into()],
+            }
+        );
+    }
+
+    // ── --model / --agent per-prompt flag tests ──────────────────────────────
+
+    #[test]
+    fn parse_opencode_model_flag_per_prompt() {
+        let cmd =
+            ParsedCommand::parse(": opencode --model ollama-cloud/glm-5.1 say hi", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                prompt,
+                options,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.model.as_deref(), Some("ollama-cloud/glm-5.1"));
+                assert_eq!(prompt, "say hi");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_agent_flag_per_prompt() {
+        let cmd = ParsedCommand::parse(": opencode --agent build run bash ls", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                prompt,
+                options,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.agent.as_deref(), Some("build"));
+                assert_eq!(prompt, "run bash ls");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_on_with_model_flag() {
+        let cmd = ParsedCommand::parse(": opencode on --model ollama-cloud/glm-5.1", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                harness,
+                options,
+                initial_prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.model.as_deref(), Some("ollama-cloud/glm-5.1"));
+                assert!(initial_prompt.is_none());
+            }
+            other => panic!("expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_on_with_agent_flag() {
+        let cmd = ParsedCommand::parse(": opencode on --agent build", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                harness, options, ..
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.agent.as_deref(), Some("build"));
+            }
+            other => panic!("expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_model_and_agent_combined() {
+        let cmd = ParsedCommand::parse(": opencode --model foo --agent bar do it", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.model.as_deref(), Some("foo"));
+                assert_eq!(options.agent.as_deref(), Some("bar"));
+                assert_eq!(prompt, "do it");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn harness_options_is_empty_false_when_agent_set() {
+        let opts = HarnessOptions {
+            agent: Some("build".into()),
+            ..Default::default()
+        };
+        assert!(!opts.is_empty());
+    }
+
+    #[test]
+    fn harness_options_summary_includes_agent() {
+        let opts = HarnessOptions {
+            agent: Some("build".into()),
+            ..Default::default()
+        };
+        assert_eq!(opts.summary(), "agent=build");
     }
 }

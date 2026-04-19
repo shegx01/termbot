@@ -31,7 +31,13 @@ src/
   state_store.rs    Atomic JSON state file (Telegram offset, chat bindings, wake
                     watermarks) owned exclusively by App; adapters send updates
                     via mpsc::Sender<StateUpdate>
-  claude.rs         Claude Code SDK integration (claude-agent-sdk-rust crate)
+  harness/
+    mod.rs          Harness trait (async_trait), HarnessEvent, HarnessKind,
+                    HarnessOptions; shared session-key builder
+    claude.rs       Claude Code SDK integration (claude-agent-sdk-rust crate)
+    opencode.rs     opencode CLI-subprocess harness; translate_event, sanitize_stderr
+    codex.rs        Codex harness stub
+    gemini.rs       Gemini harness stub
   chat_adapters/
     mod.rs          ChatPlatform trait (async_trait), IncomingMessage,
                     ReplyContext (with optional socket_reply_tx for socket-
@@ -143,13 +149,58 @@ Uses `claude-agent-sdk-rust` crate, not terminal scraping. Claude prompts spawn 
 - Session names follow the same rules as terminal session names (alphanumeric, hyphens, underscores, max 64 chars).
 - Both flags work in one-shot (`: claude --name auth fix bug`) and interactive (`: claude on --name auth`) modes.
 - `--name` and `--resume` are mutually exclusive.
-- Only works with harnesses that support resume (currently Claude only).
+- Only works with harnesses that support resume (Claude and opencode).
 
 **Session persistence:** Named sessions persist across restarts. The session index (name -> session_id + working directory) is stored in `terminus-state.json` via StateStore. The Claude SDK persists conversation state in `.claude/`. On resume, the stored working directory is passed to the SDK.
 
 **LRU eviction:** Named sessions are capped at `max_named_sessions` (default 50, configurable in `[harness]` section of `terminus.toml`). When the cap is reached, the least-recently-used session is evicted.
 
 **Breaking change:** The `-n` short flag was reassigned from `--max-turns` to `--name`. Use `-t` for `--max-turns` instead.
+
+### opencode integration
+
+Uses the `opencode` CLI directly — each prompt spawns `opencode run --format json`
+as a short-lived child process with `kill_on_drop(true)`. Mirrors the
+`claude-agent-sdk-rust` subprocess pattern, NOT an HTTP sidecar.
+
+- Config is inherited from opencode's own config (model, agent, provider, auth).
+- Session resume uses `--session <ses_id>`. Terminus captures the first
+  `sessionID` it sees on stdout and persists the name → id mapping under a
+  prefixed key `opencode:<name>` in `terminus-state.json`.
+- Ambient events: `HarnessStarted` / `HarnessFinished` at prompt boundaries.
+- Tool-use events: terminus translates opencode's atomic tool_use JSON events
+  (emitted when opencode uses a tool-enabled agent) into `HarnessEvent::ToolUse`
+  with structured `tool`, `description`, `input`, and `output` fields.
+- No persistent sidecar, no port binding, no shutdown hook needed.
+
+Optional `[harness.opencode]` overrides (see `terminus.example.toml`):
+- `binary_path`: override the opencode CLI location (default: resolved via PATH)
+- `model`: pass `-m <value>` to `opencode run` (default: opencode's own default)
+- `agent`: pass `--agent <value>` to `opencode run` (default: opencode's own default)
+
+**Supported subcommands from chat:** `models`, `stats`, `sessions` (`session list`/`ls`), `providers` (`auth list`/`ls`), `export <id>`. Full reference: [docs/opencode.md](docs/opencode.md).
+
+**Blocked from chat** (chat-safe errors returned; run in terminal): `acp`, `agent`, `attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`, `session`, `tui`, `uninstall`, `upgrade`, `web`. Full details in [docs/opencode.md](docs/opencode.md).
+
+**Per-prompt flags** (`: opencode [flags] <prompt>`):
+- `--name <x>` / `--resume <x>` / `--continue <x>` — named session
+- `--continue` (no value, followed by another flag or end of flags) — continue opencode's last session (maps to `opencode run --continue`)
+- `--model <provider/model>` (alias: `-m`) — model override; overrides `[harness.opencode] model` when passed per-prompt
+- `--agent <name>` — agent override (e.g. "build" for tool-use); overrides `[harness.opencode] agent` when passed per-prompt
+- `--title <str>` — human-readable session title
+- `--share` — ask opencode for a shareable URL
+- `--pure` — run without external plugins
+- `--fork` — fork the session before continuing (requires `--continue` or `--resume`)
+
+Full flag semantics and mutual exclusion: [docs/opencode.md#per-prompt-flags](docs/opencode.md#per-prompt-flags).
+
+Subcommand output is wrapped in a fenced code block and truncated at 3000
+chars. For long outputs, run the CLI in your terminal.
+
+**Known limitations:**
+- Cross-harness state-persist-failure (state file only persists one entry per
+  key; the `{kind}:{name}` prefix scheme prevents collisions between harnesses
+  but the underlying state-store write path is shared). Not opencode-specific.
 
 ### Platform adapters
 
@@ -223,6 +274,7 @@ envelope and drain pending requests within `shutdown_drain_secs`.
 
 - **Single-user only.** Auth checks are per-platform (telegram_user_id, slack_user_id, discord_user_id in config).
 - **tmux must be on PATH.** All session operations shell out to `tmux`.
+- **opencode must be on PATH** (or `binary_path` set in `[harness.opencode]`). The opencode harness shells out to the CLI.
 - **No shared mutable state.** The main loop owns all mutable state directly; platform adapters only send/receive through channels.
 - **Rate limiting is per-platform.** `edit_throttle_ms` config controls minimum gap between message edits to stay within Telegram/Slack API limits.
 - **Startup reconciliation.** On restart, surviving `term-*` tmux sessions are auto-reconnected. Chat binding is re-established on first user message (chat IDs are not persisted to disk).
@@ -232,3 +284,25 @@ envelope and drain pending requests within `shutdown_drain_secs`.
 Unit tests cover command parsing and blocklist (command.rs) and output buffer line counting / noise filtering (buffer.rs). No integration tests yet -- tmux operations require a live tmux server.
 
 Run with: `cargo test`
+
+Integration tests (e.g. opencode end-to-end) are gated by `#[ignore]` + env
+vars. See `docs/integration-tests.md` for how to run them.
+
+## Agent orchestration
+
+When delegating work to subagents (via the `Task` / `Agent` tool), **always use
+`sonnet` or `haiku` — not `opus`** unless the task genuinely requires deep
+architectural reasoning that smaller models demonstrably cannot handle. Pick
+the model by scope:
+
+- **`haiku`**: lookups, single-file edits, small bug fixes, doc tweaks,
+  grep-and-report tasks
+- **`sonnet`** (default): multi-file refactors, feature implementations,
+  test suites, plan execution, integration work
+- **`opus`**: reserved for genuinely hard problems — cross-system architecture
+  reviews, deep debugging of subtle concurrency bugs, consensus-mode
+  Planner/Architect/Critic passes. Flag in your prompt why opus is warranted.
+
+Opus is expensive and rate-limited; defaulting to sonnet/haiku keeps cycles
+available for the cases that truly need them. If you're unsure, start with
+sonnet and escalate only if the output is insufficient.
