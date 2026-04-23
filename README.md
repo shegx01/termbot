@@ -370,14 +370,8 @@ max_sessions = 10
 ### Socket API only
 
 ```toml
-[auth]
-# No chat platform IDs needed for socket-only mode
-
-[blocklist]
-patterns = [
-  "rm\\s+-[a-z]*f[a-z]*r[a-z]*\\s+/",
-  "sudo\\s+",
-]
+# [auth] and [blocklist] are optional — omit them for socket-only deployments.
+# Add [blocklist] if you want to forbid dangerous shell commands sent over the socket.
 
 [socket]
 enabled = true

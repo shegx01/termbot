@@ -39,4 +39,20 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Audit
-        run: cargo audit
+        # Ignored advisories are all on transitive deps with no direct fix
+        # available; revisit when the upstream crates publish new majors.
+        #   RUSTSEC-2024-0370  proc-macro-error (unmaintained)
+        #                      via aquamarine → teloxide 0.13
+        #   RUSTSEC-2024-0384  instant (unmaintained)
+        #                      via notify-types → notify 7.0
+        #   RUSTSEC-2025-0134  rustls-pemfile 1.x (unmaintained)
+        #                      via reqwest 0.11 → teloxide-core 0.10 → teloxide 0.13
+        #   RUSTSEC-2026-0097  rand 0.8.5 (unsound with custom logger)
+        #                      via tokio-tungstenite 0.24/0.21, serenity 0.12,
+        #                      claude-agent-sdk-rust 1.0
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2024-0370 \
+            --ignore RUSTSEC-2024-0384 \
+            --ignore RUSTSEC-2025-0134 \
+            --ignore RUSTSEC-2026-0097

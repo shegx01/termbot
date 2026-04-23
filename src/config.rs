@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub auth: AuthConfig,
     pub telegram: Option<TelegramConfig>,
     pub slack: Option<SlackConfig>,
     pub discord: Option<DiscordConfig>,
+    #[serde(default)]
     pub blocklist: BlocklistConfig,
     #[serde(default)]
     pub streaming: StreamingConfig,
@@ -292,7 +294,7 @@ impl Default for PowerConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct AuthConfig {
     pub telegram_user_id: Option<u64>,
     pub slack_user_id: Option<String>,
@@ -355,8 +357,9 @@ impl fmt::Debug for DiscordConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct BlocklistConfig {
+    #[serde(default)]
     pub patterns: Vec<String>,
 }
 
@@ -907,6 +910,44 @@ token = "tk_live_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         let config = load_from_str(&toml).expect("socket-only config should be valid");
         assert!(config.socket_enabled());
         assert!(!config.telegram_enabled());
+    }
+
+    #[test]
+    fn socket_only_without_auth_or_blocklist_loads() {
+        // Socket-only deployment with the minimum viable TOML: no [auth] and no
+        // [blocklist]. Both sections default to empty.
+        let toml = r#"
+[socket]
+enabled = true
+
+[[socket.client]]
+name = "agent-a"
+token = "tk_live_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#;
+        let config =
+            load_from_str(toml).expect("socket-only without [auth]/[blocklist] should load");
+        assert!(config.socket_enabled());
+        assert!(!config.telegram_enabled());
+        assert!(!config.slack_enabled());
+        assert!(!config.discord_enabled());
+        assert!(config.blocklist.patterns.is_empty());
+    }
+
+    #[test]
+    fn telegram_without_auth_section_still_fails() {
+        // Regression: [telegram] present but [auth] section entirely omitted —
+        // validation must still reject (defaulted auth leaves telegram_enabled
+        // false, which trips the "at least one platform" guard).
+        let toml = r#"
+[telegram]
+bot_token = "tg-token"
+"#;
+        let err = load_from_str(toml).expect_err("telegram without auth must fail");
+        assert!(
+            err.to_string().contains("At least one platform"),
+            "expected platform-required error, got: {}",
+            err
+        );
     }
 
     #[test]
