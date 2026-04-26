@@ -373,6 +373,10 @@ impl SlackPlatform {
 
             if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
                 warn!("Failed to write Slack image to {:?}: {}", tmp_path, e);
+                // Explicitly remove any partial file left behind by the failed
+                // write — tokio::fs::write may have created or partially written
+                // the file before the error was returned.
+                let _ = tokio::fs::remove_file(&tmp_path).await;
                 continue;
             }
 

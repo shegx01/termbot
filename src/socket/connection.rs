@@ -62,7 +62,7 @@ struct PendingRequest {
 ///
 /// This is spawned by the listener for each accepted + authenticated client.
 #[allow(clippy::too_many_arguments)]
-pub async fn run(
+pub(crate) async fn run(
     ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     client_name: String,
     session_id: String,
@@ -92,9 +92,10 @@ pub async fn run(
     // Shared per-client rate limiter (survives reconnects)
     // Insert a fresh bucket if this client doesn't have one yet.
     {
-        let mut limiters = shared_rate_limiters
-            .lock()
-            .expect("rate limiter mutex poisoned");
+        let mut limiters = shared_rate_limiters.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(target: "socket", "recovered from poisoned mutex");
+            poisoned.into_inner()
+        });
         limiters.entry(client_name.clone()).or_insert_with(|| {
             TokenBucket::new(config.rate_limit_burst, config.rate_limit_per_second)
         });
@@ -118,7 +119,7 @@ pub async fn run(
     };
     if send_envelope(&mut ws_sink, &hello_ack).await.is_err() {
         // Save subscriptions even on early exit (may have been restored via hello)
-        save_subscriptions(&subs, &client_name, &shared_subs);
+        save_subscriptions(&subs, &client_name, &shared_subs, &shared_clients);
         return;
     }
 
@@ -203,7 +204,10 @@ pub async fn run(
                         let rate_result = {
                             let mut limiters = shared_rate_limiters
                                 .lock()
-                                .expect("rate limiter mutex poisoned");
+                                .unwrap_or_else(|poisoned| {
+                                    tracing::warn!(target: "socket", "recovered from poisoned mutex");
+                                    poisoned.into_inner()
+                                });
                             if let Some(bucket) = limiters.get_mut(&client_name) {
                                 bucket.try_consume(1.0)
                             } else {
@@ -263,10 +267,13 @@ pub async fn run(
                                 // Restore subscriptions from previous connection if requested
                                 if restore_subscriptions {
                                     let stored = {
-                                        let store = shared_subs
+                                        let mut store = shared_subs
                                             .lock()
-                                            .expect("subscription store mutex poisoned");
-                                        store.get(&client_name).cloned().unwrap_or_default()
+                                            .unwrap_or_else(|poisoned| {
+                                                tracing::warn!(target: "socket", "recovered from poisoned mutex");
+                                                poisoned.into_inner()
+                                            });
+                                        store.restore(&client_name).cloned().unwrap_or_default()
                                     };
                                     if !stored.is_empty() {
                                         let count = subs.import(stored);
@@ -280,8 +287,11 @@ pub async fn run(
                                         {
                                             let mut store = shared_subs
                                                 .lock()
-                                                .expect("subscription store mutex poisoned");
-                                            store.insert(client_name.clone(), restored_subs.clone());
+                                                .unwrap_or_else(|poisoned| {
+                                                    tracing::warn!(target: "socket", "recovered from poisoned mutex");
+                                                    poisoned.into_inner()
+                                                });
+                                            store.save(client_name.clone(), restored_subs.clone());
                                         }
                                         // Notify client of each restored subscription
                                         for (sub_id, _) in restored_subs {
@@ -393,8 +403,11 @@ pub async fn run(
                                         {
                                             let mut store = shared_subs
                                                 .lock()
-                                                .expect("subscription store mutex poisoned");
-                                            store.insert(client_name.clone(), subs.export());
+                                                .unwrap_or_else(|poisoned| {
+                                                    tracing::warn!(target: "socket", "recovered from poisoned mutex");
+                                                    poisoned.into_inner()
+                                                });
+                                            store.save(client_name.clone(), subs.export());
                                         }
                                         let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Subscribed {
                                             subscription_id,
@@ -419,12 +432,15 @@ pub async fn run(
                                         {
                                             let mut store = shared_subs
                                                 .lock()
-                                                .expect("subscription store mutex poisoned");
+                                                .unwrap_or_else(|poisoned| {
+                                                    tracing::warn!(target: "socket", "recovered from poisoned mutex");
+                                                    poisoned.into_inner()
+                                                });
                                             let exported = subs.export();
                                             if exported.is_empty() {
                                                 store.remove(&client_name);
                                             } else {
-                                                store.insert(client_name.clone(), exported);
+                                                store.save(client_name.clone(), exported);
                                             }
                                         }
                                         let _ = send_envelope(&mut ws_sink, &OutboundEnvelope::Unsubscribed {
@@ -528,7 +544,10 @@ pub async fn run(
                         let rate_result = {
                             let mut limiters = shared_rate_limiters
                                 .lock()
-                                .expect("rate limiter mutex poisoned");
+                                .unwrap_or_else(|poisoned| {
+                                    tracing::warn!(target: "socket", "recovered from poisoned mutex");
+                                    poisoned.into_inner()
+                                });
                             if let Some(bucket) = limiters.get_mut(&client_name) {
                                 bucket.try_consume(1.0)
                             } else {
@@ -779,23 +798,43 @@ pub async fn run(
     let _ = drain_pending(&mut pending, &mut ws_sink).await;
 
     // Save subscriptions on connection close (regardless of close reason).
-    save_subscriptions(&subs, &client_name, &shared_subs);
+    save_subscriptions(&subs, &client_name, &shared_subs, &shared_clients);
 }
 
 /// Save current subscriptions to the shared store for potential reconnect restore.
+///
+/// If the client has been removed from the config (e.g. hot-reload purged it),
+/// we drop any stale entry instead of re-persisting stale subscriptions.  This
+/// closes the save-after-purge race: config_watcher::purge_clients runs first,
+/// then the connection task exits and reaches here; without this guard the save
+/// would re-insert the entry that was just purged.
 fn save_subscriptions(
     subs: &SubscriptionRegistry,
     client_name: &str,
     shared_subs: &super::SharedSubscriptionStore,
+    shared_clients: &SharedClientList,
 ) {
+    // If the client no longer appears in the live config, remove any stale
+    // subscription entry and skip the save.
+    let client_still_configured = shared_clients.load().iter().any(|c| c.name == client_name);
+    if !client_still_configured {
+        let mut store = shared_subs.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(target: "socket", "recovered from poisoned mutex");
+            poisoned.into_inner()
+        });
+        store.remove(client_name);
+        return;
+    }
+
     let exported = subs.export();
-    let mut store = shared_subs
-        .lock()
-        .expect("subscription store mutex poisoned");
+    let mut store = shared_subs.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(target: "socket", "recovered from poisoned mutex");
+        poisoned.into_inner()
+    });
     if exported.is_empty() {
         store.remove(client_name);
     } else {
-        store.insert(client_name.to_string(), exported);
+        store.save(client_name.to_string(), exported);
     }
 }
 

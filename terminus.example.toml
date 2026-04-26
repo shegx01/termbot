@@ -163,6 +163,10 @@ stayawake_on_battery = false
 # idle_timeout_secs = 300
 # send_buffer_size = 1024
 # shutdown_drain_secs = 30
+# # Maximum number of distinct clients whose subscriptions are remembered for
+# # reconnect-restore. Older clients are LRU-evicted; an evicted client
+# # reconnecting with restore_subscriptions: true gets a fresh state.
+# max_subscription_store_entries = 100
 #
 # # Per-client named tokens. Each client authenticates with
 # # Authorization: Bearer <token> at the HTTP upgrade.

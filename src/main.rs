@@ -184,21 +184,27 @@ async fn main() -> Result<()> {
         arc_swap::ArcSwap::from_pointee(config.socket.clients.clone()),
     );
 
+    // Shared, in-memory LRU subscription store for restoring subscriptions on reconnect.
+    // Cap is read from config (default 100).
+    let sub_store_cap = config.socket.max_subscription_store_entries;
+    let shared_subs: socket::SharedSubscriptionStore = Arc::new(std::sync::Mutex::new(
+        socket::SubscriptionStoreInner::new(sub_store_cap),
+    ));
+
     // Spawn config watcher if socket is enabled.
     // Pass the canonicalized path so the kqueue watcher opens the file
     // directly rather than resolving a relative path to CWD.
-    let _config_watcher_handle = if config.socket_enabled() {
+    // Pass socket_cancel.clone() so the watcher exits cooperatively on shutdown.
+    let config_watcher_handle = if config.socket_enabled() {
         socket::config_watcher::spawn_config_watcher(
             config_path_buf.clone(),
             Arc::clone(&shared_clients),
+            Arc::clone(&shared_subs),
+            socket_cancel.clone(),
         )
     } else {
         None
     };
-
-    // Shared, in-memory subscription store for restoring subscriptions on reconnect
-    let shared_subs: socket::SharedSubscriptionStore =
-        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     let mut socket_handle: Option<tokio::task::JoinHandle<()>> = if config.socket_enabled() {
         let server = socket::SocketServer::new(
@@ -301,15 +307,38 @@ async fn main() -> Result<()> {
 
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Shutting down...");
-                // Cancel socket server first so it can drain connections
+                // Step 1: Cancel socket server so it can drain connections and
+                //         the config watcher can exit cooperatively.
                 socket_cancel.cancel();
-                // Await socket drain with configured timeout (fix #7)
+                // Step 2: Await socket server drain (connection JoinSet drain
+                //         happens inside SocketServer::run before it returns).
+                // A second Ctrl-C during the drain window force-quits immediately
+                // rather than waiting for the full drain timeout.
                 if let Some(handle) = socket_handle.take() {
                     let drain_timeout = Duration::from_secs(socket_drain_secs);
-                    if tokio::time::timeout(drain_timeout, handle).await.is_err() {
-                        tracing::warn!("Socket drain timed out after {}s", socket_drain_secs);
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => {
+                            tracing::warn!("Second SIGINT — forcing shutdown without waiting for socket drain");
+                        }
+                        result = tokio::time::timeout(drain_timeout, handle) => {
+                            if result.is_err() {
+                                tracing::warn!("Socket drain timed out after {}s", socket_drain_secs);
+                            }
+                        }
                     }
                 }
+                // Step 3: Await the config watcher task (it exits on cancel).
+                if let Some(handle) = config_watcher_handle {
+                    let drain_timeout = Duration::from_secs(socket_drain_secs);
+                    if tokio::time::timeout(drain_timeout, handle).await.is_err() {
+                        tracing::warn!(
+                            "Config watcher did not exit within {}s after cancel",
+                            socket_drain_secs
+                        );
+                    }
+                }
+                // Step 4: Mark clean shutdown and clean up.
                 app.mark_clean_shutdown().await;
                 app.cleanup().await;
                 break;
