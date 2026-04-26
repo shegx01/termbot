@@ -73,6 +73,10 @@ pub struct SocketConfig {
     pub shutdown_drain_secs: u64,
     #[serde(default = "default_max_binary_bytes")]
     pub max_binary_bytes: usize,
+    /// Hard cap on the in-memory subscription-restore map. LRU-evicted clients
+    /// will restore no subscriptions on reconnect (equivalent to a fresh connect).
+    #[serde(default = "default_max_subscription_store_entries")]
+    pub max_subscription_store_entries: usize,
     /// Per-client named tokens for authentication.
     #[serde(default, rename = "client")]
     pub clients: Vec<SocketClient>,
@@ -139,6 +143,9 @@ fn default_shutdown_drain_secs() -> u64 {
 fn default_max_binary_bytes() -> usize {
     10_485_760 // 10 MiB
 }
+fn default_max_subscription_store_entries() -> usize {
+    100
+}
 
 impl Default for SocketConfig {
     fn default() -> Self {
@@ -158,6 +165,7 @@ impl Default for SocketConfig {
             send_buffer_size: default_send_buffer_size(),
             shutdown_drain_secs: default_shutdown_drain_secs(),
             max_binary_bytes: default_max_binary_bytes(),
+            max_subscription_store_entries: default_max_subscription_store_entries(),
             clients: Vec::new(),
         }
     }

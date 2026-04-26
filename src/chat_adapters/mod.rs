@@ -4,6 +4,7 @@ pub mod telegram;
 
 pub use discord::DiscordAdapter;
 
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -48,6 +49,11 @@ pub enum PlatformMessageId {
 }
 
 /// An image or file attachment downloaded to a temp file.
+///
+/// # SAFETY
+/// Drop removes the file at `path` on a best-effort basis. Cloning
+/// `Attachment` shares the path; the second Drop sees `ENOENT` and silently
+/// swallows it. Do NOT panic in Drop.
 #[derive(Debug, Clone)]
 pub struct Attachment {
     pub path: PathBuf,
@@ -55,6 +61,22 @@ pub struct Attachment {
     pub filename: String,
     #[allow(dead_code)]
     pub media_type: String, // e.g. "image/jpeg", "image/png"
+}
+
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != ErrorKind::NotFound {
+                tracing::debug!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "Attachment::drop: failed to remove temp file"
+                );
+            }
+            // ENOENT is expected when a clone has already removed the file;
+            // swallow silently.
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -208,5 +230,71 @@ mod tests {
             "ChatBinding JSON wire format changed; this breaks persisted queue \
              files. If intentional, coordinate with a queue-file migration."
         );
+    }
+
+    // ── Attachment Drop tests (AC-1, AC-2, AC-clone) ─────────────────────────
+
+    fn make_temp_file() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CTR: AtomicUsize = AtomicUsize::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "terminus-test-att-{}-{}.txt",
+            std::process::id(),
+            n
+        ));
+        std::fs::write(&path, b"test data").expect("write temp file");
+        path
+    }
+
+    fn make_attachment(path: std::path::PathBuf) -> Attachment {
+        Attachment {
+            path,
+            filename: "test.txt".to_string(),
+            media_type: "text/plain".to_string(),
+        }
+    }
+
+    /// AC-1: Dropping an Attachment removes the underlying file.
+    #[test]
+    fn attachment_drop_removes_file() {
+        let path = make_temp_file();
+        assert!(path.exists(), "temp file should exist before drop");
+        {
+            let _att = make_attachment(path.clone());
+            // Drop happens here at end of block.
+        }
+        assert!(
+            !path.exists(),
+            "temp file should be removed after Attachment is dropped"
+        );
+    }
+
+    /// AC-2: Dropping an Attachment whose file has already been deleted does
+    /// not panic (ENOENT is silently swallowed).
+    #[test]
+    fn attachment_drop_swallows_enoent() {
+        let path = make_temp_file();
+        std::fs::remove_file(&path).expect("pre-delete the file");
+        assert!(
+            !path.exists(),
+            "file should be gone before constructing Attachment"
+        );
+        // Constructing and dropping an Attachment for a missing file must not panic.
+        let att = make_attachment(path);
+        drop(att); // must not panic
+    }
+
+    /// AC-clone: Cloning an Attachment and dropping both copies is safe.
+    /// The file is deleted exactly once; the second Drop sees ENOENT and swallows it.
+    #[test]
+    fn attachment_clone_double_drop_is_safe() {
+        let path = make_temp_file();
+        assert!(path.exists(), "temp file should exist");
+        let att1 = make_attachment(path.clone());
+        let att2 = att1.clone();
+        drop(att1); // first drop removes the file
+        assert!(!path.exists(), "file should be gone after first drop");
+        drop(att2); // second drop: ENOENT — must not panic
     }
 }
