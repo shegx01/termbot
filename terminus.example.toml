@@ -61,7 +61,7 @@ stayawake_on_battery = false
 # ---------------------------------------------------------------------------
 # Named Harness Sessions
 # ---------------------------------------------------------------------------
-# Controls the maximum number of named sessions (Claude, opencode, and Gemini)
+# Controls the maximum number of named sessions (Claude, opencode, Gemini, Codex)
 # (--name / --resume) kept in the session index. When the cap is reached, the
 # least-recently-used session is evicted. Default: 50.
 #
@@ -98,6 +98,47 @@ stayawake_on_battery = false
 #                                           # can also override per-prompt with --model / -m
 # approval_mode = "default"                 # default | auto_edit | yolo | plan
 #                                           # passed to gemini via --approval-mode
+
+# ---------------------------------------------------------------------------
+# codex CLI harness overrides
+# ---------------------------------------------------------------------------
+# Optional: override codex CLI settings for the Codex harness.
+# If this entire block is omitted, terminus resolves `codex` from PATH and
+# inherits the user's own config (~/.codex/config.toml, profiles, ChatGPT/API
+# auth). The codex binary must be installed (e.g. `brew install --cask codex`
+# or `npm install -g @openai/codex`) and the user must be logged in
+# (`codex login`) before terminus can spawn codex sessions.
+#
+# Defaults applied unconditionally by terminus (regardless of these fields):
+#   --full-auto              (sandboxed automatic execution; codex 0.125.0
+#                            removed --ask-for-approval, so this is the
+#                            non-interactive default that won't deadlock)
+#   --skip-git-repo-check    (terminus's tmux cwd may not always be a git repo)
+#   --ephemeral              (passed when no named/resumed session is active,
+#                            so one-shot prompts don't pollute codex's session
+#                            log)
+#
+# [harness.codex]
+# binary_path = "/opt/homebrew/bin/codex"   # default: resolved via PATH
+# model = "gpt-5.4"                         # default: codex's own default
+#                                           # ChatGPT-account models: gpt-5.4,
+#                                           # gpt-5.3-codex, etc. (gpt-5.5 is
+#                                           # API-only and rejects ChatGPT auth)
+#                                           # can override per-prompt: --model / -m
+# profile = "default"                       # default: codex's own active profile
+#                                           # selects [profiles.<name>] from
+#                                           # ~/.codex/config.toml
+#                                           # can override per-prompt: --profile / -p
+# sandbox = "workspace-write"               # default: codex's own default
+#                                           # values: read-only | workspace-write
+#                                           #         | danger-full-access
+#                                           # can override per-prompt: --sandbox / -s
+# ignore_user_config = false                # when true, passes --ignore-user-config
+#                                           # to codex (skips ~/.codex/config.toml).
+#                                           # Defense-in-depth against future codex
+#                                           # profile fields re-introducing approval
+#                                           # prompts. Default: false (respect user's
+#                                           # profile).
 
 # ---------------------------------------------------------------------------
 # Structured Output (--schema)

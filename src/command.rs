@@ -72,8 +72,16 @@ pub struct HarnessOptions {
     /// Distinguished from `resume: Option<String>` (name-based resume).
     pub continue_last: bool,
     /// Gemini-only: `--approval-mode <default|auto_edit|yolo|plan>`. Overrides
-    /// the `[harness.gemini].approval_mode` config when set.
+    /// the `[harness.gemini].approval_mode` config when set. (Codex 0.125.0
+    /// removed `--ask-for-approval`; codex always passes `--full-auto` and
+    /// does not consume this field.)
     pub approval_mode: Option<String>,
+    /// Codex-only: `--sandbox <read-only|workspace-write|danger-full-access>`.
+    /// Overrides `[harness.codex].sandbox` when set.
+    pub sandbox: Option<String>,
+    /// Codex-only: `--profile <name>` / `-p <name>`. Selects a named profile
+    /// from `~/.codex/config.toml`. Overrides `[harness.codex].profile`.
+    pub profile: Option<String>,
 }
 
 impl HarnessOptions {
@@ -98,6 +106,8 @@ impl HarnessOptions {
             && !self.fork
             && !self.continue_last
             && self.approval_mode.is_none()
+            && self.sandbox.is_none()
+            && self.profile.is_none()
     }
 
     /// Build a human-readable summary of active options for the ON confirmation message.
@@ -163,6 +173,12 @@ impl HarnessOptions {
         }
         if let Some(ref am) = self.approval_mode {
             parts.push(format!("approval-mode={}", am));
+        }
+        if let Some(ref s) = self.sandbox {
+            parts.push(format!("sandbox={}", s));
+        }
+        if let Some(ref p) = self.profile {
+            parts.push(format!("profile={}", p));
         }
         parts.join(", ")
     }
@@ -358,6 +374,13 @@ impl ParsedCommand {
                             "gemini does not support --fork — remove the flag".into(),
                         ));
                     }
+                    if kind == HarnessKind::Codex && options.fork {
+                        return Err(ParseError::InvalidHarnessOption(
+                            "codex does not support --fork in non-interactive mode \
+                             (use `codex fork` from your terminal). Remove the flag."
+                                .into(),
+                        ));
+                    }
                     let initial_prompt = if prompt.is_empty() {
                         None
                     } else {
@@ -470,6 +493,70 @@ impl ParsedCommand {
                     }
                 }
 
+                // Codex-only: block codex 0.125.0's native subcommands so `: codex login`,
+                // `: codex cloud`, `: codex resume`, etc. return a chat-safe error rather
+                // than getting forwarded as prompt text. Named-session resume still works
+                // via `: codex --resume <name>` (the long flag), independent of the
+                // codex CLI's `resume` subcommand. v1 ships no chat-safe subcommand
+                // passthrough; revisit in v1.1 once cloud lifecycle is designed.
+                if kind == HarnessKind::Codex && !after_harness.is_empty() {
+                    let first = after_harness.split_whitespace().next().unwrap_or("");
+                    const CODEX_BLOCKED: &[&str] = &[
+                        // auth / TTY-bound
+                        "login",
+                        "logout",
+                        // server / desktop modes
+                        "mcp",
+                        "mcp-server",
+                        "app",
+                        "app-server",
+                        "exec-server",
+                        // management / inspection
+                        "plugin",
+                        "completion",
+                        "features",
+                        "debug",
+                        "sandbox", // the subcommand form, NOT --sandbox flag
+                        // separate-lifecycle subcommands deferred to v1.1
+                        "cloud",
+                        "apply",
+                        "review",
+                        "resume", // bare subcommand; `: codex --resume <name>` still works
+                        "fork",
+                        // session-listing subcommands not exposed in v1; revisit in v1.1
+                        "sessions",
+                    ];
+                    if CODEX_BLOCKED.contains(&first) {
+                        // Tailor the chat-safe error message per category for clearer guidance.
+                        let detail = match first {
+                            "login" | "logout" => "codex auth must be run from your terminal",
+                            "mcp" | "mcp-server" => {
+                                "MCP management is not exposed to chat; run from terminal"
+                            }
+                            "app" | "app-server" | "exec-server" => {
+                                "codex desktop/server modes are not exposed to chat"
+                            }
+                            "cloud" | "apply" => {
+                                "cloud surface deferred to v1.1; run from terminal"
+                            }
+                            "resume" => {
+                                "use `: codex --resume <name>` for named-session resume; \
+                                         the bare `resume` subcommand is not exposed to chat in v1"
+                            }
+                            "sessions" => {
+                                "session listing is not exposed to chat in v1; \
+                                          run `codex exec resume --all` from your terminal"
+                            }
+                            "fork" => "session forking is not exposed to chat in v1",
+                            _ => "not exposed to chat in v1; run from terminal",
+                        };
+                        return Err(ParseError::InvalidHarnessOption(format!(
+                            "`codex {}` is not available from chat — {}.",
+                            first, detail
+                        )));
+                    }
+                }
+
                 if !after_harness.is_empty() {
                     // Extract any leading --flags before the actual prompt text.
                     // e.g. `: claude --schema=foo my prompt` → options={schema: "foo"}, prompt="my prompt"
@@ -479,6 +566,13 @@ impl ParsedCommand {
                     if kind == HarnessKind::Gemini && options.fork {
                         return Err(ParseError::InvalidHarnessOption(
                             "gemini does not support --fork — remove the flag".into(),
+                        ));
+                    }
+                    if kind == HarnessKind::Codex && options.fork {
+                        return Err(ParseError::InvalidHarnessOption(
+                            "codex does not support --fork in non-interactive mode \
+                             (use `codex fork` from your terminal). Remove the flag."
+                                .into(),
                         ));
                     }
                     return Ok(ParsedCommand::HarnessPrompt {
@@ -781,9 +875,22 @@ fn parse_harness_options_tokens(
             }
             "--approval-mode" => {
                 let val = get_value!();
+                // Gemini accepts: default | auto_edit | yolo | plan.
+                // Codex 0.125.0 has no `--ask-for-approval` CLI flag at all
+                // (terminus passes `--full-auto` unconditionally). We still
+                // accept the flag for forward compatibility but reject any
+                // value that would re-introduce interactive approval prompts.
                 match val.as_str() {
                     "default" | "auto_edit" | "yolo" | "plan" => {
                         opts.approval_mode = Some(val);
+                    }
+                    "on-request" => {
+                        return Err(ParseError::InvalidHarnessOption(
+                            "--approval-mode on-request would deadlock the harness \
+                             (no TTY for approval prompts) — terminus always passes \
+                             --full-auto instead"
+                                .into(),
+                        ));
                     }
                     _ => {
                         return Err(ParseError::InvalidHarnessOption(format!(
@@ -792,6 +899,26 @@ fn parse_harness_options_tokens(
                         )));
                     }
                 }
+            }
+            "--sandbox" => {
+                let val = get_value!();
+                match val.as_str() {
+                    "read-only" | "workspace-write" | "danger-full-access" => {
+                        opts.sandbox = Some(val);
+                    }
+                    _ => {
+                        return Err(ParseError::InvalidHarnessOption(format!(
+                            "Invalid --sandbox '{}' — expected read-only, workspace-write, or danger-full-access",
+                            val
+                        )));
+                    }
+                }
+            }
+            "--profile" => {
+                // No `-p` short alias: `-p` is already taken by --permission-mode
+                // for the Claude harness. Codex users use the long form.
+                let val = get_value!();
+                opts.profile = Some(val);
             }
             other => {
                 // Better error for short-flag=value syntax (e.g. `-m=opus`)
@@ -803,7 +930,7 @@ fn parse_harness_options_tokens(
                     )));
                 }
                 return Err(ParseError::InvalidHarnessOption(format!(
-                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema, --name, --resume, --continue, --agent, --title, --share, --pure, --fork, --approval-mode",
+                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema, --name, --resume, --continue, --agent, --title, --share, --pure, --fork, --approval-mode, --sandbox, --profile",
                     other
                 )));
             }
@@ -3217,5 +3344,369 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.summary(), "agent=build");
+    }
+
+    // ── Codex parser tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_codex_basic_prompt() {
+        let cmd = ParsedCommand::parse(": codex what is 2+2", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness, prompt, ..
+            } => {
+                assert_eq!(harness, HarnessKind::Codex);
+                assert_eq!(prompt, "what is 2+2");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_named_session() {
+        let cmd = ParsedCommand::parse(": codex --name auth fix login", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Codex);
+                assert_eq!(options.name.as_deref(), Some("auth"));
+                assert_eq!(prompt, "fix login");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_resume_strict() {
+        let cmd = ParsedCommand::parse(": codex --resume auth keep going", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.resume.as_deref(), Some("auth"));
+                assert_eq!(prompt, "keep going");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_continue_last() {
+        // Bare `--continue` requires the next token to be a flag (or absent)
+        // to be interpreted as continue_last. Add `--sandbox read-only` so
+        // the parser sees the flag boundary before the prompt.
+        let cmd =
+            ParsedCommand::parse(": codex --continue --sandbox read-only keep going", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert!(
+                    options.continue_last,
+                    "bare --continue followed by another flag should set continue_last"
+                );
+                assert_eq!(options.sandbox.as_deref(), Some("read-only"));
+                assert_eq!(prompt, "keep going");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_sandbox_each_value_accepted() {
+        for val in ["read-only", "workspace-write", "danger-full-access"] {
+            let input = format!(": codex --sandbox {} hi", val);
+            match ParsedCommand::parse(&input, ':').unwrap() {
+                ParsedCommand::HarnessPrompt { options, .. } => {
+                    assert_eq!(
+                        options.sandbox.as_deref(),
+                        Some(val),
+                        "expected sandbox={}",
+                        val
+                    );
+                }
+                other => panic!("expected HarnessPrompt for `{}`, got {:?}", val, other),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_codex_sandbox_invalid_rejected() {
+        let err = ParsedCommand::parse(": codex --sandbox banana hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(msg.contains("--sandbox"), "got: {}", msg);
+                assert!(msg.contains("banana"), "got: {}", msg);
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_profile_passes_through() {
+        let cmd = ParsedCommand::parse(": codex --profile teamsmall hi", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt { options, .. } => {
+                assert_eq!(options.profile.as_deref(), Some("teamsmall"));
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_approval_mode_on_request_rejected_with_deadlock_message() {
+        let err = ParsedCommand::parse(": codex --approval-mode on-request hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("on-request") && msg.contains("deadlock"),
+                    "expected deadlock-explaining error; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_blocked_subcommands_all_rejected() {
+        let blocked = [
+            "login",
+            "logout",
+            "mcp",
+            "mcp-server",
+            "app",
+            "app-server",
+            "exec-server",
+            "plugin",
+            "completion",
+            "features",
+            "debug",
+            "sandbox",
+            "cloud",
+            "apply",
+            "review",
+            "resume",
+            "fork",
+            "sessions",
+        ];
+        for kw in &blocked {
+            let input = format!(": codex {}", kw);
+            match ParsedCommand::parse(&input, ':') {
+                Err(ParseError::InvalidHarnessOption(msg)) => {
+                    assert!(
+                        msg.contains("not available from chat") && msg.contains(kw),
+                        "blocked codex keyword `{}` did not surface a chat-safe error; got: {}",
+                        kw,
+                        msg
+                    );
+                }
+                other => panic!(
+                    "blocked codex keyword `{}` should be rejected, got {:?}",
+                    kw, other
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_codex_resume_subcommand_redirects_to_flag_form() {
+        let err = ParsedCommand::parse(": codex resume something", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("--resume <name>"),
+                    "expected guidance toward the --resume flag; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_login_returns_terminal_only_message() {
+        let err = ParsedCommand::parse(": codex login", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("auth must be run from your terminal"),
+                    "expected auth/terminal guidance; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_cloud_returns_v1_1_deferral_message() {
+        let err = ParsedCommand::parse(": codex cloud something", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("v1.1"),
+                    "expected v1.1-deferral message; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_fork_flag_rejected_with_specific_error() {
+        let err = ParsedCommand::parse(": codex --fork --continue hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("codex does not support --fork"),
+                    "expected codex-specific fork rejection; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_on_fork_flag_rejected() {
+        let err = ParsedCommand::parse(": codex on --fork --continue", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("codex does not support --fork"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_em_dashed_flag_normalized() {
+        let cmd = ParsedCommand::parse(": codex —name auth fix it", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Codex);
+                assert_eq!(options.name.as_deref(), Some("auth"));
+                assert_eq!(prompt, "fix it");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_on_with_flags() {
+        let cmd =
+            ParsedCommand::parse(": codex on --sandbox read-only --name review", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                harness, options, ..
+            } => {
+                assert_eq!(harness, HarnessKind::Codex);
+                assert_eq!(options.sandbox.as_deref(), Some("read-only"));
+                assert_eq!(options.name.as_deref(), Some("review"));
+            }
+            other => panic!("expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_off() {
+        match ParsedCommand::parse(": codex off", ':').unwrap() {
+            ParsedCommand::HarnessOff { harness } => assert_eq!(harness, HarnessKind::Codex),
+            other => panic!("expected HarnessOff, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn harness_options_summary_includes_sandbox_and_profile() {
+        let opts = HarnessOptions {
+            sandbox: Some("workspace-write".into()),
+            profile: Some("dev".into()),
+            ..Default::default()
+        };
+        let summary = opts.summary();
+        assert!(
+            summary.contains("sandbox=workspace-write"),
+            "got: {}",
+            summary
+        );
+        assert!(summary.contains("profile=dev"), "got: {}", summary);
+    }
+
+    #[test]
+    fn harness_options_is_empty_false_when_sandbox_set() {
+        let opts = HarnessOptions {
+            sandbox: Some("read-only".into()),
+            ..Default::default()
+        };
+        assert!(!opts.is_empty());
+    }
+
+    #[test]
+    fn harness_options_is_empty_false_when_profile_set() {
+        let opts = HarnessOptions {
+            profile: Some("dev".into()),
+            ..Default::default()
+        };
+        assert!(!opts.is_empty());
+    }
+
+    #[test]
+    fn parse_codex_combined_flags_sandbox_profile_model() {
+        // Regression guard: combined parsing of all three codex-specific
+        // flags together with a prompt. Individual flag tests pass but
+        // combined parsing was untested.
+        let cmd = ParsedCommand::parse(
+            ": codex --sandbox read-only --profile dev --model gpt-5.4 fix the bug",
+            ':',
+        )
+        .unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Codex);
+                assert_eq!(options.sandbox.as_deref(), Some("read-only"));
+                assert_eq!(options.profile.as_deref(), Some("dev"));
+                assert_eq!(options.model.as_deref(), Some("gpt-5.4"));
+                assert_eq!(prompt, "fix the bug");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_sandbox_equals_syntax() {
+        let cmd = ParsedCommand::parse(": codex --sandbox=workspace-write hi", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt { options, .. } => {
+                assert_eq!(options.sandbox.as_deref(), Some("workspace-write"));
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_profile_equals_syntax() {
+        let cmd = ParsedCommand::parse(": codex --profile=mydev hi", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt { options, .. } => {
+                assert_eq!(options.profile.as_deref(), Some("mydev"));
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
     }
 }

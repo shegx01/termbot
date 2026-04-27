@@ -35,7 +35,7 @@
 //! Live-binary tests are gated `#[ignore]` + `TERMINUS_HAS_GEMINI=1`.
 //! Run with `TERMINUS_HAS_GEMINI=1 cargo test -- --ignored`.
 
-use super::{Harness, HarnessEvent, HarnessKind};
+use super::{Harness, HarnessEvent, HarnessKind, ToolPairingBuffer};
 use crate::chat_adapters::Attachment;
 use crate::command::HarnessOptions;
 use crate::config::GeminiConfig;
@@ -170,6 +170,14 @@ impl Harness for GeminiHarness {
                 Err(panic_info) => {
                     let msg = format_panic_message(&*panic_info);
                     let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+                    // Panic short-circuited `run_gemini_inner` before its own
+                    // `Done` emission. Send one here so the receiver doesn't
+                    // block forever waiting for a terminal event.
+                    let _ = event_tx
+                        .send(HarnessEvent::Done {
+                            session_id: String::new(),
+                        })
+                        .await;
                     "error"
                 }
             };
@@ -407,6 +415,9 @@ async fn run_gemini_inner(
                 ))
                 .await;
             let _ = child.kill().await;
+            // Reap the (now-killed) child so the process-table entry is freed.
+            // `kill_on_drop` only sends SIGKILL — it does not call `wait()`.
+            let _ = child.wait().await;
             let _ = event_tx
                 .send(HarnessEvent::Done {
                     session_id: String::new(),
@@ -415,7 +426,21 @@ async fn run_gemini_inner(
             return;
         }
     };
-    let stderr = child.stderr.take();
+
+    // Drain stderr concurrently with stdout so gemini-cli doesn't pipe-deadlock
+    // when its stderr buffer fills (~64 KiB on Linux, ~8 KiB on macOS).
+    // Without a concurrent drain, if gemini writes substantial stderr while
+    // also writing stdout, gemini will block on the stderr write — and we'll
+    // block on stdout's `next_line()` waiting for output that never comes.
+    let stderr_handle: Option<tokio::task::JoinHandle<Vec<u8>>> = child.stderr.take().map(|s| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf: Vec<u8> = Vec::new();
+            let mut limited = s.take(64 * 1024);
+            let _ = limited.read_to_end(&mut buf).await;
+            buf
+        })
+    });
 
     let mut reader = BufReader::new(stdout).lines();
     let mut captured_session_id: Option<String> = None;
@@ -622,20 +647,19 @@ async fn run_gemini_inner(
         let _ = event_tx.send(HarnessEvent::Error(msg)).await;
     }
 
+    // Always await the stderr-drain handle (even on success paths) so the
+    // spawned task ends cleanly. Buffered stderr is only used on non-zero-
+    // exit paths but the drain task must run to completion to avoid a
+    // leaked tokio task and a half-open pipe.
+    let raw_stderr_buf: Vec<u8> = match stderr_handle {
+        Some(h) => h.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
     // Non-zero exit → surface sanitized stderr.
     if let Some(status) = status {
         if !status.success() && !had_fatal {
-            let raw_stderr = match stderr {
-                Some(s) => {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = vec![0u8; 0];
-                    let mut limited = s.take(64 * 1024);
-                    let _ = limited.read_to_end(&mut buf).await;
-                    buf
-                }
-                None => Vec::new(),
-            };
-            let stderr_raw = String::from_utf8_lossy(&raw_stderr).trim().to_string();
+            let stderr_raw = String::from_utf8_lossy(&raw_stderr_buf).trim().to_string();
             let sanitized = sanitize_stderr(&stderr_raw);
             // Log the sanitized form — never the raw bytes — so debug-level
             // logs can't leak secrets when `RUST_LOG=debug` is enabled.
@@ -885,103 +909,10 @@ pub(crate) enum TranslatedEvent {
     },
 }
 
-/// Coalesces gemini's separate `tool_use` and `tool_result` events into a
-/// single `HarnessEvent::ToolUse` keyed by `tool_id`.
-///
-/// - `on_use` stores the partial entry (tool name + input parameters)
-/// - `on_result` removes the matching entry and returns a fully-populated
-///   `HarnessEvent::ToolUse` (or `None` if no matching `tool_use` was
-///   observed — the read loop logs these at debug level)
-/// - `flush_pending` drains any still-open entries at stream close; each is
-///   emitted with `output: None` so the user sees the invocation even when
-///   the tool didn't produce a result event before the stream ended
-///
-/// Bounded at [`Self::CAP`] entries to prevent unbounded memory growth from
-/// a pathological stream that emits many orphaned `tool_use` events. At cap,
-/// `on_use` evicts an arbitrary entry before inserting.
-pub(crate) struct ToolPairingBuffer {
-    pending: HashMap<String, PendingToolUse>,
-}
-
-#[derive(Debug, Clone)]
-struct PendingToolUse {
-    tool: String,
-    input: Option<String>,
-}
-
-impl ToolPairingBuffer {
-    /// Maximum number of unpaired `tool_use` entries retained at once.
-    /// Reached only by a pathological or drifted gemini stream; in normal
-    /// operation the count is small (bounded by model concurrency).
-    pub(crate) const CAP: usize = 256;
-
-    pub(crate) fn new() -> Self {
-        Self {
-            pending: HashMap::new(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_len(&self) -> usize {
-        self.pending.len()
-    }
-
-    pub(crate) fn on_use(&mut self, tool_id: String, tool: String, input: Option<String>) {
-        if self.pending.len() >= Self::CAP && !self.pending.contains_key(&tool_id) {
-            // Evict an arbitrary entry — order isn't meaningful for resource
-            // safety and any concrete ordering would need a separate data
-            // structure. Log once per evict so the drift is observable.
-            if let Some(k) = self.pending.keys().next().cloned() {
-                tracing::warn!(
-                    evicted_tool_id = %k,
-                    cap = Self::CAP,
-                    "gemini tool-pairing buffer at cap; evicting oldest entry"
-                );
-                self.pending.remove(&k);
-            }
-        }
-        self.pending.insert(tool_id, PendingToolUse { tool, input });
-    }
-
-    pub(crate) fn on_result(
-        &mut self,
-        tool_id: &str,
-        success: bool,
-        output: Option<String>,
-        error: Option<String>,
-    ) -> Option<HarnessEvent> {
-        let p = self.pending.remove(tool_id)?;
-        let description = if success {
-            p.tool.clone()
-        } else {
-            let err_msg = error.as_deref().unwrap_or("tool failed");
-            format!("{} ({})", p.tool, err_msg)
-        };
-        let paired_output = if success { output } else { None };
-        Some(HarnessEvent::ToolUse {
-            tool: p.tool,
-            description,
-            input: p.input,
-            output: paired_output,
-        })
-    }
-
-    /// Drain all unpaired tool_use entries and emit each as a
-    /// `HarnessEvent::ToolUse` with `output: None`.
-    pub(crate) fn flush_pending(&mut self) -> Vec<HarnessEvent> {
-        let mut out = Vec::new();
-        let drained: Vec<(String, PendingToolUse)> = self.pending.drain().collect();
-        for (_, p) in drained {
-            out.push(HarnessEvent::ToolUse {
-                tool: p.tool.clone(),
-                description: p.tool,
-                input: p.input,
-                output: None,
-            });
-        }
-        out
-    }
-}
+// `ToolPairingBuffer` was relocated to `crate::harness` (mod.rs) so the codex
+// harness can share the same paired-event coalescing logic. The struct,
+// helper, impl, and tests now live in `src/harness/mod.rs`. Gemini imports
+// the relocated type below.
 
 #[cfg(test)]
 mod tests {
@@ -1336,130 +1267,8 @@ mod tests {
         assert!(translate_event(&ev).is_none());
     }
 
-    // ── ToolPairingBuffer ───────────────────────────────────────────────────
-
-    #[test]
-    fn pairing_buffer_coalesces_use_and_result_by_tool_id() {
-        let mut buf = ToolPairingBuffer::new();
-        buf.on_use(
-            "tu_1".into(),
-            "read_file".into(),
-            Some(r#"{"path":"/tmp/x"}"#.into()),
-        );
-        assert_eq!(buf.pending_len(), 1);
-
-        let paired = buf
-            .on_result("tu_1", true, Some("contents".into()), None)
-            .expect("result should match tool_use");
-        assert_eq!(buf.pending_len(), 0);
-
-        match paired {
-            HarnessEvent::ToolUse {
-                tool,
-                input,
-                output,
-                ..
-            } => {
-                assert_eq!(tool, "read_file");
-                assert_eq!(output.as_deref(), Some("contents"));
-                assert!(
-                    input.as_deref().unwrap_or("").contains("/tmp/x"),
-                    "input should preserve the original parameters"
-                );
-            }
-            other => panic!("expected ToolUse, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn pairing_buffer_result_for_unknown_tool_id_returns_none() {
-        let mut buf = ToolPairingBuffer::new();
-        let paired = buf.on_result("tu_does_not_exist", true, Some("x".into()), None);
-        assert!(
-            paired.is_none(),
-            "result for unknown tool_id must not fabricate a ToolUse"
-        );
-    }
-
-    #[test]
-    fn pairing_buffer_error_result_suppresses_output_and_decorates_description() {
-        let mut buf = ToolPairingBuffer::new();
-        buf.on_use("tu_err".into(), "write_file".into(), None);
-        let paired = buf
-            .on_result("tu_err", false, None, Some("no space left".into()))
-            .expect("error result still pairs");
-        match paired {
-            HarnessEvent::ToolUse {
-                description,
-                output,
-                ..
-            } => {
-                assert!(
-                    description.contains("no space left"),
-                    "error message should surface in description, got: {}",
-                    description
-                );
-                assert!(output.is_none(), "output should be None on error result");
-            }
-            other => panic!("expected ToolUse, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn pairing_buffer_flush_emits_unpaired_use_with_none_output() {
-        let mut buf = ToolPairingBuffer::new();
-        buf.on_use(
-            "tu_orphan".into(),
-            "bash".into(),
-            Some(r#"{"cmd":"ls"}"#.into()),
-        );
-        let flushed = buf.flush_pending();
-        assert_eq!(flushed.len(), 1, "one unpaired use should flush");
-        match &flushed[0] {
-            HarnessEvent::ToolUse {
-                tool,
-                input,
-                output,
-                ..
-            } => {
-                assert_eq!(tool, "bash");
-                assert!(input.as_deref().unwrap_or("").contains("ls"));
-                assert!(output.is_none(), "flushed entry must have output: None");
-            }
-            other => panic!("expected ToolUse, got {:?}", other),
-        }
-        assert_eq!(buf.pending_len(), 0, "pending must be empty after flush");
-    }
-
-    #[test]
-    fn pairing_buffer_handles_multiple_interleaved_tools() {
-        let mut buf = ToolPairingBuffer::new();
-        buf.on_use("a".into(), "tool_a".into(), None);
-        buf.on_use("b".into(), "tool_b".into(), None);
-        // Results arrive out-of-order.
-        let rb = buf
-            .on_result("b", true, Some("ob".into()), None)
-            .expect("b should pair");
-        assert!(matches!(rb, HarnessEvent::ToolUse { ref tool, .. } if tool == "tool_b"));
-        let ra = buf
-            .on_result("a", true, Some("oa".into()), None)
-            .expect("a should pair");
-        assert!(matches!(ra, HarnessEvent::ToolUse { ref tool, .. } if tool == "tool_a"));
-        assert_eq!(buf.pending_len(), 0);
-    }
-
-    #[test]
-    fn pairing_buffer_caps_pending_entries_evicting_arbitrary_oldest() {
-        let mut buf = ToolPairingBuffer::new();
-        for i in 0..ToolPairingBuffer::CAP + 5 {
-            buf.on_use(format!("t{}", i), "tool".into(), None);
-        }
-        assert_eq!(
-            buf.pending_len(),
-            ToolPairingBuffer::CAP,
-            "pending must not exceed CAP"
-        );
-    }
+    // ToolPairingBuffer tests live in `src/harness/mod.rs` (relocated when the
+    // buffer became a shared utility for both gemini and codex harnesses).
 
     // ── sanitize_stderr parity with opencode ────────────────────────────────
 

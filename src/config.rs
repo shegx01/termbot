@@ -232,6 +232,11 @@ pub struct HarnessConfig {
     /// CLI config.
     #[serde(default)]
     pub gemini: Option<GeminiConfig>,
+    /// Codex CLI-subprocess harness configuration.  Optional — when absent,
+    /// the harness resolves `codex` from PATH and inherits the user's own
+    /// CLI config (`~/.codex/config.toml`, profiles, auth).
+    #[serde(default)]
+    pub codex: Option<CodexConfig>,
 }
 
 /// Configuration for the Opencode CLI-subprocess harness.
@@ -265,6 +270,40 @@ pub struct GeminiConfig {
     /// Optional approval mode (`default` | `auto_edit` | `yolo` | `plan`).
     /// Passed via `--approval-mode`.
     pub approval_mode: Option<String>,
+}
+
+/// Configuration for the Codex CLI-subprocess harness.
+///
+/// All fields are optional. When a field is `None`, the corresponding CLI flag
+/// is omitted from `codex exec ...` and the binary falls back to the user's
+/// own config (`~/.codex/config.toml`, active profile, ChatGPT/API auth).
+///
+/// **Defaults applied unconditionally** by terminus regardless of these
+/// fields (so the harness never deadlocks waiting on TTY approval prompts):
+/// - `--full-auto` (sandboxed automatic execution; codex 0.125.0 removed the
+///   prior `--ask-for-approval` flag).
+/// - `--skip-git-repo-check` (terminus's tmux cwd may not be a git repo).
+/// - `--ephemeral` when no named/resumed session is in play.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CodexConfig {
+    /// Override path to the `codex` binary. When `None`, resolves via PATH.
+    pub binary_path: Option<PathBuf>,
+    /// Optional model override (e.g. `"gpt-5.4"`, `"gpt-5.3-codex"`).
+    /// Passed via `-m`. When `None`, codex uses its own default.
+    pub model: Option<String>,
+    /// Optional codex profile name. Passed via `-p / --profile <name>`.
+    /// Selects a `[profiles.<name>]` block from `~/.codex/config.toml`.
+    pub profile: Option<String>,
+    /// Optional sandbox policy (`read-only` | `workspace-write` |
+    /// `danger-full-access`). Passed via `-s / --sandbox`. When `None`,
+    /// codex applies its own default (typically `workspace-write`).
+    pub sandbox: Option<String>,
+    /// When `true`, terminus passes `--ignore-user-config` to codex (skips
+    /// `~/.codex/config.toml`, including profiles). Defense-in-depth against
+    /// future codex releases that might add profile fields re-introducing
+    /// approval prompts. Defaults to `false` (respect user's profile).
+    #[serde(default)]
+    pub ignore_user_config: bool,
 }
 
 impl Default for StructuredOutputConfig {

@@ -14,6 +14,7 @@ use crate::command::{CommandBlocklist, HarnessOptions, ParsedCommand};
 use crate::config::Config;
 use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
+use crate::harness::codex::CodexHarness;
 use crate::harness::gemini::GeminiHarness;
 use crate::harness::opencode::OpencodeHarness;
 use crate::harness::{build_session_key, drive_harness, Harness, HarnessContext, HarnessKind};
@@ -139,6 +140,9 @@ impl App {
         let gemini_cfg = config.harness.gemini.clone().unwrap_or_default();
         let gemini = GeminiHarness::new(gemini_cfg, ambient_tx.clone());
         harnesses.insert(HarnessKind::Gemini, Box::new(gemini));
+        let codex_cfg = config.harness.codex.clone().unwrap_or_default();
+        let codex = CodexHarness::new(codex_cfg, ambient_tx.clone());
+        harnesses.insert(HarnessKind::Codex, Box::new(codex));
 
         // Hydrate active chat sets from persisted state.
         let snapshot = store.snapshot();

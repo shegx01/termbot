@@ -244,6 +244,78 @@ Full flag semantics, event schema, error table, and functionality matrix: [docs/
 - Inbound attachments (images / files) are rejected with a chat-safe error rather than forwarded — multimodal threading is a follow-up.
 - `stats` from the terminal `result` event (tokens, duration, tool calls) is not surfaced to chat.
 
+### Codex integration
+
+Uses OpenAI's `codex` CLI (`github.com/openai/codex`, verified against codex-cli
+**0.125.0**) — each prompt spawns `codex exec --json --full-auto
+--skip-git-repo-check [flags] <prompt>` as a short-lived child process with
+`kill_on_drop(true)`. Mirrors gemini's structure, including the shared
+`ToolPairingBuffer` for `item.started` + `item.completed` pairing.
+
+- **`--full-auto` is unconditional**: codex 0.125.0 removed `--ask-for-approval`,
+  so this is the only non-interactive default that won't deadlock on a missing
+  TTY. `--skip-git-repo-check` is also unconditional. `--ephemeral` is added
+  when no named session is in play.
+- **stdin must be `Stdio::null()`**: codex 0.125.0 reads stdin even when the
+  prompt is supplied as a positional arg, blocking forever on a TTY-less
+  subprocess otherwise.
+- Session resume uses the SUBCOMMAND form `codex exec resume <thread_id>`
+  (not a `--resume` flag). Bare `--continue` maps to `codex exec resume
+  --last`. Terminus captures the `thread_id` from the first `thread.started`
+  event and persists the name → id mapping under prefixed key
+  `codex:<name>` in `terminus-state.json`.
+- Ambient events: `HarnessStarted` / `HarnessFinished` at prompt boundaries.
+- Tool-use events: terminus pairs codex's `item.started` + `item.completed`
+  for tool kinds (`command_execution`, `file_change`, `mcp_tool_call`,
+  `web_search`, `plan_update`) into a single `HarnessEvent::ToolUse` with
+  structured `input` (from `command`/`path`/`query`) and `output` (from
+  `aggregated_output`). `agent_message` items go straight to
+  `HarnessEvent::Text` without pairing.
+
+Optional `[harness.codex]` overrides (see `terminus.example.toml`):
+- `binary_path`: override the codex CLI location (default: resolved via PATH)
+- `model`: pass `-m <value>` (default: codex's own default; ChatGPT-account
+  models include `gpt-5.4`, `gpt-5.3-codex`)
+- `profile`: pass `-p <value>` to select a named profile from
+  `~/.codex/config.toml`
+- `sandbox`: pass `-s <value>` (`read-only` | `workspace-write` |
+  `danger-full-access`)
+- `ignore_user_config`: when `true`, pass `--ignore-user-config` to codex so
+  it skips `~/.codex/config.toml` entirely (defense-in-depth against future
+  profile fields re-introducing approval prompts)
+
+**Subcommands blocked from chat** (chat-safe errors returned; run in terminal):
+`login`, `logout`, `mcp`, `mcp-server`, `app`, `app-server`, `exec-server`,
+`plugin`, `completion`, `features`, `debug`, `sandbox` (the subcommand form),
+`cloud`, `apply`, `resume` (use `--resume <name>` flag instead), `fork`,
+`sessions`, `review`. Full reference: [docs/codex.md](docs/codex.md).
+
+**Per-prompt flags** (`: codex [flags] <prompt>`):
+- `--name <x>` / `--resume <x>` / `--continue <x>` — named session
+- `--continue` (bare) — continue most recent codex session (`exec resume --last`)
+- `--model <x>` (alias: `-m`) — model override
+- `--sandbox <x>` — sandbox policy override
+- `--profile <x>` — profile override (no `-p` short alias; collides with
+  Claude's `--permission-mode`)
+- `--schema <inline-json|file-path>` — inline JSON written to a temp file,
+  passed via `--output-schema <path>`. Validated response is rendered as text
+
+Full flag semantics, event schema, error table, and functionality matrix:
+[docs/codex.md](docs/codex.md).
+
+**Known limitations (codex-specific):**
+- Cloud surface (`codex cloud` / `codex apply`) deferred to v1.1; blocked at
+  the parser. Long-running, two-step submit-then-apply lifecycle doesn't fit
+  terminus's short-lived-subprocess pattern.
+- No chat-safe subcommand passthrough in v1 (`sessions`, `resume`, `models`
+  all blocked). Named-session resume still works via the `--resume <name>`
+  flag, independent of codex's `resume` subcommand.
+- `reasoning` items are dropped silently.
+- Token usage from `turn.completed.usage` not surfaced to chat (parity with
+  gemini).
+- Image-only attachment whitelist (`image/png`, `image/jpeg`, `image/jpg`,
+  `image/webp`).
+
 ### Platform adapters
 
 All three implement `ChatPlatform` (async_trait). Auth is single-user: messages from non-authorized user IDs are silently dropped. Telegram uses manual `getUpdates` long-polling (not webhooks). Slack uses Socket Mode WebSocket with auto-reconnect. Discord uses the serenity crate with gateway intents `DIRECT_MESSAGES | GUILD_MESSAGES | MESSAGE_CONTENT` (privileged). Inbound Discord attachments (images/files sent by the user to the bot) are not currently processed -- only `msg.content` text is forwarded to the main loop. Telegram-parity for inbound attachments is a follow-up.
