@@ -7,6 +7,7 @@ The gemini harness wraps Google's `gemini` CLI (`github.com/google-gemini/gemini
 - [Functionality matrix](#functionality-matrix)
 - [Invocation modes](#invocation-modes)
 - [Per-prompt flags](#per-prompt-flags)
+- [Subcommands (safe, read-only)](#subcommands-safe-read-only)
 - [Blocked subcommands](#blocked-subcommands)
 - [Event schema](#event-schema)
 - [Configuration](#configuration)
@@ -26,7 +27,7 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 | **Invocation** |||
 | One-shot (`: gemini <prompt>`) | Working | Non-interactive; each prompt spawns a fresh `gemini -o stream-json` subprocess |
 | Interactive toggle (`: gemini on` / `: gemini off`) | Working | Plain text routes to gemini between the two toggles |
-| Gemini subcommand passthrough (`: gemini <sub>`) | Not shipped | Gemini's native subcommands (`extensions`, `mcp`, `skills`, `update`) are all interactive/destructive — blocked (see below) |
+| Gemini chat-safe subcommands | Working | `: gemini sessions` → `gemini --list-sessions`; `: gemini extensions` → `gemini --list-extensions`. Both are read-only flag-based surfaces. All other native subcommands (`mcp`, `skills`, `hooks`, `update`, `extensions <sub>`) remain blocked — see [Blocked subcommands](#blocked-subcommands) |
 | **Per-prompt flags** |||
 | `--name <x>` (create-or-resume) | Working | Upsert; internally prefixed `gemini:<x>` in session index |
 | `--resume <x>` / `--continue <x>` (strict resume) | Working | Errors if the named session isn't in the index |
@@ -134,20 +135,35 @@ All flags work in both one-shot (`: gemini --name foo <prompt>`) and on-toggle (
 
 ---
 
+## Subcommands (safe, read-only)
+
+Gemini-cli's only chat-safe surfaces are the read-only `--list-*` flags. Terminus exposes them under user-friendly chat keywords:
+
+| Chat keyword | Maps to | What it does |
+|---|---|---|
+| `: gemini sessions` | `gemini --list-sessions` | List saved sessions for the current project |
+| `: gemini extensions` | `gemini --list-extensions` | List installed extensions |
+
+### Bounds
+
+- 30-second wall-clock timeout per subcommand
+- stderr capped at 64 KiB before being sanitized for chat display
+- Empty stdout at exit 0 → `"gemini <sub>: no results"` rather than silence
+- `NO_COLOR=1` is set on the child env so output is plain-text fenced
+
 ## Blocked subcommands
 
 Rejected at parse time with a chat-safe error:
 
-> `` `gemini <sub>` is not available from chat — run it in your terminal. No chat-safe gemini subcommands are shipped yet. ``
+> `` `gemini <sub>` is not available from chat — run it in your terminal. Safe chat subcommands: sessions, extensions. ``
 
 | Command | Why blocked | Alternative |
 |---|---|---|
 | `update` | Self-updates the gemini binary — interactive confirmation, then restart required | Run `gemini update` in terminal, then restart terminus |
 | `mcp` | Opens a TTY-bound interactive MCP server manager | Run in terminal |
-| `extensions` | Interactive extension management | Run in terminal |
+| `extensions <sub>` (any sub-form) | `extensions add` / `remove` / `enable` / `disable` are interactive | Run in terminal. Bare `: gemini extensions` (chat-safe list) still works |
 | `skills` | Interactive skills install / discovery | Run in terminal |
-
-Any other first word after `: gemini ...` that is not a recognized flag is treated as the start of a prompt (e.g. `: gemini sessions` sends `"sessions"` as a prompt). There is no chat-safe subcommand passthrough yet — see [Known limitations](#known-limitations).
+| `hooks` | Interactive hook management | Run in terminal |
 
 ---
 
@@ -211,7 +227,7 @@ The `[harness.gemini]` block in `terminus.toml` is entirely optional. If omitted
 | `gemini: event schema mismatch (version drift — check \`gemini --version\`)` | Recognized type but required field missing | Schema changed upstream; report to terminus |
 | `gemini result status: <status>` | `result` event with non-success status and no detail | Check auth / quota / model availability |
 | `gemini does not support --schema. Try: \`: claude --schema=<name> <prompt>\`` | `--schema` passed to gemini | Use the claude harness for structured output |
-| `` `gemini <sub>` is not available from chat — run it in your terminal. No chat-safe gemini subcommands are shipped yet. `` | Blocked subcommand invoked | Run the native command in terminal |
+| `` `gemini <sub>` is not available from chat — run it in your terminal. Safe chat subcommands: sessions, extensions. `` | Blocked subcommand invoked | Use a safe subcommand or run the native command in terminal |
 | `gemini does not support --fork — remove the flag` | `--fork` passed for gemini | gemini-cli has no fork analog; drop the flag |
 | `gemini: attachments are not yet supported — send text only` | An attachment was sent to the harness | Send the prompt without the attachment |
 
@@ -260,7 +276,7 @@ Preconditions: `gemini` on PATH and authenticated.
 
 ## Known limitations
 
-1. **No chat-safe subcommand passthrough.** Gemini's native subcommands (`extensions`, `mcp`, `skills`, `update`) are all interactive or destructive and are blocked. There's no equivalent of opencode's `: opencode models / stats / sessions / providers / export`. `--list-sessions` passthrough is feasible but was deferred to a follow-up; until then, list sessions directly with `gemini --list-sessions` in a terminal.
+1. **Limited chat-safe subcommand surface.** Only the read-only `--list-sessions` and `--list-extensions` flags are exposed (as `: gemini sessions` / `: gemini extensions`). Gemini-cli's interactive surfaces (`mcp`, `skills`, `hooks`, `extensions <sub>`, `update`) remain blocked at the parser. There's no `models` listing because gemini-cli doesn't expose one.
 2. **Inbound attachments not forwarded.** Image / file attachments sent via chat are rejected with a chat-safe error rather than silently dropped. Gemini-cli has a multimodal input path but terminus does not thread attachments through it yet.
 3. **`result` / `stats` token-usage surfacing.** The terminal `result` event carries a `stats` payload (input/output tokens, duration, tool calls). Terminus currently uses `stats` only to diagnose the terminal marker; the numbers are not surfaced to chat. An opencode-style `: gemini stats` equivalent is not shipped.
 4. **No per-harness binary-version detection.** If the on-disk `gemini` emits events with a drifted schema, terminus surfaces a generic "version drift — check `gemini --version`" warning rather than fetching and reporting the actual version.

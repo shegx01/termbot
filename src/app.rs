@@ -10,7 +10,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::{OutputBuffer, StreamEvent};
 use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
-use crate::command::{CommandBlocklist, HarnessOptions, ParsedCommand};
+use crate::command::{CommandBlocklist, HarnessOptions, HarnessSubcommandKind, ParsedCommand};
 use crate::config::Config;
 use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
@@ -101,6 +101,11 @@ pub struct App {
     /// alongside the type-erased entry in `harnesses`).
     #[allow(dead_code)]
     pub opencode: Arc<OpencodeHarness>,
+    /// Gemini CLI-subprocess harness (typed Arc so the chat-safe subcommand
+    /// dispatcher can call `run_subcommand` directly — `run_subcommand` is
+    /// not on the `Harness` trait).
+    #[allow(dead_code)]
+    pub gemini: Arc<GeminiHarness>,
 }
 
 impl App {
@@ -138,8 +143,11 @@ impl App {
             Box::new(Arc::clone(&opencode)) as Box<dyn Harness>,
         );
         let gemini_cfg = config.harness.gemini.clone().unwrap_or_default();
-        let gemini = GeminiHarness::new(gemini_cfg, ambient_tx.clone());
-        harnesses.insert(HarnessKind::Gemini, Box::new(gemini));
+        let gemini = Arc::new(GeminiHarness::new(gemini_cfg, ambient_tx.clone()));
+        harnesses.insert(
+            HarnessKind::Gemini,
+            Box::new(Arc::clone(&gemini)) as Box<dyn Harness>,
+        );
         let codex_cfg = config.harness.codex.clone().unwrap_or_default();
         let codex = CodexHarness::new(codex_cfg, ambient_tx.clone())
             .with_schema_registry(Arc::clone(&schema_registry));
@@ -197,6 +205,7 @@ impl App {
             retry_worker_shutdown: Arc::clone(&retry_worker_shutdown),
             retry_worker_shutdown_flag: Arc::clone(&retry_worker_shutdown_flag),
             opencode,
+            gemini,
         };
 
         // Immediately mark state dirty in memory (sets last_clean_shutdown=false)
@@ -1108,36 +1117,47 @@ impl App {
                 subcommand,
                 args,
             } => {
-                if harness != HarnessKind::Opencode {
-                    // Parser should only emit this for opencode, but be defensive.
-                    self.send_error(
-                        &msg.reply_context,
-                        &format!("HarnessSubcommand not supported for {}", harness.name()),
-                    )
-                    .await;
-                    return;
-                }
-                match self.opencode.run_subcommand(subcommand, args).await {
+                let hctx = HarnessContext {
+                    ctx: &msg.reply_context,
+                    telegram: self.telegram.as_deref(),
+                    slack: self.slack.as_deref(),
+                    discord: self.discord.as_deref(),
+                    schema_registry: &self.schema_registry,
+                    delivery_queue: &self.delivery_queue,
+                    webhook_client: &self.webhook_client,
+                    stream_tx: &self.stream_tx,
+                };
+                // Route to the per-harness subcommand runner. Both runners
+                // emit the same Text+Done / Error+Done shape that
+                // drive_harness consumes — subcommands don't create sessions
+                // and don't fire ambient HarnessStarted/Finished events.
+                let setup = match (harness, subcommand) {
+                    (HarnessKind::Opencode, HarnessSubcommandKind::Opencode(sub)) => {
+                        self.opencode.run_subcommand(sub, args).await
+                    }
+                    (HarnessKind::Gemini, HarnessSubcommandKind::Gemini(sub)) => {
+                        self.gemini.run_subcommand(sub, args).await
+                    }
+                    (h, _) => {
+                        self.send_error(
+                            &msg.reply_context,
+                            &format!(
+                                "HarnessSubcommand kind mismatch for {} — internal bug",
+                                h.name()
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                match setup {
                     Ok(event_rx) => {
-                        let hctx = HarnessContext {
-                            ctx: &msg.reply_context,
-                            telegram: self.telegram.as_deref(),
-                            slack: self.slack.as_deref(),
-                            discord: self.discord.as_deref(),
-                            schema_registry: &self.schema_registry,
-                            delivery_queue: &self.delivery_queue,
-                            webhook_client: &self.webhook_client,
-                            stream_tx: &self.stream_tx,
-                        };
-                        // Subcommands don't create sessions and don't emit ambient
-                        // HarnessStarted/Finished — drive_harness still works fine;
-                        // we just ignore the session_id return value.
                         let _ = drive_harness(event_rx, &hctx).await;
                     }
                     Err(e) => {
                         self.send_error(
                             &msg.reply_context,
-                            &format!("opencode subcommand setup failed: {}", e),
+                            &format!("{} subcommand setup failed: {}", harness.name(), e),
                         )
                         .await;
                     }

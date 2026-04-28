@@ -37,7 +37,7 @@
 
 use super::{Harness, HarnessEvent, HarnessKind, ToolPairingBuffer};
 use crate::chat_adapters::Attachment;
-use crate::command::HarnessOptions;
+use crate::command::{GeminiSubcommand, HarnessOptions};
 use crate::config::GeminiConfig;
 use crate::socket::events::AmbientEvent;
 use anyhow::Result;
@@ -81,6 +81,194 @@ impl GeminiHarness {
             ambient_tx: None,
         }
     }
+
+    /// Spawn `gemini --list-sessions` (or equivalent) and stream the output.
+    /// Mirrors [`OpencodeHarness::run_subcommand`]: emits exactly one of
+    /// `Text(fenced_stdout) + Done` or `Error(msg) + Done`. No ambient
+    /// events; subcommands are not AI runs and don't carry session state.
+    pub async fn run_subcommand(
+        &self,
+        sub: GeminiSubcommand,
+        args: Vec<String>,
+    ) -> Result<mpsc::Receiver<HarnessEvent>> {
+        let (event_tx, event_rx) = mpsc::channel::<HarnessEvent>(32);
+        let binary = self
+            .config
+            .binary_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gemini"));
+
+        let argv = build_subcommand_argv(&sub, &args);
+        tokio::spawn(async move {
+            let body = run_subcommand_inner(binary, argv, sub, args, event_tx.clone());
+            let result = AssertUnwindSafe(body).catch_unwind().await;
+            if let Err(panic_info) = result {
+                let msg = format_panic_message(&*panic_info);
+                let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
+            }
+        });
+        Ok(event_rx)
+    }
+}
+
+/// Pure function: build the argv for a chat-safe gemini subcommand. Both
+/// known surfaces are exposed via top-level `--list-*` flags rather than
+/// real subcommands.
+fn build_subcommand_argv(sub: &GeminiSubcommand, extra_args: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = match sub {
+        GeminiSubcommand::Sessions => vec!["--list-sessions".into()],
+        GeminiSubcommand::Extensions => vec!["--list-extensions".into()],
+    };
+    argv.extend(extra_args.iter().cloned());
+    argv
+}
+
+fn sub_display_name(sub: &GeminiSubcommand) -> &'static str {
+    match sub {
+        GeminiSubcommand::Sessions => "sessions",
+        GeminiSubcommand::Extensions => "extensions",
+    }
+}
+
+/// Async inner body: spawn child, wait for output, emit Text + Done (or
+/// Error + Done). Bounded by a 30s timeout. Emits Done unconditionally
+/// before returning so receivers don't hang.
+async fn run_subcommand_inner(
+    binary: PathBuf,
+    argv: Vec<String>,
+    sub: GeminiSubcommand,
+    extra_args: Vec<String>,
+    event_tx: mpsc::Sender<HarnessEvent>,
+) {
+    let sub_label = sub_display_name(&sub);
+
+    let mut cmd = Command::new(&binary);
+    cmd.args(&argv)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "gemini binary not found: {} (set [harness.gemini] binary_path or install gemini-cli on PATH)",
+                    binary.display()
+                )
+            } else {
+                format!("gemini subcommand spawn failed: {}", e)
+            };
+            let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let out =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+            .await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                let _ = event_tx
+                    .send(HarnessEvent::Error(format!(
+                        "gemini {} wait failed: {}",
+                        sub_label, e
+                    )))
+                    .await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
+                return;
+            }
+            Err(_) => {
+                let _ = event_tx
+                    .send(HarnessEvent::Error(format!(
+                        "gemini {} timed out after 30s",
+                        sub_label
+                    )))
+                    .await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    if !out.status.success() {
+        let raw_stderr = if out.stderr.len() > 64 * 1024 {
+            &out.stderr[..64 * 1024]
+        } else {
+            &out.stderr
+        };
+        let stderr_trim = String::from_utf8_lossy(raw_stderr).trim().to_string();
+        tracing::debug!(
+            "gemini {} non-zero exit; raw stderr: {}",
+            sub_label,
+            stderr_trim
+        );
+        let code = out
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into());
+        let sanitized = sanitize_stderr(&stderr_trim);
+        let detail = if sanitized.is_empty() {
+            format!(
+                "gemini {} exited with status {} (no stderr)",
+                sub_label, code
+            )
+        } else {
+            format!(
+                "gemini {} exited with status {}: {}",
+                sub_label, code, sanitized
+            )
+        };
+        let _ = event_tx.send(HarnessEvent::Error(detail)).await;
+        let _ = event_tx
+            .send(HarnessEvent::Done {
+                session_id: String::new(),
+            })
+            .await;
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stripped = stdout.trim();
+
+    let message = if stripped.is_empty() {
+        let arg_summary = if extra_args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", extra_args.join(" "))
+        };
+        format!("gemini {}{}: no results", sub_label, arg_summary)
+    } else {
+        format!("```\n{}\n```", stripped)
+    };
+
+    let _ = event_tx.send(HarnessEvent::Text(message)).await;
+    let _ = event_tx
+        .send(HarnessEvent::Done {
+            session_id: String::new(),
+        })
+        .await;
 }
 
 #[async_trait]
@@ -1356,6 +1544,68 @@ mod tests {
         let a = build_session_key(HarnessKind::Gemini, "foo");
         let b = build_session_key(HarnessKind::Opencode, "foo");
         assert_ne!(a, b, "gemini and opencode keys must not collide");
+    }
+
+    // ── F5 chat-safe subcommand argv ─────────────────────────────────────────
+
+    #[test]
+    fn subcommand_argv_sessions_uses_list_sessions_flag() {
+        let argv = build_subcommand_argv(&GeminiSubcommand::Sessions, &[]);
+        assert_eq!(argv, vec!["--list-sessions".to_string()]);
+    }
+
+    #[test]
+    fn subcommand_argv_extensions_uses_list_extensions_flag() {
+        let argv = build_subcommand_argv(&GeminiSubcommand::Extensions, &[]);
+        assert_eq!(argv, vec!["--list-extensions".to_string()]);
+    }
+
+    #[test]
+    fn subcommand_argv_appends_extra_args() {
+        let extras = vec!["--max-count".into(), "5".into()];
+        let argv = build_subcommand_argv(&GeminiSubcommand::Sessions, &extras);
+        assert_eq!(argv[0], "--list-sessions");
+        assert_eq!(argv[1], "--max-count");
+        assert_eq!(argv[2], "5");
+    }
+
+    #[test]
+    fn subcommand_display_name_round_trip() {
+        assert_eq!(sub_display_name(&GeminiSubcommand::Sessions), "sessions");
+        assert_eq!(
+            sub_display_name(&GeminiSubcommand::Extensions),
+            "extensions"
+        );
+    }
+
+    /// run_subcommand must always produce a terminal Done, even on
+    /// spawn-failure paths. Same invariant as the prompt path.
+    #[tokio::test]
+    async fn subcommand_missing_binary_emits_error_then_done() {
+        let (tx, _rx) = broadcast::channel::<AmbientEvent>(8);
+        let config = GeminiConfig {
+            binary_path: Some(std::path::PathBuf::from(
+                "/nonexistent/gemini-binary-for-tests-c1f7",
+            )),
+            ..GeminiConfig::default()
+        };
+        let h = GeminiHarness::new(config, tx);
+        let mut rx = h
+            .run_subcommand(GeminiSubcommand::Sessions, vec![])
+            .await
+            .expect("run_subcommand returns receiver");
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("first event");
+        assert!(matches!(first, HarnessEvent::Error(ref m) if m.contains("not found")));
+
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("Done must follow Error");
+        assert!(matches!(second, HarnessEvent::Done { .. }));
     }
 
     // ── HarnessKind::from_str ──────────────────────────────────────────────
