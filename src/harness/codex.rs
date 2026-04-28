@@ -65,6 +65,11 @@ pub struct CodexHarness {
     /// form used for cross-harness isolation in state.
     sessions: Arc<StdMutex<HashMap<String, String>>>,
     ambient_tx: Option<broadcast::Sender<AmbientEvent>>,
+    /// Optional schema registry. When set, `--schema=<name>` resolves against
+    /// `[schemas.<name>]` in `terminus.toml` (in addition to the existing
+    /// inline-JSON / file-path forms). Required for full webhook-delivery
+    /// parity with the claude harness — see F11.
+    schema_registry: Option<Arc<crate::structured_output::SchemaRegistry>>,
 }
 
 impl CodexHarness {
@@ -74,6 +79,7 @@ impl CodexHarness {
             config,
             sessions: Arc::new(StdMutex::new(HashMap::new())),
             ambient_tx: Some(ambient_tx),
+            schema_registry: None,
         }
     }
 
@@ -84,7 +90,19 @@ impl CodexHarness {
             config,
             sessions: Arc::new(StdMutex::new(HashMap::new())),
             ambient_tx: None,
+            schema_registry: None,
         }
+    }
+
+    /// Builder: attach a [`SchemaRegistry`] so `--schema=<name>` can resolve
+    /// against `[schemas.<name>]` config entries, with full webhook-delivery
+    /// parity to the claude harness.
+    pub fn with_schema_registry(
+        mut self,
+        registry: Arc<crate::structured_output::SchemaRegistry>,
+    ) -> Self {
+        self.schema_registry = Some(registry);
+        self
     }
 }
 
@@ -125,8 +143,12 @@ impl Harness for CodexHarness {
         let attachment_paths: Vec<PathBuf> = attachments.iter().map(|a| a.path.clone()).collect();
 
         // Schema temp file (only when --schema is set).
-        let schema_temp = match handle_schema(options.schema.as_deref(), cwd) {
-            Ok(t) => t,
+        let resolved = match handle_schema(
+            options.schema.as_deref(),
+            cwd,
+            self.schema_registry.as_deref(),
+        ) {
+            Ok(r) => r,
             Err(msg) => {
                 let _ = event_tx.send(HarnessEvent::Error(msg)).await;
                 let _ = event_tx
@@ -137,6 +159,8 @@ impl Harness for CodexHarness {
                 return Ok(event_rx);
             }
         };
+        let schema_temp = resolved.temp;
+        let registered_schema_name = resolved.registered_name;
 
         let binary: PathBuf = self
             .config
@@ -169,6 +193,13 @@ impl Harness for CodexHarness {
             });
         }
 
+        // Decide whether this run should emit `HarnessEvent::StructuredOutput`
+        // (parity with claude) or fall back to plain `HarnessEvent::Text`.
+        let structured_schema_for_run: Option<String> = decide_structured_schema(
+            registered_schema_name.as_deref(),
+            self.schema_registry.as_deref(),
+        );
+
         let run_id_for_task = run_id.clone();
         // Move the schema temp + attachment paths into the task so they
         // outlive the subprocess. The schema TempFile drop-cleans the tmp
@@ -176,7 +207,13 @@ impl Harness for CodexHarness {
         tokio::spawn(async move {
             let _schema_guard = schema_temp;
 
-            let body = run_codex_inner(binary, args, cwd, event_tx.clone());
+            let body = run_codex_inner(
+                binary,
+                args,
+                cwd,
+                event_tx.clone(),
+                structured_schema_for_run,
+            );
             let result: std::result::Result<(), Box<dyn std::any::Any + Send>> =
                 AssertUnwindSafe(body).catch_unwind().await;
 
@@ -384,22 +421,85 @@ fn validate_attachments(attachments: &[Attachment]) -> std::result::Result<(), S
     Ok(())
 }
 
-/// Resolve the `--schema` option to a temp file path. Returns `Ok(None)` when
-/// no schema was requested. When the user provides a path that exists,
-/// codex needs the path on disk; we copy to a temp so the harness has a
-/// uniform "guard.path()" surface for argv construction.
+/// Resolved `--schema` source. The harness keeps the temp file alive across
+/// the run; the optional `registered_name` lets the spawned task know it
+/// should consider webhook delivery on success.
+#[derive(Debug)]
+struct ResolvedSchema {
+    temp: Option<TempFile>,
+    /// `Some(name)` when `--schema=<name>` matched a `[schemas.<name>]` entry
+    /// from `terminus.toml`. `None` for inline-JSON / file-path forms.
+    registered_name: Option<String>,
+}
+
+/// Decide whether a run should emit `HarnessEvent::StructuredOutput`
+/// (which feeds the webhook-delivery pipeline) or fall back to plain
+/// `HarnessEvent::Text`.
+///
+/// The structured-output path is taken iff:
+/// 1. `--schema=<registered-name>` matched a `[schemas.<name>]` entry, AND
+/// 2. that entry has a `webhook` URL configured.
+///
+/// Registry-driven so the security model (HMAC secret env var) is honoured —
+/// inline-JSON and file-path schema forms never trigger webhook delivery.
+fn decide_structured_schema(
+    registered_name: Option<&str>,
+    registry: Option<&crate::structured_output::SchemaRegistry>,
+) -> Option<String> {
+    let name = registered_name?;
+    let reg = registry?;
+    reg.webhook_for(name).map(|_| name.to_string())
+}
+
+/// Resolve the `--schema` option in priority order:
+/// 1. **Registered name** (`[schemas.<name>]` in `terminus.toml`) — only when
+///    a [`SchemaRegistry`] is attached. Highest priority because the security
+///    model (HMAC secret env var) is registry-driven.
+/// 2. **File path** — relative to `cwd` or absolute. Validated as UTF-8 +
+///    JSON before being copied to a temp.
+/// 3. **Inline JSON** — parsed and written to a temp.
+///
+/// Returns `Ok(ResolvedSchema { temp: None, registered_name: None })` when no
+/// schema was requested. When the user provides a path that exists, codex
+/// needs the path on disk; we copy to a temp so the harness has a uniform
+/// `guard.path()` surface for argv construction.
 fn handle_schema(
     schema: Option<&str>,
     cwd: &Path,
-) -> std::result::Result<Option<TempFile>, String> {
+    registry: Option<&crate::structured_output::SchemaRegistry>,
+) -> std::result::Result<ResolvedSchema, String> {
     let Some(s) = schema else {
-        return Ok(None);
+        return Ok(ResolvedSchema {
+            temp: None,
+            registered_name: None,
+        });
     };
     let s = s.trim();
     if s.is_empty() {
         return Err("codex: --schema value is empty".into());
     }
 
+    // (1) Registered-name lookup — beats path / inline-JSON forms.
+    if let Some(reg) = registry {
+        if let Some(value) = reg.schema_value(s) {
+            let bytes = match serde_json::to_vec_pretty(value) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(format!(
+                        "codex: failed to serialize registered schema '{}': {}",
+                        s, e
+                    ));
+                }
+            };
+            let temp = write_schema_temp(&bytes)?;
+            return Ok(ResolvedSchema {
+                temp,
+                registered_name: Some(s.to_string()),
+            });
+        }
+    }
+
+    // (2) File path.
     let candidate = if Path::new(s).is_absolute() {
         PathBuf::from(s)
     } else {
@@ -421,7 +521,10 @@ fn handle_schema(
         if let Err(e) = serde_json::from_str::<serde_json::Value>(text) {
             return Err(format!("codex: schema file is not valid JSON: {}", e));
         }
-        return write_schema_temp(&bytes);
+        return Ok(ResolvedSchema {
+            temp: write_schema_temp(&bytes)?,
+            registered_name: None,
+        });
     }
     // Explicit error for the "exists but not a file" case (typically a
     // directory). The previous fallthrough produced a misleading
@@ -433,13 +536,25 @@ fn handle_schema(
         ));
     }
 
+    // (3) Inline JSON.
     if let Err(e) = serde_json::from_str::<serde_json::Value>(s) {
+        // If a registry is attached, fold the known-schemas list into the
+        // error so users discover the registered-name shortcut.
+        let known_hint = match registry {
+            Some(reg) if !reg.schema_names().is_empty() => {
+                format!(" (registered schemas: {})", reg.schema_names().join(", "))
+            }
+            _ => String::new(),
+        };
         return Err(format!(
-            "codex: --schema is neither a file path nor valid JSON: {}",
-            e
+            "codex: --schema is neither a file path nor valid JSON{}: {}",
+            known_hint, e
         ));
     }
-    write_schema_temp(s.as_bytes())
+    Ok(ResolvedSchema {
+        temp: write_schema_temp(s.as_bytes())?,
+        registered_name: None,
+    })
 }
 
 fn write_schema_temp(bytes: &[u8]) -> std::result::Result<Option<TempFile>, String> {
@@ -463,6 +578,7 @@ fn write_schema_temp(bytes: &[u8]) -> std::result::Result<Option<TempFile>, Stri
 
 /// Wrapper around `tempfile::NamedTempFile` so the harness can hold and pass
 /// `&Path` references without exposing the inner type publicly.
+#[derive(Debug)]
 struct TempFile(tempfile::NamedTempFile);
 
 impl TempFile {
@@ -500,11 +616,19 @@ fn format_panic_message(info: &(dyn std::any::Any + Send)) -> String {
 /// Spawn the codex child, read NDJSON events, translate them, and drive a
 /// [`ToolPairingBuffer`] so emitted `HarnessEvent::ToolUse` entries carry
 /// both `input` (from `item.started`) and `output` (from `item.completed`).
+///
+/// When `structured_schema` is `Some(name)`, agent_message text is BUFFERED
+/// (not emitted as `HarnessEvent::Text`) and on the terminal `turn.completed`
+/// the buffer is parsed as JSON and emitted as `HarnessEvent::StructuredOutput
+/// { schema: name, value, run_id }`. This is the path that drives webhook
+/// delivery via `drive_harness`. When `None`, agent_message text streams as
+/// `HarnessEvent::Text` exactly as before (existing behavior preserved).
 async fn run_codex_inner(
     binary: PathBuf,
     args: Vec<String>,
     cwd: PathBuf,
     event_tx: mpsc::Sender<HarnessEvent>,
+    structured_schema: Option<String>,
 ) {
     let mut cmd = Command::new(&binary);
     cmd.args(&args)
@@ -582,6 +706,11 @@ async fn run_codex_inner(
     let mut first_unknown_logged = false;
     let mut fatal_error: Option<String> = None;
     let mut pairing = ToolPairingBuffer::new();
+    // Accumulator for the structured-output path. When `structured_schema` is
+    // `Some(_)`, agent_message text is appended here instead of streamed as
+    // `HarnessEvent::Text`; on `turn.completed` the buffer is parsed as JSON
+    // and emitted via `HarnessEvent::StructuredOutput`.
+    let mut structured_buffer: String = String::new();
 
     loop {
         let next =
@@ -637,7 +766,15 @@ async fn run_codex_inner(
                         TranslatedEvent::AgentMessage(text) => {
                             saw_recognized = true;
                             if !text.is_empty() {
-                                let _ = event_tx.send(HarnessEvent::Text(text)).await;
+                                if structured_schema.is_some() {
+                                    // Buffer for parse-and-emit on
+                                    // turn.completed. Concatenate without
+                                    // separators — codex's --output-schema
+                                    // produces a single JSON document.
+                                    structured_buffer.push_str(&text);
+                                } else {
+                                    let _ = event_tx.send(HarnessEvent::Text(text)).await;
+                                }
                             }
                         }
                         TranslatedEvent::ToolUseStart {
@@ -674,6 +811,47 @@ async fn run_codex_inner(
                         }
                         TranslatedEvent::TurnCompleted => {
                             saw_recognized = true;
+                            // Structured-output emission, if enabled. We only
+                            // attempt parse + emit when we actually accumulated
+                            // text — an empty buffer means codex returned no
+                            // agent_message at all, so falling through to the
+                            // `!saw_recognized` / "no response content" path
+                            // below is the right behaviour.
+                            if let Some(ref schema_name) = structured_schema {
+                                if !structured_buffer.is_empty() {
+                                    match serde_json::from_str::<serde_json::Value>(
+                                        &structured_buffer,
+                                    ) {
+                                        Ok(value) => {
+                                            let run_id = ulid::Ulid::new().to_string();
+                                            let _ = event_tx
+                                                .send(HarnessEvent::StructuredOutput {
+                                                    schema: schema_name.clone(),
+                                                    value,
+                                                    run_id,
+                                                })
+                                                .await;
+                                        }
+                                        Err(e) => {
+                                            // Schema-constrained mode but the
+                                            // model returned non-JSON — surface
+                                            // a clear error so the user knows
+                                            // delivery did NOT happen, and fall
+                                            // back to streaming the raw text
+                                            // so the content isn't lost.
+                                            let _ = event_tx
+                                                .send(HarnessEvent::Error(format!(
+                                                    "codex: --schema='{}' but response was not valid JSON: {}",
+                                                    schema_name, e
+                                                )))
+                                                .await;
+                                            let _ = event_tx
+                                                .send(HarnessEvent::Text(structured_buffer.clone()))
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
                             terminate = true;
                             break;
                         }
@@ -1234,16 +1412,24 @@ mod tests {
 
     #[test]
     fn handle_schema_none_returns_none() {
-        let result = handle_schema(None, Path::new("/tmp"));
-        assert!(matches!(result, Ok(None)));
+        let result = handle_schema(None, Path::new("/tmp"), None);
+        match result {
+            Ok(r) => {
+                assert!(r.temp.is_none());
+                assert!(r.registered_name.is_none());
+            }
+            Err(e) => panic!("expected Ok, got Err: {}", e),
+        }
     }
 
     #[test]
     fn handle_schema_inline_json_writes_temp() {
         let schema = r#"{"type":"object","required":["answer"]}"#;
-        let result = handle_schema(Some(schema), Path::new("/tmp"));
+        let result = handle_schema(Some(schema), Path::new("/tmp"), None);
         match result {
-            Ok(Some(temp)) => {
+            Ok(r) => {
+                assert!(r.registered_name.is_none(), "inline must not be registered");
+                let temp = r.temp.expect("inline JSON should produce a temp file");
                 let p = temp.path();
                 assert!(p.exists(), "temp file should exist while guard is held");
                 assert!(p.extension().map(|e| e == "json").unwrap_or(false));
@@ -1251,13 +1437,13 @@ mod tests {
                 let s = std::str::from_utf8(&bytes).unwrap();
                 assert!(s.contains("\"answer\""));
             }
-            other => panic!("expected Ok(Some(temp)), got {:?}", other.map(|_| ())),
+            Err(e) => panic!("expected Ok, got Err: {}", e),
         }
     }
 
     #[test]
     fn handle_schema_invalid_json_rejected() {
-        let result = handle_schema(Some("not json {"), Path::new("/tmp"));
+        let result = handle_schema(Some("not json {"), Path::new("/tmp"), None);
         match result {
             Err(msg) => {
                 assert!(
@@ -1272,7 +1458,7 @@ mod tests {
 
     #[test]
     fn handle_schema_empty_string_rejected() {
-        let result = handle_schema(Some("   "), Path::new("/tmp"));
+        let result = handle_schema(Some("   "), Path::new("/tmp"), None);
         match result {
             Err(msg) => assert!(msg.contains("empty"), "got: {}", msg),
             Ok(_) => panic!("expected error on empty"),
@@ -1836,14 +2022,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("schema.json");
         std::fs::write(&path, r#"{"type":"object"}"#).expect("write");
-        let result = handle_schema(Some(path.to_str().unwrap()), dir.path());
+        let result = handle_schema(Some(path.to_str().unwrap()), dir.path(), None);
         match result {
-            Ok(Some(temp)) => {
+            Ok(r) => {
+                let temp = r.temp.expect("file path should produce a temp");
                 let bytes = std::fs::read(temp.path()).expect("read");
                 let s = std::str::from_utf8(&bytes).unwrap();
                 assert!(s.contains("\"object\""), "got: {}", s);
+                assert!(r.registered_name.is_none());
             }
-            other => panic!("expected Ok(Some(temp)), got {:?}", other.map(|_| ())),
+            Err(e) => panic!("expected Ok, got Err: {}", e),
         }
     }
 
@@ -1852,7 +2040,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("not-json.txt");
         std::fs::write(&path, "this is not json").expect("write");
-        let result = handle_schema(Some(path.to_str().unwrap()), dir.path());
+        let result = handle_schema(Some(path.to_str().unwrap()), dir.path(), None);
         match result {
             Err(msg) => {
                 assert!(
@@ -1868,7 +2056,7 @@ mod tests {
     #[test]
     fn handle_schema_directory_path_emits_explicit_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let result = handle_schema(Some(dir.path().to_str().unwrap()), dir.path());
+        let result = handle_schema(Some(dir.path().to_str().unwrap()), dir.path(), None);
         match result {
             Err(msg) => {
                 assert!(
@@ -1886,11 +2074,140 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("binary.bin");
         std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x00]).expect("write");
-        let result = handle_schema(Some(path.to_str().unwrap()), dir.path());
+        let result = handle_schema(Some(path.to_str().unwrap()), dir.path(), None);
         match result {
             Err(msg) => assert!(msg.contains("UTF-8"), "got: {}", msg),
             Ok(_) => panic!("expected UTF-8 rejection"),
         }
+    }
+
+    // ── F11: registered-schema name resolution ──────────────────────────────
+
+    fn registry_with(
+        name: &str,
+        webhook: Option<&str>,
+        env: Option<&str>,
+    ) -> Arc<crate::structured_output::SchemaRegistry> {
+        // Helper: build a registry with one schema entry. When `webhook` is
+        // Some, `env` must also be Some and that env var must be set; the
+        // registry validation will fail otherwise.
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            name.to_string(),
+            crate::config::SchemaEntry {
+                schema: r#"{"type":"object","required":["answer"]}"#.to_string(),
+                webhook: webhook.map(|s| s.to_string()),
+                webhook_secret_env: env.map(|s| s.to_string()),
+            },
+        );
+        Arc::new(crate::structured_output::SchemaRegistry::from_config(&entries).expect("registry"))
+    }
+
+    #[test]
+    fn argv_schema_registered_name_resolved_via_registry() {
+        let reg = registry_with("todos_v1", None, None);
+        let resolved = handle_schema(Some("todos_v1"), Path::new("/tmp"), Some(&reg))
+            .expect("registered name should resolve");
+        assert_eq!(resolved.registered_name.as_deref(), Some("todos_v1"));
+        let temp = resolved
+            .temp
+            .expect("registered schema produces a temp file");
+        let bytes = std::fs::read(temp.path()).expect("read");
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            s.contains("\"answer\""),
+            "temp must hold the registered schema's value, got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn registered_name_takes_priority_over_inline_json() {
+        // When a registry contains a name that ALSO happens to parse as JSON,
+        // the registered form wins. This is the security-relevant ordering:
+        // a malicious user can't bypass the registry by passing inline JSON
+        // with the same shape.
+        let reg = registry_with("inline_v1", None, None);
+        // The argument here is just the schema name; if priority were
+        // reversed, this would fall through to inline-JSON path and fail
+        // because "inline_v1" is not valid JSON.
+        let resolved = handle_schema(Some("inline_v1"), Path::new("/tmp"), Some(&reg))
+            .expect("registered name should resolve first");
+        assert_eq!(resolved.registered_name.as_deref(), Some("inline_v1"));
+    }
+
+    #[test]
+    fn unknown_registered_name_falls_through_to_inline() {
+        let reg = registry_with("known_v1", None, None);
+        // "unknown_v1" is not in the registry; if it were ALSO not valid
+        // JSON, we'd get the inline-parse-error path. Pass a JSON-ish name
+        // to verify the fall-through works.
+        let inline = r#"{"type":"object"}"#;
+        let resolved = handle_schema(Some(inline), Path::new("/tmp"), Some(&reg))
+            .expect("inline JSON should still work when registry exists");
+        assert!(resolved.registered_name.is_none());
+        assert!(resolved.temp.is_some());
+    }
+
+    #[test]
+    fn inline_json_schema_unchanged_emits_text() {
+        // Regression guard: inline-JSON schemas (the v1 form) are NEVER
+        // routed through the structured-output / webhook path even when a
+        // registry is attached. They produce a temp file with no
+        // `registered_name`, so `decide_structured_schema` returns None.
+        let reg = registry_with("known_v1", Some("https://e.example/wh"), Some("HOME"));
+        let inline = r#"{"type":"object","properties":{"x":{"type":"string"}}}"#;
+        let resolved = handle_schema(Some(inline), Path::new("/tmp"), Some(&reg))
+            .expect("inline JSON should resolve");
+        assert!(
+            resolved.registered_name.is_none(),
+            "inline JSON must never carry a registered_name"
+        );
+        assert!(
+            decide_structured_schema(resolved.registered_name.as_deref(), Some(&reg)).is_none(),
+            "inline JSON must never trigger structured-output emission"
+        );
+    }
+
+    #[test]
+    fn run_prompt_emits_structured_output_when_schema_registered_with_webhook() {
+        // Unit-level surrogate for the integration test. We can't spawn
+        // codex in a unit test, but we CAN pin the decision logic:
+        // `decide_structured_schema` returns Some(name) iff the registry
+        // has a webhook configured for that name.
+        // HOME is a guaranteed-set env var in tests; using it spares the
+        // test from setting/unsetting custom env vars.
+        let reg = registry_with("orders_v1", Some("https://e.example/wh"), Some("HOME"));
+        assert_eq!(
+            decide_structured_schema(Some("orders_v1"), Some(&reg)),
+            Some("orders_v1".to_string()),
+            "registered name + webhook → StructuredOutput emission"
+        );
+    }
+
+    #[test]
+    fn run_prompt_falls_back_to_text_when_schema_registered_without_webhook() {
+        let reg = registry_with("orders_v1", None, None);
+        assert_eq!(
+            decide_structured_schema(Some("orders_v1"), Some(&reg)),
+            None,
+            "registered name without webhook → fall back to Text"
+        );
+    }
+
+    #[test]
+    fn registered_name_priority_documented_in_inline_error() {
+        // When inline-JSON parse fails AND a registry is attached, the
+        // error should list the registered names so users discover the
+        // shortcut.
+        let reg = registry_with("orders_v1", None, None);
+        let err = handle_schema(Some("not json {"), Path::new("/tmp"), Some(&reg))
+            .expect_err("invalid input should error");
+        assert!(
+            err.contains("orders_v1"),
+            "error should mention registered schemas; got: {}",
+            err
+        );
     }
 
     // ── Test gaps: validate_attachments edge cases ─────────────────────────

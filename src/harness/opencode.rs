@@ -104,7 +104,7 @@ impl Harness for OpencodeHarness {
         if options.schema.is_some() {
             let _ = event_tx
                 .send(HarnessEvent::Error(
-                    "opencode does not support --schema. Try: `: claude --schema=<name> <prompt>`"
+                    "opencode does not support --schema. Try: `: claude --schema=<name> <prompt>` or `: codex --schema=<name> <prompt>`"
                         .into(),
                 ))
                 .await;

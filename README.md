@@ -52,7 +52,7 @@ terminus gives you remote access to terminal sessions and AI harnesses from your
 ³ Tool-use events from gemini arrive as separate `tool_use` + `tool_result` frames linked by `tool_id`; terminus coalesces them into a single event with both input and output. Enable tool-using behavior with `--approval-mode yolo` (or `auto_edit` / `plan`)
 ⁴ Inbound attachments (images / files) are rejected by the gemini harness with a chat-safe error rather than silently dropped; multimodal threading is a follow-up
 ⁵ Tool-use events from codex arrive as paired `item.started` + `item.completed` frames linked by `item.id` for tool kinds (`command_execution`, `file_change`, `mcp_tool_call`, `web_search`, `plan_update`); `agent_message` items go straight to text. terminus reuses the same `ToolPairingBuffer` as gemini
-⁶ Codex `--schema` accepts inline JSON or a file path; the value is validated as JSON, written to a temp file, and passed as `--output-schema <path>`. The validated response is rendered as a fenced JSON block in chat (no webhook delivery — that path is claude-only)
+⁶ Codex `--schema` accepts three forms — registered name (`[schemas.<name>]` in `terminus.toml`), file path, or inline JSON — all resolved to a temp file and passed as `--output-schema <path>`. The registered-name form additionally feeds the webhook-delivery pipeline (HMAC-SHA256, retry queue, full parity with claude). Inline-JSON and file-path forms render as chat-only fenced JSON, no webhook delivery.
 ⁷ Image-only attachment whitelist (case-insensitive): `image/png`, `image/jpeg`, `image/jpg`, `image/webp`. Non-image MIME types are rejected with a chat-safe error
 
 ---
@@ -424,7 +424,7 @@ Optional overrides:
 
 **Blocked from chat** (run in your terminal instead): `acp`, `agent`, `attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`, `session`, `tui`, `uninstall`, `upgrade`, `web`. Terminus returns a clear error if you try these from chat. Note: `session list` / `session ls` and `auth list` / `auth ls` ARE supported as safe read-only aliases.
 
-**`--schema` is not supported.** Opencode's CLI has no schema-constrained output surface; passing `--schema` to `: opencode ...` returns a chat-safe redirect error pointing at the claude harness. Use `: claude --schema=<name> <prompt>` for validated structured output (full pipeline including webhook delivery + retry queue) or `: codex --schema=<inline-or-path> <prompt>` for chat-only validation without webhook delivery.
+**`--schema` is not supported.** Opencode's CLI has no schema-constrained output surface; passing `--schema` to `: opencode ...` returns a chat-safe redirect error pointing at the claude harness. Use `: claude --schema=<name> <prompt>` or `: codex --schema=<name> <prompt>` for validated structured output with full webhook delivery (both harnesses now ship the same pipeline).
 
 See [docs/opencode.md](docs/opencode.md) for the full CLI reference.
 
@@ -452,7 +452,7 @@ Optional overrides:
 
 **Per-prompt flags:** `--name`, `--resume`, `--continue` (named or bare), `--model` / `-m`, `--approval-mode`. Opencode-only flags (`--title`, `--share`, `--pure`, `--fork`) are not supported by gemini and return a parse error. Attachments (images / files) are rejected with a chat-safe error -- multimodal threading is a follow-up.
 
-**`--schema` is not supported.** Gemini-cli has no schema-constrained output surface; passing `--schema` to `: gemini ...` returns a chat-safe redirect error pointing at the claude harness. Use `: claude --schema=<name> <prompt>` for validated structured output with webhook delivery, or `: codex --schema=<inline-or-path> <prompt>` for chat-only validation without webhook delivery.
+**`--schema` is not supported.** Gemini-cli has no schema-constrained output surface; passing `--schema` to `: gemini ...` returns a chat-safe redirect error pointing at the claude harness. Use `: claude --schema=<name> <prompt>` or `: codex --schema=<name> <prompt>` for validated structured output with full webhook delivery.
 
 See [docs/gemini.md](docs/gemini.md) for the full CLI reference, event schema, error table, and functionality matrix.
 
@@ -494,7 +494,7 @@ Optional overrides:
 
 **Blocked from chat** (interactive, destructive, or v1.1-deferred; run in your terminal instead): `login`, `logout`, `mcp`, `mcp-server`, `app`, `app-server`, `exec-server`, `plugin`, `completion`, `features`, `debug`, `sandbox` (subcommand form, distinct from `--sandbox` flag), `cloud`, `apply`, `review`, `resume` (use `--resume <name>` flag), `fork`, `sessions`. All return targeted chat-safe error messages.
 
-**Per-prompt flags:** `--name`, `--resume`, `--continue` (named or bare), `--model` / `-m`, `--sandbox`, `--profile` (no `-p` short alias — collides with claude's `--permission-mode`), `--schema` (inline JSON or file path; passed as `--output-schema`. Validated response renders as a fenced JSON block in chat — **no webhook delivery; use the claude harness if you need it POSTed to a webhook with HMAC-signed retry**). Image attachments (`image/png`, `image/jpeg`, `image/jpg`, `image/webp`) are forwarded via codex's `-i` flag.
+**Per-prompt flags:** `--name`, `--resume`, `--continue` (named or bare), `--model` / `-m`, `--sandbox`, `--profile` (no `-p` short alias — collides with claude's `--permission-mode`), `--add-dir` / `-d` (repeatable, codex 0.125.0+), `--schema` (three forms — registered name from `[schemas.<name>]`, file path, or inline JSON; all passed as `--output-schema`. Registered names additionally drive webhook delivery with HMAC-SHA256-signed POST + retry queue, full parity with claude). Image attachments (`image/png`, `image/jpeg`, `image/jpg`, `image/webp`) are forwarded via codex's `-i` flag.
 
 See [docs/codex.md](docs/codex.md) for the full CLI reference, verified event schema, error table, and functionality matrix.
 
@@ -707,11 +707,11 @@ terminus can instruct an AI harness to emit a validated JSON response that match
 | Harness  | Schema validation | In-chat fenced JSON | Webhook delivery + retry queue |
 |----------|:----:|:----:|:----:|
 | claude   |  ✓   |  ✓   | ✓ (full pipeline below) |
-| codex    |  ✓   |  ✓   | ✗ (chat-only; use claude for downstream POST) |
+| codex    |  ✓   |  ✓   | ✓ (registered names only; inline-JSON / file-path forms remain chat-only) |
 | opencode |  ✗   |  ✗   | n/a |
 | gemini   |  ✗   |  ✗   | n/a |
 
-The full pipeline below — write-ahead queue, HMAC-signed webhook delivery, exponential-backoff retry — applies only to the claude harness. The codex harness validates the schema and renders the result in chat, but does not feed the delivery queue.
+The codex harness reaches webhook parity with claude when `--schema=<name>` resolves against a `[schemas.<name>]` entry in `terminus.toml`. Inline-JSON and file-path forms (`--schema='{...}'` / `--schema=path/to/schema.json`) remain chat-only — they validate against the schema but never feed the delivery queue, because the security model (HMAC secret env var) is registry-driven.
 
 ### Why
 

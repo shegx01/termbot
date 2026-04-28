@@ -141,7 +141,8 @@ impl App {
         let gemini = GeminiHarness::new(gemini_cfg, ambient_tx.clone());
         harnesses.insert(HarnessKind::Gemini, Box::new(gemini));
         let codex_cfg = config.harness.codex.clone().unwrap_or_default();
-        let codex = CodexHarness::new(codex_cfg, ambient_tx.clone());
+        let codex = CodexHarness::new(codex_cfg, ambient_tx.clone())
+            .with_schema_registry(Arc::clone(&schema_registry));
         harnesses.insert(HarnessKind::Codex, Box::new(codex));
 
         // Hydrate active chat sets from persisted state.
