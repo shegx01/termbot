@@ -236,36 +236,8 @@ impl Harness for CodexHarness {
     }
 }
 
-/// `Arc<CodexHarness>` forwarder so `App` can hold a strong named handle and
-/// insert a clone into the `harnesses: HashMap<HarnessKind, Box<dyn Harness>>`
-/// map without double-boxing.
-#[async_trait]
-impl Harness for Arc<CodexHarness> {
-    fn kind(&self) -> HarnessKind {
-        (**self).kind()
-    }
-    fn supports_resume(&self) -> bool {
-        (**self).supports_resume()
-    }
-    async fn run_prompt(
-        &self,
-        prompt: &str,
-        attachments: &[Attachment],
-        cwd: &Path,
-        session_id: Option<&str>,
-        options: &HarnessOptions,
-    ) -> Result<mpsc::Receiver<HarnessEvent>> {
-        (**self)
-            .run_prompt(prompt, attachments, cwd, session_id, options)
-            .await
-    }
-    fn get_session_id(&self, session_name: &str) -> Option<String> {
-        (**self).get_session_id(session_name)
-    }
-    fn set_session_id(&self, session_name: &str, session_id: String) {
-        (**self).set_session_id(session_name, session_id)
-    }
-}
+// `Arc<CodexHarness>` is a `Harness` via the blanket `impl<H> Harness for
+// `Arc<H>` in `harness::mod`. No per-type forwarder needed.
 
 /// Build the argv for `codex exec [...] --json [...]`. Pure function —
 /// `session_id` is the *resolved* codex thread_id (or `None` for fresh).

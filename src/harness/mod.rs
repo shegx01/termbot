@@ -230,6 +230,57 @@ pub trait Harness: Send + Sync {
     fn set_session_id(&self, session_name: &str, id: String);
 }
 
+/// Blanket impl: every `Arc<H>` is itself a `Harness` when `H: Harness`.
+///
+/// This replaces three near-identical hand-rolled `impl Harness for
+/// Arc<HarnessXxx>` forwarders (one each for codex, gemini, opencode). The
+/// motivating use site is `App::new`, which holds a typed `Arc<OpencodeHarness>`
+/// for direct shutdown access while also inserting a clone into the
+/// type-erased `harnesses: HashMap<HarnessKind, Box<dyn Harness>>` map.
+///
+/// Bounds rationale:
+/// - `H: Harness` — `Arc<H>` only forwards calls the trait already supports.
+/// - `Send + Sync` — required because the trait itself is `Send + Sync` and
+///   the blanket must satisfy it for the resulting `Arc<H>` to be insertable
+///   into `Box<dyn Harness>`.
+/// - `'static` — necessary so the boxed `dyn Harness` satisfies `'static` (the
+///   trait-object default lifetime), otherwise `Box::new(arc) as Box<dyn
+///   Harness>` would fail.
+#[async_trait]
+impl<H> Harness for std::sync::Arc<H>
+where
+    H: Harness + Send + Sync + 'static,
+{
+    fn kind(&self) -> HarnessKind {
+        (**self).kind()
+    }
+
+    fn supports_resume(&self) -> bool {
+        (**self).supports_resume()
+    }
+
+    async fn run_prompt(
+        &self,
+        prompt: &str,
+        attachments: &[Attachment],
+        cwd: &Path,
+        session_id: Option<&str>,
+        options: &HarnessOptions,
+    ) -> Result<mpsc::Receiver<HarnessEvent>> {
+        (**self)
+            .run_prompt(prompt, attachments, cwd, session_id, options)
+            .await
+    }
+
+    fn get_session_id(&self, session_name: &str) -> Option<String> {
+        (**self).get_session_id(session_name)
+    }
+
+    fn set_session_id(&self, session_name: &str, session_id: String) {
+        (**self).set_session_id(session_name, session_id)
+    }
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();

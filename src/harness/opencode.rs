@@ -246,36 +246,11 @@ impl Harness for OpencodeHarness {
     }
 }
 
-/// `Arc<OpencodeHarness>` forwarder so `App` can hold a strong named handle
-/// and insert a clone into the `harnesses: HashMap<HarnessKind, Box<dyn
-/// Harness>>` map without double-boxing.
-#[async_trait]
-impl Harness for Arc<OpencodeHarness> {
-    fn kind(&self) -> HarnessKind {
-        (**self).kind()
-    }
-    fn supports_resume(&self) -> bool {
-        (**self).supports_resume()
-    }
-    async fn run_prompt(
-        &self,
-        prompt: &str,
-        attachments: &[Attachment],
-        cwd: &Path,
-        session_id: Option<&str>,
-        options: &HarnessOptions,
-    ) -> Result<mpsc::Receiver<HarnessEvent>> {
-        (**self)
-            .run_prompt(prompt, attachments, cwd, session_id, options)
-            .await
-    }
-    fn get_session_id(&self, session_name: &str) -> Option<String> {
-        (**self).get_session_id(session_name)
-    }
-    fn set_session_id(&self, session_name: &str, session_id: String) {
-        (**self).set_session_id(session_name, session_id)
-    }
-}
+// `Arc<OpencodeHarness>` is a `Harness` via the blanket `impl<H> Harness
+// for `Arc<H>` in `harness::mod`. The `App` layer holds a typed
+// `Arc<OpencodeHarness>` for direct shutdown access while inserting a
+// clone into the type-erased `harnesses: HashMap<HarnessKind, Box<dyn
+// Harness>>` map.
 
 /// Strip ANSI escape sequences (CSI sequences and simple OSC). Hand-rolled
 /// to avoid a new crate dep — matches `\x1b[...m`, `\x1b[...K`, and similar.
