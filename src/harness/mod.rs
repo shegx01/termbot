@@ -230,6 +230,155 @@ pub trait Harness: Send + Sync {
     fn set_session_id(&self, session_name: &str, id: String);
 }
 
+/// Blanket impl: every `Arc<H>` is itself a `Harness` when `H: Harness`.
+///
+/// This replaces three near-identical hand-rolled `impl Harness for
+/// Arc<HarnessXxx>` forwarders (one each for codex, gemini, opencode). The
+/// motivating use site is `App::new`, which holds a typed `Arc<OpencodeHarness>`
+/// for direct shutdown access while also inserting a clone into the
+/// type-erased `harnesses: HashMap<HarnessKind, Box<dyn Harness>>` map.
+///
+/// Bounds rationale:
+/// - `H: Harness` — `Arc<H>` only forwards calls the trait already supports.
+/// - `Send + Sync` — required because the trait itself is `Send + Sync` and
+///   the blanket must satisfy it for the resulting `Arc<H>` to be insertable
+///   into `Box<dyn Harness>`.
+/// - `'static` — necessary so the boxed `dyn Harness` satisfies `'static` (the
+///   trait-object default lifetime), otherwise `Box::new(arc) as Box<dyn
+///   Harness>` would fail.
+#[async_trait]
+impl<H> Harness for std::sync::Arc<H>
+where
+    H: Harness + Send + Sync + 'static,
+{
+    fn kind(&self) -> HarnessKind {
+        (**self).kind()
+    }
+
+    fn supports_resume(&self) -> bool {
+        (**self).supports_resume()
+    }
+
+    async fn run_prompt(
+        &self,
+        prompt: &str,
+        attachments: &[Attachment],
+        cwd: &Path,
+        session_id: Option<&str>,
+        options: &HarnessOptions,
+    ) -> Result<mpsc::Receiver<HarnessEvent>> {
+        (**self)
+            .run_prompt(prompt, attachments, cwd, session_id, options)
+            .await
+    }
+
+    fn get_session_id(&self, session_name: &str) -> Option<String> {
+        (**self).get_session_id(session_name)
+    }
+
+    fn set_session_id(&self, session_name: &str, session_id: String) {
+        (**self).set_session_id(session_name, session_id)
+    }
+}
+
+/// Sanitize a stderr string before forwarding it to chat. Shared base for the
+/// codex, gemini, and opencode harnesses; each may pre-filter known-benign
+/// log lines via a small per-harness wrapper before calling this.
+///
+/// The transformation pipeline:
+/// 1. **Env-var redaction** — `KEY=value` patterns where `KEY` starts with an
+///    ASCII alphabetic char and contains only `[A-Za-z0-9_]` are replaced
+///    with `KEY=<redacted>`. Values are line-bounded (`\n` / `\r`) rather
+///    than whitespace-bounded so a quoted secret like `KEY='secret with
+///    spaces'` is fully redacted. Slight over-redaction of prose like
+///    `name=hello` is acceptable; the alternative — missing a real key —
+///    leaks credentials into the chat log.
+/// 2. **Absolute-user-path redaction** — `/Users/<name>/…` and `/home/<name>/…`
+///    prefixes are replaced with `<redacted-path>`.
+/// 3. **500-char truncation** — applied last so the redaction can't leak a
+///    partial prefix near the boundary.
+///
+/// The raw content should be logged at `tracing::debug!` by the caller so
+/// operators can diagnose via `RUST_LOG=debug` without shipping raw content.
+pub(crate) fn sanitize_stderr_base(s: &str) -> String {
+    // (1) Env-var redaction.
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        if let Some(pos) = rest.find('=') {
+            let before = &rest[..pos];
+            let key_start = before
+                .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let key = &before[key_start..];
+            let is_env_key = !key.is_empty()
+                && key.starts_with(|c: char| c.is_ascii_alphabetic())
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+
+            if is_env_key {
+                out.push_str(&rest[..key_start]);
+                out.push_str(key);
+                out.push('=');
+                out.push_str("<redacted>");
+                let after_eq = &rest[pos + 1..];
+                // Line-bounded (NOT whitespace-bounded) so quoted values
+                // containing spaces don't leak.
+                let val_end = after_eq.find(['\n', '\r']).unwrap_or(after_eq.len());
+                rest = &after_eq[val_end..];
+                continue;
+            }
+
+            out.push_str(&rest[..pos + 1]);
+            rest = &rest[pos + 1..];
+        } else {
+            out.push_str(rest);
+            break;
+        }
+    }
+
+    // (2) Absolute user-path redaction.
+    //
+    // Replace the entire path-shaped run starting at `/Users/<u>/…` or
+    // `/home/<u>/…` with a single `<redacted-path>` placeholder, ending at
+    // the first whitespace or end-of-line. The previous implementation
+    // skipped only past the username + first `/`, which let
+    // `<redacted-path>secret-project/key.pem` survive — leaking directory
+    // structure that's often as sensitive as the username (C6.P1.1).
+    //
+    // A path component is anything not ASCII-whitespace and not a path
+    // terminator like `:` or `,`. We use the conservative rule "advance
+    // until whitespace or end-of-line" since most stderr prints paths
+    // followed by a space or `\n`. Trailing punctuation like `:42` or `,`
+    // after a path is preserved by stopping at non-path characters.
+    let patterns: &[&str] = &["/Users/", "/home/"];
+    let mut result = out;
+    for needle in patterns {
+        if result.contains(needle) {
+            let mut new_result = String::with_capacity(result.len());
+            let mut scan = result.as_str();
+            while let Some(idx) = scan.find(needle) {
+                new_result.push_str(&scan[..idx]);
+                new_result.push_str("<redacted-path>");
+                // Advance past the entire path. Stop at whitespace
+                // (space / tab / newline) or end-of-string. This redacts
+                // both `<u>` and every nested directory + filename so the
+                // chat output reveals nothing about the layout.
+                let after_needle = &scan[idx..];
+                let path_end = after_needle
+                    .find(|c: char| c.is_ascii_whitespace())
+                    .unwrap_or(after_needle.len());
+                scan = &after_needle[path_end..];
+            }
+            new_result.push_str(scan);
+            result = new_result;
+        }
+    }
+
+    // (3) 500-char truncation.
+    result.chars().take(500).collect()
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -1053,5 +1202,108 @@ mod tests {
             ToolPairingBuffer::CAP,
             "pending must not exceed CAP"
         );
+    }
+
+    // ── sanitize_stderr_base ─────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_stderr_base_redacts_uppercase_env_var() {
+        let out = sanitize_stderr_base("API_KEY=sk-abc123 went bad\n");
+        assert!(!out.contains("sk-abc123"), "value leaked: {}", out);
+        assert!(out.contains("API_KEY"));
+    }
+
+    #[test]
+    fn sanitize_stderr_base_redacts_lowercase_env_var() {
+        // Lowercase keys (e.g. `gemini_api_key`) must also be redacted —
+        // codex / gemini both use this convention.
+        let out = sanitize_stderr_base("gemini_api_key=AIzaSy-redact-me\n");
+        assert!(!out.contains("AIzaSy-redact-me"), "value leaked: {}", out);
+        assert!(out.contains("gemini_api_key"));
+    }
+
+    #[test]
+    fn sanitize_stderr_base_redacts_value_through_to_end_of_line() {
+        // A quoted value with embedded whitespace must redact to end-of-line,
+        // not stop at the first space.
+        let out = sanitize_stderr_base("KEY='secret with spaces' next-token\n");
+        assert!(!out.contains("secret with spaces"), "leaked: {}", out);
+    }
+
+    #[test]
+    fn sanitize_stderr_base_redacts_user_path() {
+        let out = sanitize_stderr_base("crash at /Users/alice/code/foo.rs:42");
+        assert!(!out.contains("/Users/alice/"));
+        assert!(out.contains("<redacted-path>"));
+    }
+
+    #[test]
+    fn sanitize_stderr_base_redacts_home_path() {
+        let out = sanitize_stderr_base("/home/bob/proj exploded");
+        assert!(!out.contains("/home/bob/"));
+    }
+
+    #[test]
+    fn sanitize_stderr_base_truncates_to_500_chars() {
+        let long = "x".repeat(800);
+        assert!(sanitize_stderr_base(&long).chars().count() <= 500);
+    }
+
+    #[test]
+    fn sanitize_stderr_base_preserves_safe_content() {
+        let s = "model quota exceeded; try again later";
+        assert_eq!(sanitize_stderr_base(s), s);
+    }
+
+    /// Critic-6 P1: the previous path-redaction algorithm advanced past
+    /// `/Users/<u>/` and resumed scanning, so `secret-project/key.pem` would
+    /// survive in the chat output. The new algorithm replaces the entire
+    /// path run (until whitespace) with a single placeholder.
+    #[test]
+    fn sanitize_stderr_base_redacts_full_path_not_just_username() {
+        let s = "stat failed: /Users/bob/secret-project/key.pem missing";
+        let out = sanitize_stderr_base(s);
+        assert!(
+            !out.contains("secret-project"),
+            "directory after username must be redacted, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("key.pem"),
+            "filename must be redacted, got: {}",
+            out
+        );
+        // Surrounding prose stays.
+        assert!(out.contains("stat failed:"), "prose dropped: {}", out);
+        assert!(
+            out.contains("missing"),
+            "post-path token must be preserved (stops at whitespace), got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn sanitize_stderr_base_redacts_home_path_with_nested_dirs() {
+        let s = "/home/alice/code/project/src/main.rs:42";
+        let out = sanitize_stderr_base(s);
+        assert!(!out.contains("alice"));
+        assert!(!out.contains("code"));
+        assert!(!out.contains("project"));
+        assert!(!out.contains("main.rs"));
+        // The trailing `:42` is part of the path-token and gets consumed
+        // (no whitespace before EOL); acceptable behaviour — if the input
+        // had a space (e.g. `path:42 panic`) we'd preserve `panic`.
+    }
+
+    #[test]
+    fn sanitize_stderr_base_path_redaction_preserves_post_whitespace_diagnostics() {
+        // Bracketing whitespace marks the path boundary so prose survives.
+        let s = "error at /Users/dave/etc/config and at /home/dave/.bashrc continues";
+        let out = sanitize_stderr_base(s);
+        assert!(!out.contains("dave"));
+        assert!(!out.contains(".bashrc"));
+        assert!(out.contains("error at"));
+        assert!(out.contains("continues"));
+        assert!(out.contains("and at"), "prose between two paths kept");
     }
 }

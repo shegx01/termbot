@@ -11,6 +11,7 @@ The opencode harness wraps the `opencode` CLI as a short-lived subprocess per pr
 - [Configuration](#configuration)
 - [Error messages](#error-messages)
 - [Mobile keyboard normalization](#mobile-keyboard-normalization)
+- [Reliability guarantees](#reliability-guarantees)
 - [Testing](#testing)
 
 ---
@@ -162,7 +163,7 @@ The `[harness.opencode]` block in `terminus.toml` is entirely optional. If omitt
 | `opencode: no response content` | Exit 0, zero recognized events | Model returned nothing; check provider quota |
 | `opencode: no recognized events received (version drift — check opencode --version)` | Exit 0, only unknown events | Upgrade or downgrade opencode to a compatible version |
 | `opencode: event schema mismatch (version drift — check opencode --version)` | Recognized event type but required field missing | opencode's JSON shape changed; report to terminus |
-| `opencode does not support --schema. Try: : claude --schema=<name> <prompt>` | `--schema` flag passed to opencode harness | Use the claude harness for structured output |
+| `opencode does not support --schema. Try: : claude --schema=<registered-name> <prompt> or : codex --schema=<registered-name> <prompt> (codex also accepts inline-JSON / file-path schema forms, but only registered names trigger webhook delivery)` | `--schema` flag passed to opencode harness | Use the claude or codex harness for structured output |
 | `opencode <sub> is not available from chat — run it in your terminal. Safe chat subcommands: models, stats, sessions, providers, export.` | Blocked subcommand invoked | Use a safe subcommand or run the native command in terminal |
 
 ---
@@ -182,6 +183,21 @@ Parses identically to:
 ```
 
 En-dash (U+2013) is intentionally NOT normalized — it appears in legitimate prose (e.g., page ranges `5–10`).
+
+---
+
+## Reliability guarantees
+
+The harness mirrors the structural-fix parity from the codex template:
+
+| Guarantee | Mechanism |
+|---|---|
+| Every error path emits a terminal `HarnessEvent::Done` | Spawn-failure, stdout-pipe-missing, panic, idle-timeout, and stdout-read-error paths all fan into a `Done` so socket and chat receivers never hang |
+| Stdout-pipe-missing reaps the child | After `child.kill()`, an explicit `child.wait()` runs so the OS process-table entry is freed (kill_on_drop alone does not call wait) |
+| Stderr is drained concurrently with stdout | A spawned task reads up to 64 KiB of stderr into a buffer in parallel with the stdout JSON loop, preventing pipe-deadlock when opencode writes substantial stderr at the same time as stdout |
+| Mutex poisoning recovers gracefully | `sessions.lock().unwrap_or_else(\|e\| e.into_inner())` so a panic in one session-mutating call doesn't take down subsequent reads |
+
+The validation `missing_binary_emits_error_then_done` pins the spawn-failure invariant; the codex harness has the equivalent battery for its template.
 
 ---
 

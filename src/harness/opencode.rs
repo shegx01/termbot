@@ -104,7 +104,7 @@ impl Harness for OpencodeHarness {
         if options.schema.is_some() {
             let _ = event_tx
                 .send(HarnessEvent::Error(
-                    "opencode does not support --schema. Try: `: claude --schema=<name> <prompt>`"
+                    "opencode does not support --schema. Try: `: claude --schema=<registered-name> <prompt>` or `: codex --schema=<registered-name> <prompt>` (codex also accepts inline-JSON / file-path schema forms, but only registered names trigger webhook delivery)"
                         .into(),
                 ))
                 .await;
@@ -202,6 +202,14 @@ impl Harness for OpencodeHarness {
                 Err(panic_info) => {
                     let msg = format_panic_message(&*panic_info);
                     let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+                    // The panic short-circuited `run_opencode_inner` before
+                    // its own `Done` emission. Send one here so the receiver
+                    // doesn't block forever waiting for a terminal event.
+                    let _ = event_tx
+                        .send(HarnessEvent::Done {
+                            session_id: String::new(),
+                        })
+                        .await;
                     "error"
                 }
             };
@@ -226,46 +234,23 @@ impl Harness for OpencodeHarness {
     }
 
     fn get_session_id(&self, session_name: &str) -> Option<String> {
-        let sessions = self.sessions.lock().unwrap();
+        // Recover from poison: another thread panicked while holding the lock,
+        // but the data is still consistent. Mirrors codex/gemini handling.
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.get(session_name).cloned()
     }
 
     fn set_session_id(&self, session_name: &str, session_id: String) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.insert(session_name.to_string(), session_id);
     }
 }
 
-/// `Arc<OpencodeHarness>` forwarder so `App` can hold a strong named handle
-/// and insert a clone into the `harnesses: HashMap<HarnessKind, Box<dyn
-/// Harness>>` map without double-boxing.
-#[async_trait]
-impl Harness for Arc<OpencodeHarness> {
-    fn kind(&self) -> HarnessKind {
-        (**self).kind()
-    }
-    fn supports_resume(&self) -> bool {
-        (**self).supports_resume()
-    }
-    async fn run_prompt(
-        &self,
-        prompt: &str,
-        attachments: &[Attachment],
-        cwd: &Path,
-        session_id: Option<&str>,
-        options: &HarnessOptions,
-    ) -> Result<mpsc::Receiver<HarnessEvent>> {
-        (**self)
-            .run_prompt(prompt, attachments, cwd, session_id, options)
-            .await
-    }
-    fn get_session_id(&self, session_name: &str) -> Option<String> {
-        (**self).get_session_id(session_name)
-    }
-    fn set_session_id(&self, session_name: &str, session_id: String) {
-        (**self).set_session_id(session_name, session_id)
-    }
-}
+// `Arc<OpencodeHarness>` is a `Harness` via the blanket `impl<H> Harness
+// for `Arc<H>` in `harness::mod`. The `App` layer holds a typed
+// `Arc<OpencodeHarness>` for direct shutdown access while inserting a
+// clone into the type-erased `harnesses: HashMap<HarnessKind, Box<dyn
+// Harness>>` map.
 
 /// Strip ANSI escape sequences (CSI sequences and simple OSC). Hand-rolled
 /// to avoid a new crate dep — matches `\x1b[...m`, `\x1b[...K`, and similar.
@@ -306,87 +291,11 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Sanitize a stderr string before forwarding it to chat.
-///
-/// - Truncates to 500 chars (chat-friendly)
-/// - Redacts obvious env-var assignments: `KEY=value` → `KEY=<redacted>`
-/// - Redacts absolute user paths: `/Users/…` and `/home/…` → `<redacted-path>`
-///
-/// The raw content should be logged at `tracing::debug!` by the caller so
-/// operators can diagnose via `RUST_LOG=debug` without shipping raw content.
+/// Sanitize opencode stderr before forwarding to chat. Opencode has no
+/// benign noise to pre-filter, so this is a thin pass-through to the shared
+/// base in [`crate::harness::sanitize_stderr_base`].
 fn sanitize_stderr(s: &str) -> String {
-    // Truncate first to bound further work.
-    let truncated: String = s.chars().take(500).collect();
-
-    // Redact env-var assignments: one or more uppercase letters/digits/underscores
-    // starting with an uppercase letter followed by `=<non-whitespace>`.
-    let mut out = String::with_capacity(truncated.len());
-    let mut rest = truncated.as_str();
-    while !rest.is_empty() {
-        // Scan for `[A-Z][A-Z0-9_]*=` pattern followed by non-whitespace value.
-        if let Some(pos) = rest.find('=') {
-            let before = &rest[..pos];
-            // Walk backwards to find the start of the potential key.
-            let key_start = before
-                .rfind(|c: char| !c.is_ascii_uppercase() && !c.is_ascii_digit() && c != '_')
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let key = &before[key_start..];
-            // A valid env-var key: starts with uppercase letter, non-empty.
-            let is_env_key = !key.is_empty()
-                && key.starts_with(|c: char| c.is_ascii_uppercase())
-                && key
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-
-            if is_env_key {
-                // Emit everything up to and including the key and `=`.
-                out.push_str(&rest[..key_start]);
-                out.push_str(key);
-                out.push('=');
-                out.push_str("<redacted>");
-                // Skip the value (non-whitespace chars after `=`).
-                let after_eq = &rest[pos + 1..];
-                let val_end = after_eq
-                    .find(|c: char| c.is_whitespace())
-                    .unwrap_or(after_eq.len());
-                rest = &after_eq[val_end..];
-                continue;
-            }
-
-            // Not an env-var key — emit up through the `=` and move on.
-            out.push_str(&rest[..pos + 1]);
-            rest = &rest[pos + 1..];
-        } else {
-            out.push_str(rest);
-            break;
-        }
-    }
-
-    // Redact absolute user paths: /Users/<name>/... and /home/<name>/...
-    let patterns: &[(&str, &str)] = &[("/Users/", "/Users/"), ("/home/", "/home/")];
-    let mut result = out;
-    for (needle, prefix) in patterns {
-        if result.contains(needle) {
-            let mut new_result = String::with_capacity(result.len());
-            let mut scan = result.as_str();
-            while let Some(idx) = scan.find(needle) {
-                new_result.push_str(&scan[..idx]);
-                new_result.push_str("<redacted-path>");
-                // Skip past the username component (up to the next `/` or end)
-                let after_prefix = &scan[idx + prefix.len()..];
-                let skip = after_prefix
-                    .find('/')
-                    .map(|i| i + 1) // include the slash after username
-                    .unwrap_or(after_prefix.len());
-                scan = &after_prefix[skip..];
-            }
-            new_result.push_str(scan);
-            result = new_result;
-        }
-    }
-
-    result
+    crate::harness::sanitize_stderr_base(s)
 }
 
 /// Build the argv for a subcommand, mapping user-friendly aliases to the
@@ -650,6 +559,13 @@ async fn run_opencode_inner(
                 format!("opencode spawn failed: {}", e)
             };
             let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+            // Always emit a terminal Done so the receiver doesn't hang on
+            // any spawn-time failure path.
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
             return;
         }
     };
@@ -663,10 +579,46 @@ async fn run_opencode_inner(
                 ))
                 .await;
             let _ = child.kill().await;
+            // Reap the (now-killed) child so the process-table entry is freed.
+            // `kill_on_drop` only sends SIGKILL — it does not call `wait()`.
+            let _ = child.wait().await;
+            // Always emit a terminal Done so the receiver doesn't hang.
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
             return;
         }
     };
-    let stderr = child.stderr.take();
+
+    // Drain stderr concurrently with stdout so opencode doesn't pipe-deadlock
+    // when its stderr buffer fills (~64 KiB on Linux, ~8 KiB on macOS).
+    //
+    // The buffered portion (first 64 KiB) is captured for sanitization on
+    // non-zero exit. Anything past 64 KiB is forwarded to `tokio::io::sink`
+    // so the child can keep writing without blocking — without the post-cap
+    // drain, opencode could fill the OS pipe buffer past 64 KiB and stall
+    // on its next stderr write, hanging `child.wait()` until the 5-minute
+    // idle timeout fired. (Critic-2 P1.)
+    let stderr_handle: Option<tokio::task::JoinHandle<Vec<u8>>> = child.stderr.take().map(|s| {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf: Vec<u8> = Vec::new();
+            let mut s = s;
+            // Capture up to 64 KiB for sanitization.
+            {
+                let mut limited = (&mut s).take(64 * 1024);
+                let _ = limited.read_to_end(&mut buf).await;
+            }
+            // Drain anything past the cap into a sink so the child never
+            // blocks on stderr writes.
+            let mut sink = tokio::io::sink();
+            let _ = tokio::io::copy(&mut s, &mut sink).await;
+            let _ = sink.flush().await;
+            buf
+        })
+    });
 
     let mut reader = BufReader::new(stdout).lines();
     let mut captured_session_id: Option<String> = None;
@@ -812,20 +764,23 @@ async fn run_opencode_inner(
         }
     };
 
+    // Always await the stderr-drain handle (even on success paths) so the
+    // spawned task ends cleanly. The buffered stderr is only used on
+    // non-zero-exit paths but the drain task must run to completion to
+    // avoid a leaked tokio task and a half-open pipe.
+    let raw_stderr_buf: Vec<u8> = match stderr_handle {
+        Some(h) => h.await.unwrap_or_else(|e| {
+            // Don't silently swallow drain-task panics; log so a half-open
+            // pipe + missing stderr buffer can be diagnosed.
+            tracing::warn!("opencode stderr drain task failed: {}", e);
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+
     if let Some(status) = status {
         if !status.success() {
-            // Read stderr capped at 64 KiB to prevent OOM on crash-looping processes.
-            let raw_stderr = match stderr {
-                Some(s) => {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = vec![0u8; 0];
-                    let mut limited = s.take(64 * 1024);
-                    let _ = limited.read_to_end(&mut buf).await;
-                    buf
-                }
-                None => Vec::new(),
-            };
-            let stderr_raw = String::from_utf8_lossy(&raw_stderr).trim().to_string();
+            let stderr_raw = String::from_utf8_lossy(&raw_stderr_buf).trim().to_string();
             tracing::debug!("opencode run non-zero exit; raw stderr: {}", stderr_raw);
             let code = status
                 .code()
@@ -1425,6 +1380,80 @@ mod tests {
             "expected Done after Error, got {:?}",
             second
         );
+    }
+
+    // ── F1 regression: terminal Done on every error path ───────────────────
+
+    /// Spawn-failure (binary not on PATH and no override) MUST emit a terminal
+    /// `HarnessEvent::Done` after `HarnessEvent::Error`. Without it the
+    /// receiver hangs forever waiting for the conventional terminal event.
+    /// Mirrors the codex harness behaviour after F1 / structural-fix parity.
+    #[tokio::test]
+    async fn missing_binary_emits_error_then_done() {
+        let (tx, _rx) = broadcast::channel::<AmbientEvent>(8);
+        let config = OpencodeConfig {
+            // Path that is guaranteed NOT to exist so spawn returns ENOENT.
+            binary_path: Some(std::path::PathBuf::from(
+                "/nonexistent/opencode-binary-for-tests-7c1f",
+            )),
+            ..OpencodeConfig::default()
+        };
+        let h = OpencodeHarness::new(config, tx);
+        let opts = HarnessOptions::default();
+        let cwd = std::env::temp_dir();
+
+        let mut rx = h
+            .run_prompt("hello", &[], &cwd, None, &opts)
+            .await
+            .expect("run_prompt returns receiver");
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("recv timeout: spawn failure should emit fast")
+            .expect("first event must arrive");
+        match first {
+            HarnessEvent::Error(msg) => {
+                assert!(
+                    msg.contains("opencode") && msg.contains("not found"),
+                    "expected binary-not-found error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Error first, got {:?}", other),
+        }
+
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("recv timeout: terminal Done must follow Error")
+            .expect("Done must follow Error");
+        assert!(
+            matches!(second, HarnessEvent::Done { ref session_id } if session_id.is_empty()),
+            "expected Done with empty session_id after spawn failure, got {:?}",
+            second
+        );
+    }
+
+    /// If a panic poisons the `sessions` mutex, subsequent calls must still
+    /// succeed (parity with codex / gemini). Without recovery, the next
+    /// `lock().unwrap()` panics again, taking down whichever async task
+    /// touched it.
+    #[test]
+    fn mutex_recovers_from_poison() {
+        let h = Arc::new(empty_harness());
+        h.set_session_id("alpha", "ses_pre".into());
+
+        let h_panic = Arc::clone(&h);
+        let result = std::thread::spawn(move || {
+            let _guard = h_panic.sessions.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(result.is_err(), "panic thread should have unwound");
+
+        // Reads and writes must still work despite the poisoned lock.
+        assert_eq!(h.get_session_id("alpha"), Some("ses_pre".into()));
+        h.set_session_id("beta", "ses_post".into());
+        assert_eq!(h.get_session_id("beta"), Some("ses_post".into()));
     }
 
     // ── HarnessKind::from_str ────────────────────────────────────────────────

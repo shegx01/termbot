@@ -24,6 +24,29 @@ pub enum OpencodeSubcommand {
     Export,
 }
 
+/// Chat-safe subcommand surfaces for the gemini harness. Gemini-cli's real
+/// "subcommands" (`mcp`, `extensions`, `skills`, `hooks`) are all interactive
+/// or destructive; the only safe surfaces are the read-only `--list-*` flags
+/// which we expose under user-friendly chat keywords.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeminiSubcommand {
+    /// `gemini --list-sessions` — list saved sessions for the current project.
+    /// User-facing keyword: `sessions`.
+    Sessions,
+    /// `gemini --list-extensions` — list installed extensions.
+    /// User-facing keyword: `extensions`.
+    Extensions,
+}
+
+/// Sum type over per-harness subcommand enums. Carried in
+/// [`ParsedCommand::HarnessSubcommand`] so the dispatcher can route to the
+/// right harness without losing per-harness type safety.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarnessSubcommandKind {
+    Opencode(OpencodeSubcommand),
+    Gemini(GeminiSubcommand),
+}
+
 /// CLI-style options that can be passed with `: claude on [options]`.
 ///
 /// These options persist for the duration of the harness session (until
@@ -219,12 +242,11 @@ pub enum ParsedCommand {
     HarnessOff {
         harness: HarnessKind,
     },
-    /// Raw CLI subcommand passthrough (e.g. `: opencode models openrouter`).
-    /// Only emitted for opencode; other harnesses fall through to their current
-    /// parse paths. Execution captures stdout and surfaces it to chat.
+    /// Raw CLI subcommand passthrough (e.g. `: opencode models openrouter`,
+    /// `: gemini sessions`). Execution captures stdout and surfaces it to chat.
     HarnessSubcommand {
         harness: HarnessKind,
-        subcommand: OpencodeSubcommand,
+        subcommand: HarnessSubcommandKind,
         args: Vec<String>,
     },
     ShellCommand {
@@ -439,7 +461,7 @@ impl ParsedCommand {
                         }
                         return Ok(ParsedCommand::HarnessSubcommand {
                             harness: kind,
-                            subcommand,
+                            subcommand: HarnessSubcommandKind::Opencode(subcommand),
                             args: rest_args,
                         });
                     }
@@ -477,17 +499,45 @@ impl ParsedCommand {
                     // Fallthrough: not a subcommand, treat as prompt (existing behavior).
                 }
 
-                // Gemini-only: block gemini's native interactive/destructive subcommands
-                // so `: gemini mcp`/`extensions`/`skills`/`update` return a chat-safe
-                // error instead of silently hanging (mcp opens a TTY, update needs
-                // interactive confirmation, etc.).
+                // Gemini chat-safe subcommands: route `sessions` and `extensions`
+                // to the corresponding `--list-*` flags. Their interactive forms
+                // (`extensions <add|remove|...>`, `mcp`, `skills`, `hooks`) and
+                // anything else fall to the blocked list.
                 if kind == HarnessKind::Gemini && !after_harness.is_empty() {
-                    let first = after_harness.split_whitespace().next().unwrap_or("");
-                    const GEMINI_BLOCKED: &[&str] = &["update", "mcp", "extensions", "skills"];
+                    let mut subword_iter = after_harness.split_whitespace().peekable();
+                    let first = subword_iter.next().unwrap_or("");
+                    let second = subword_iter.peek().copied().unwrap_or("");
+
+                    // Chat-safe routing — only the bare 1-word forms are
+                    // accepted. `extensions install` / `extensions remove` /
+                    // anything that would mutate state must keep falling
+                    // through to the blocked-list rejection.
+                    let routed = match (first, second) {
+                        ("sessions", "") => Some(GeminiSubcommand::Sessions),
+                        ("extensions", "") => Some(GeminiSubcommand::Extensions),
+                        _ => None,
+                    };
+
+                    if let Some(subcommand) = routed {
+                        let rest_args: Vec<String> = subword_iter.map(String::from).collect();
+                        return Ok(ParsedCommand::HarnessSubcommand {
+                            harness: kind,
+                            subcommand: HarnessSubcommandKind::Gemini(subcommand),
+                            args: rest_args,
+                        });
+                    }
+
+                    // Block gemini's native interactive/destructive subcommands
+                    // so `: gemini mcp`/`update`/etc. return a chat-safe error
+                    // instead of silently hanging (mcp opens a TTY, update needs
+                    // interactive confirmation, etc.). `extensions <sub>` falls
+                    // here because the bare `extensions` form was caught above.
+                    const GEMINI_BLOCKED: &[&str] =
+                        &["update", "mcp", "extensions", "skills", "hooks"];
                     if GEMINI_BLOCKED.contains(&first) {
                         return Err(ParseError::InvalidHarnessOption(format!(
                             "`gemini {}` is not available from chat — run it in your terminal. \
-                             No chat-safe gemini subcommands are shipped yet.",
+                             Safe chat subcommands: sessions, extensions.",
                             first
                         )));
                     }
@@ -2329,7 +2379,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Stats,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Stats),
                 args: vec!["\u{2013}days".into(), "1".into()],
             }
         );
@@ -2690,7 +2740,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Models,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Models),
                 args: vec![],
             }
         );
@@ -2703,7 +2753,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Models,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Models),
                 args: vec!["openrouter".into()],
             }
         );
@@ -2716,7 +2766,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Stats,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Stats),
                 args: vec!["--days".into(), "7".into()],
             }
         );
@@ -2729,7 +2779,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Sessions,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Sessions),
                 args: vec![],
             }
         );
@@ -2742,7 +2792,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Providers,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Providers),
                 args: vec![],
             }
         );
@@ -2755,7 +2805,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Export,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Export),
                 args: vec!["ses_01HABCDEF".into()],
             }
         );
@@ -2859,7 +2909,10 @@ mod tests {
 
     #[test]
     fn parse_gemini_blocked_subcommands_all_rejected() {
-        let blocked = ["update", "mcp", "extensions", "skills"];
+        // After F5: bare `extensions` is chat-safe (routes to --list-extensions).
+        // Blocked: `update`, `mcp`, `skills`, `hooks`, and `extensions <sub>`
+        // (any sub-form of extensions; the bare form is the only safe one).
+        let blocked = ["update", "mcp", "skills", "hooks"];
         for kw in &blocked {
             let input = format!(": gemini {}", kw);
             match ParsedCommand::parse(&input, ':') {
@@ -2881,18 +2934,59 @@ mod tests {
     }
 
     #[test]
-    fn parse_gemini_unknown_first_word_is_prompt() {
-        // Non-blocked first words fall through to prompt parsing (no gemini
-        // subcommand passthrough is shipped yet).
+    fn parse_gemini_extensions_subform_is_rejected() {
+        // `: gemini extensions install foo` must NOT be routed (would hit the
+        // interactive `gemini extensions install` subcommand). Only the bare
+        // `extensions` form maps to `--list-extensions`.
+        let input = ": gemini extensions install foo";
+        match ParsedCommand::parse(input, ':') {
+            Err(ParseError::InvalidHarnessOption(msg)) => {
+                assert!(
+                    msg.contains("not available from chat") && msg.contains("extensions"),
+                    "extensions sub-form should be rejected; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected rejection, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_gemini_sessions_routes_to_list_sessions() {
         let cmd = ParsedCommand::parse(": gemini sessions", ':').unwrap();
         match cmd {
-            ParsedCommand::HarnessPrompt {
-                harness, prompt, ..
+            ParsedCommand::HarnessSubcommand {
+                harness,
+                subcommand,
+                args,
             } => {
                 assert_eq!(harness, HarnessKind::Gemini);
-                assert_eq!(prompt, "sessions");
+                assert!(matches!(
+                    subcommand,
+                    HarnessSubcommandKind::Gemini(GeminiSubcommand::Sessions)
+                ));
+                assert!(args.is_empty());
             }
-            other => panic!("expected HarnessPrompt, got {:?}", other),
+            other => panic!("expected HarnessSubcommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_gemini_extensions_routes_to_list_extensions() {
+        let cmd = ParsedCommand::parse(": gemini extensions", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessSubcommand {
+                harness,
+                subcommand,
+                ..
+            } => {
+                assert_eq!(harness, HarnessKind::Gemini);
+                assert!(matches!(
+                    subcommand,
+                    HarnessSubcommandKind::Gemini(GeminiSubcommand::Extensions)
+                ));
+            }
+            other => panic!("expected HarnessSubcommand, got {:?}", other),
         }
     }
 
@@ -3151,7 +3245,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Sessions,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Sessions),
                 args: vec![],
             }
         );
@@ -3164,7 +3258,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Sessions,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Sessions),
                 args: vec![],
             }
         );
@@ -3177,7 +3271,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Providers,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Providers),
                 args: vec![],
             }
         );
@@ -3190,7 +3284,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Providers,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Providers),
                 args: vec![],
             }
         );
@@ -3222,7 +3316,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Stats,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Stats),
                 args: vec!["--days".into(), "1".into()],
             }
         );
@@ -3239,7 +3333,7 @@ mod tests {
             cmd,
             ParsedCommand::HarnessSubcommand {
                 harness: HarnessKind::Opencode,
-                subcommand: OpencodeSubcommand::Models,
+                subcommand: HarnessSubcommandKind::Opencode(OpencodeSubcommand::Models),
                 args: vec!["\u{2013}provider".into(), "openrouter".into()],
             }
         );

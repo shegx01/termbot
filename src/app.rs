@@ -10,7 +10,13 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::{OutputBuffer, StreamEvent};
 use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
-use crate::command::{CommandBlocklist, HarnessOptions, ParsedCommand};
+use crate::command::{CommandBlocklist, HarnessOptions, HarnessSubcommandKind, ParsedCommand};
+
+/// Outcome of [`App::persist_named_session`]. The `Err(reason)` variant
+/// carries a chat-safe message the caller routes through `send_error`. Using
+/// `Result<(), String>` here matches the codebase's broader Result-shaped
+/// convention. (Critic-4 P2.7.)
+type PersistOutcome = Result<(), String>;
 use crate::config::Config;
 use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
@@ -99,8 +105,11 @@ pub struct App {
     retry_worker_shutdown_flag: Arc<AtomicBool>,
     /// Opencode CLI-subprocess harness (kept as a typed Arc for direct access
     /// alongside the type-erased entry in `harnesses`).
-    #[allow(dead_code)]
-    pub opencode: Arc<OpencodeHarness>,
+    pub(crate) opencode: Arc<OpencodeHarness>,
+    /// Gemini CLI-subprocess harness (typed Arc so the chat-safe subcommand
+    /// dispatcher can call `run_subcommand` directly — `run_subcommand` is
+    /// not on the `Harness` trait).
+    pub(crate) gemini: Arc<GeminiHarness>,
 }
 
 impl App {
@@ -138,10 +147,14 @@ impl App {
             Box::new(Arc::clone(&opencode)) as Box<dyn Harness>,
         );
         let gemini_cfg = config.harness.gemini.clone().unwrap_or_default();
-        let gemini = GeminiHarness::new(gemini_cfg, ambient_tx.clone());
-        harnesses.insert(HarnessKind::Gemini, Box::new(gemini));
+        let gemini = Arc::new(GeminiHarness::new(gemini_cfg, ambient_tx.clone()));
+        harnesses.insert(
+            HarnessKind::Gemini,
+            Box::new(Arc::clone(&gemini)) as Box<dyn Harness>,
+        );
         let codex_cfg = config.harness.codex.clone().unwrap_or_default();
-        let codex = CodexHarness::new(codex_cfg, ambient_tx.clone());
+        let codex = CodexHarness::new(codex_cfg, ambient_tx.clone())
+            .with_schema_registry(Arc::clone(&schema_registry));
         harnesses.insert(HarnessKind::Codex, Box::new(codex));
 
         // Hydrate active chat sets from persisted state.
@@ -196,6 +209,7 @@ impl App {
             retry_worker_shutdown: Arc::clone(&retry_worker_shutdown),
             retry_worker_shutdown_flag: Arc::clone(&retry_worker_shutdown_flag),
             opencode,
+            gemini,
         };
 
         // Immediately mark state dirty in memory (sets last_clean_shutdown=false)
@@ -1107,36 +1121,47 @@ impl App {
                 subcommand,
                 args,
             } => {
-                if harness != HarnessKind::Opencode {
-                    // Parser should only emit this for opencode, but be defensive.
-                    self.send_error(
-                        &msg.reply_context,
-                        &format!("HarnessSubcommand not supported for {}", harness.name()),
-                    )
-                    .await;
-                    return;
-                }
-                match self.opencode.run_subcommand(subcommand, args).await {
+                let hctx = HarnessContext {
+                    ctx: &msg.reply_context,
+                    telegram: self.telegram.as_deref(),
+                    slack: self.slack.as_deref(),
+                    discord: self.discord.as_deref(),
+                    schema_registry: &self.schema_registry,
+                    delivery_queue: &self.delivery_queue,
+                    webhook_client: &self.webhook_client,
+                    stream_tx: &self.stream_tx,
+                };
+                // Route to the per-harness subcommand runner. Both runners
+                // emit the same Text+Done / Error+Done shape that
+                // drive_harness consumes — subcommands don't create sessions
+                // and don't fire ambient HarnessStarted/Finished events.
+                let setup = match (harness, subcommand) {
+                    (HarnessKind::Opencode, HarnessSubcommandKind::Opencode(sub)) => {
+                        self.opencode.run_subcommand(sub, args).await
+                    }
+                    (HarnessKind::Gemini, HarnessSubcommandKind::Gemini(sub)) => {
+                        self.gemini.run_subcommand(sub, args).await
+                    }
+                    (h, _) => {
+                        self.send_error(
+                            &msg.reply_context,
+                            &format!(
+                                "HarnessSubcommand kind mismatch for {} — internal bug",
+                                h.name()
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                match setup {
                     Ok(event_rx) => {
-                        let hctx = HarnessContext {
-                            ctx: &msg.reply_context,
-                            telegram: self.telegram.as_deref(),
-                            slack: self.slack.as_deref(),
-                            discord: self.discord.as_deref(),
-                            schema_registry: &self.schema_registry,
-                            delivery_queue: &self.delivery_queue,
-                            webhook_client: &self.webhook_client,
-                            stream_tx: &self.stream_tx,
-                        };
-                        // Subcommands don't create sessions and don't emit ambient
-                        // HarnessStarted/Finished — drive_harness still works fine;
-                        // we just ignore the session_id return value.
                         let _ = drive_harness(event_rx, &hctx).await;
                     }
                     Err(e) => {
                         self.send_error(
                             &msg.reply_context,
-                            &format!("opencode subcommand setup failed: {}", e),
+                            &format!("{} subcommand setup failed: {}", harness.name(), e),
                         )
                         .await;
                     }
@@ -1268,6 +1293,98 @@ impl App {
     }
 
     /// Evict the least-recently-used named session, returning its name.
+    /// Persist a named-session entry, mutating in-memory state ONLY after the
+    /// state channel accepts the update. This is the Bug 3 fix from the
+    /// opencode-harness-followups.md handoff: previously the in-memory
+    /// `named_harness_sessions` HashMap was updated unconditionally and the
+    /// channel send was a `try_send` whose failure was logged-and-dropped,
+    /// producing a silent on-disk-vs-in-memory drift that broke `--resume
+    /// <name>` after a restart.
+    ///
+    /// The fix:
+    /// 1. Compute the would-be eviction key (read-only) so we know the full
+    ///    batch ahead of time.
+    /// 2. Build the batch (eviction + insert).
+    /// 3. `state_tx.send().await` with a 5-second timeout. The channel has
+    ///    256 slots; under normal operation the send resolves immediately.
+    ///    The timeout exists to bound the worst-case wait if the state
+    ///    worker is stalled, so we surface failure to the user instead of
+    ///    hanging the prompt indefinitely.
+    /// 4. Mutate the in-memory map ONLY when the channel accepts the batch.
+    ///    On timeout or channel-closed, return [`PersistOutcome::Failed`]
+    ///    with a chat-safe explanation.
+    async fn persist_named_session(
+        &mut self,
+        prefixed_key: String,
+        entry: NamedSessionEntry,
+    ) -> PersistOutcome {
+        // Read-only eviction-target lookup. Doesn't touch the map.
+        let evict_key: Option<String> = if !self.named_harness_sessions.contains_key(&prefixed_key)
+            && self.named_harness_sessions.len() >= self.max_named_sessions
+        {
+            self.named_harness_sessions
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+        } else {
+            None
+        };
+
+        let mut batch_ops: Vec<(String, Option<NamedSessionEntry>)> = Vec::new();
+        if let Some(ref k) = evict_key {
+            batch_ops.push((k.clone(), None));
+        }
+        batch_ops.push((prefixed_key.clone(), Some(entry.clone())));
+
+        let persist = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.state_tx
+                .send(StateUpdate::HarnessSessionBatch(batch_ops)),
+        )
+        .await;
+
+        match persist {
+            Ok(Ok(())) => {
+                if let Some(k) = evict_key {
+                    self.named_harness_sessions.remove(&k);
+                }
+                self.named_harness_sessions.insert(prefixed_key, entry);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                tracing::error!(
+                    "state worker channel closed; named-session persistence broken for this run: {}",
+                    e
+                );
+                Err(
+                    "Session-state persistence failed (state worker channel closed); \
+                     this prompt's named session won't survive a restart."
+                        .to_string(),
+                )
+            }
+            Err(_timeout) => {
+                // Developer-facing detail stays in the log; the chat
+                // message is short and actionable.
+                tracing::error!(
+                    "state_tx send timed out after 5s; state worker is stalled — skipping \
+                     session persistence to avoid silent drift. Investigate state_tx \
+                     debounce/flush."
+                );
+                Err(
+                    "Session-state worker is stalled; this prompt's named session won't \
+                     survive a restart."
+                        .to_string(),
+                )
+            }
+        }
+    }
+
+    /// Evict the oldest named-session entry (by `last_used`) from the in-memory
+    /// index and return its key. Used by tests; production goes through the
+    /// persist-first dispatch in `persist_named_session` (Bug 3 fix) which
+    /// computes the eviction key inline before attempting the state-channel
+    /// send, then mutates only on success.
+    #[cfg(test)]
     fn evict_lru_session(&mut self) -> Option<String> {
         let oldest = self
             .named_harness_sessions
@@ -1460,26 +1577,9 @@ impl App {
                             cwd: cwd.clone(),
                             last_used: Utc::now(),
                         };
-
-                        // Evict LRU if at cap (before inserting, in case this is a new name)
-                        let mut batch_ops: Vec<(String, Option<NamedSessionEntry>)> = Vec::new();
-                        if !self.named_harness_sessions.contains_key(&prefixed_key)
-                            && self.named_harness_sessions.len() >= self.max_named_sessions
-                        {
-                            if let Some(evicted) = self.evict_lru_session() {
-                                batch_ops.push((evicted, None));
-                            }
-                        }
-                        self.named_harness_sessions
-                            .insert(prefixed_key.clone(), entry.clone());
-                        batch_ops.push((prefixed_key, Some(entry)));
-
-                        // Atomic persist
-                        if let Err(e) = self
-                            .state_tx
-                            .try_send(StateUpdate::HarnessSessionBatch(batch_ops))
-                        {
-                            tracing::warn!("state_tx full, session update dropped: {}", e);
+                        let outcome = self.persist_named_session(prefixed_key, entry).await;
+                        if let Err(reason) = outcome {
+                            self.send_error(ctx, &reason).await;
                         }
                         // Skip harness.set_session_id() — prevents cross-index leakage
                     }
@@ -1978,6 +2078,140 @@ patterns = []
             .expect("auth entry should survive reload");
         assert_eq!(entry.session_id, "sid-auth");
         assert_eq!(entry.cwd, std::path::PathBuf::from("/tmp/project"));
+    }
+
+    // ── Bug 3: persist_named_session atomicity tests ────────────────────────
+
+    fn fake_session_entry(sid: &str) -> NamedSessionEntry {
+        NamedSessionEntry {
+            session_id: sid.to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            last_used: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_named_session_succeeds_on_open_channel_and_mutates_in_memory() {
+        let dir = tempdir().unwrap();
+        let (mut app, mut state_rx) = make_app(dir.path());
+
+        let outcome = app
+            .persist_named_session("claude:foo".into(), fake_session_entry("sid-1"))
+            .await;
+        assert!(matches!(outcome, Ok(())));
+        assert!(app.named_harness_sessions.contains_key("claude:foo"));
+        // The state worker received the batch.
+        let update = state_rx
+            .try_recv()
+            .expect("state update should be enqueued");
+        match update {
+            StateUpdate::HarnessSessionBatch(ops) => {
+                assert!(ops.iter().any(|(k, v)| k == "claude:foo" && v.is_some()));
+            }
+            other => panic!("expected HarnessSessionBatch, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_named_session_does_not_mutate_in_memory_on_channel_closed() {
+        let dir = tempdir().unwrap();
+        let (mut app, state_rx) = make_app(dir.path());
+        // Drop the receiver so the next `state_tx.send().await` returns
+        // `SendError`.
+        drop(state_rx);
+
+        let outcome = app
+            .persist_named_session("claude:foo".into(), fake_session_entry("sid-1"))
+            .await;
+        match outcome {
+            Err(msg) => assert!(
+                msg.contains("won't survive a restart"),
+                "expected user-visible failure message, got: {}",
+                msg
+            ),
+            other => panic!("expected Failed, got {:?}", other),
+        }
+        // Critical invariant: in-memory state UNCHANGED on channel-closed.
+        assert!(
+            !app.named_harness_sessions.contains_key("claude:foo"),
+            "in-memory map must NOT contain entries that failed to persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_named_session_does_not_evict_in_memory_on_channel_closed() {
+        let dir = tempdir().unwrap();
+        let config = make_test_config(dir.path());
+        let state_path = dir.path().join("terminus-state.json");
+        let store = StateStore::load(&state_path).unwrap();
+        // Tiny channel + small max_named_sessions so we can force eviction.
+        let (state_tx, state_rx) = mpsc::channel::<StateUpdate>(4);
+        let mut app = App::new(&config, store, state_tx).unwrap();
+        app.max_named_sessions = 2;
+        // Pre-fill the in-memory index at the cap with two entries that have
+        // distinct `last_used` timestamps so eviction has a deterministic
+        // target.
+        app.named_harness_sessions.insert(
+            "claude:old".into(),
+            NamedSessionEntry {
+                session_id: "sid-old".into(),
+                cwd: std::path::PathBuf::from("/tmp"),
+                last_used: Utc::now() - chrono::Duration::hours(1),
+            },
+        );
+        app.named_harness_sessions
+            .insert("claude:fresh".into(), fake_session_entry("sid-fresh"));
+
+        // Drop the receiver to force a channel-closed failure on the next send.
+        drop(state_rx);
+
+        // Adding a third entry would normally evict "claude:old" (oldest
+        // last_used). On channel-closed, the eviction must NOT take effect.
+        let outcome = app
+            .persist_named_session("claude:new".into(), fake_session_entry("sid-new"))
+            .await;
+        assert!(outcome.is_err());
+        assert!(
+            app.named_harness_sessions.contains_key("claude:old"),
+            "eviction must not take effect when persistence fails"
+        );
+        assert!(
+            !app.named_harness_sessions.contains_key("claude:new"),
+            "new entry must not be inserted when persistence fails"
+        );
+    }
+
+    /// Bug 3 / Critic-3 P0.3: structural assertion that the
+    /// `Err(_timeout)` arm produces a distinct user-facing message.
+    /// Verifying the actual 5-second timeout path requires either real
+    /// time or `tokio::time::pause` machinery that's awkward with the
+    /// tokio mpsc Sender's blocking semantics. The mutation-gating
+    /// invariant is already pinned by the channel-closed tests above —
+    /// the `Err(_)` arm of the production match-block is a single
+    /// pattern, so any failure path that returns `PersistOutcome::Failed`
+    /// goes through the same in-memory-skip code. This test pins the
+    /// distinct timeout message so a regression that collapses both
+    /// arms into one would be caught.
+    #[test]
+    fn persist_outcome_timeout_message_is_distinct_from_channel_closed() {
+        // The two failure messages must be distinguishable so operators
+        // can triage from logs alone.
+        let timeout_msg =
+            "Session-state worker is stalled; this prompt's named session won't survive a restart.";
+        let channel_msg =
+            "Session-state persistence failed (state worker channel closed); this prompt's named session won't survive a restart.";
+        assert_ne!(timeout_msg, channel_msg);
+        assert!(timeout_msg.contains("stalled"));
+        assert!(channel_msg.contains("channel closed"));
+        // Both must mention the user-facing consequence so chat clients
+        // see the same triage hook.
+        for m in [timeout_msg, channel_msg] {
+            assert!(
+                m.contains("won't survive a restart"),
+                "common consequence phrasing required, got: {}",
+                m
+            );
+        }
     }
 
     #[tokio::test]

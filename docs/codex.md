@@ -10,6 +10,7 @@ The codex harness wraps OpenAI's `codex` CLI (`github.com/openai/codex`, verifie
 - [Blocked subcommands](#blocked-subcommands)
 - [Event schema](#event-schema)
 - [Configuration](#configuration)
+- [Structured output and webhooks](#structured-output-and-webhooks)
 - [Error messages](#error-messages)
 - [Mobile keyboard normalization](#mobile-keyboard-normalization)
 - [Testing](#testing)
@@ -34,8 +35,9 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 | `--model <x>` / `-m <x>` | Working | Per-prompt wins over `[harness.codex].model`. Note: ChatGPT-account auth rejects some models (e.g. `gpt-5.5` → API-only); use `gpt-5.4` or `gpt-5.3-codex` |
 | `--sandbox <x>` | Working | Values: `read-only`, `workspace-write`, `danger-full-access`. Per-prompt wins over `[harness.codex].sandbox` |
 | `--profile <x>` | Working | No `-p` short alias (collides with Claude's `--permission-mode`). Per-prompt wins over `[harness.codex].profile` |
+| `--add-dir <DIR>` / `-d <DIR>` (repeatable) | Working | Forwarded to `codex exec --add-dir <DIR>` to extend the writable sandbox beyond the current `cwd`. Each occurrence appends one flag/value pair, in argv order. Codex 0.125.0+ |
 | `--approval-mode on-request` | Working (rejected) | Codex 0.125.0 has no `--ask-for-approval` flag at all; terminus passes `--full-auto` unconditionally. Passing `--approval-mode on-request` returns a chat-safe error explaining the deadlock risk |
-| `--schema <name>` | Working | Inline JSON or file path. Inline JSON written to a temp file, passed via `codex exec --output-schema <path>`. Validated response is rendered as text (no separate `StructuredOutput` channel) |
+| `--schema <name>` | Working | Three forms: (a) registered name from `[schemas.<name>]` in `terminus.toml`; (b) absolute or cwd-relative file path; (c) inline JSON. All three resolve to a temp file passed via `codex exec --output-schema <path>`. The registered-name form additionally drives the webhook-delivery pipeline (see [Structured output and webhooks](#structured-output-and-webhooks)) |
 | `--fork` | Working (rejected) | Codex's `fork` is a separate interactive subcommand; not exposed in non-interactive mode. Returns "codex does not support --fork in non-interactive mode" |
 | `--title`, `--share`, `--pure`, `--agent` | Not shipped | Opencode-only; no codex analog (silently ignored) |
 | **Always-on flags** |||
@@ -130,7 +132,7 @@ All flags work in both one-shot (`: codex --name foo <prompt>`) and on-toggle (`
 | `--model <x>` / `-m <x>` | e.g. `gpt-5.4`, `gpt-5.3-codex` | Override model | `-m <model>` |
 | `--sandbox <x>` | `read-only` \| `workspace-write` \| `danger-full-access` | Override sandbox policy | `-s <sandbox>` |
 | `--profile <x>` | profile name | Select named profile from `~/.codex/config.toml` | `-p <profile>` |
-| `--schema <x>` | file path or inline JSON | Validate response shape | `--output-schema <path>` (inline written to temp) |
+| `--schema <x>` | registered name, file path, or inline JSON | Validate response shape; registered names also drive webhook delivery | `--output-schema <path>` (resolved value written to temp) |
 | `--approval-mode on-request` | (rejected) | Returns chat-safe deadlock error | n/a — codex 0.125.0 has no equivalent flag |
 | `--fork` | (rejected) | Returns "not supported in non-interactive mode" | n/a |
 
@@ -210,6 +212,54 @@ All fields are optional. When omitted, terminus resolves `codex` from PATH and i
 
 Terminus already sets the child process's working directory via `tokio::process::Command::current_dir(cwd)`. Passing `--cd` redundantly risks divergence if codex resolves `--cd` differently from the OS-level `current_dir`.
 
+### Schema registry entries
+
+Schema registry entries (`[schemas.<name>]` with `schema`, `webhook`, `webhook_secret_env` keys) are documented in [Structured output and webhooks](#structured-output-and-webhooks) — they're not codex-specific and are validated at startup against all schema-supporting harnesses (claude + codex).
+
+---
+
+## Structured output and webhooks
+
+`--schema <x>` resolves in priority order — **(1) registered name → (2) file path → (3) inline JSON**. Only the registered-name form drives the webhook-delivery pipeline; the other two are chat-only validation surfaces.
+
+| `--schema=…` form | Behavior | Webhook delivery? |
+|---|---|---|
+| **`<name>`** matching `[schemas.<name>]` in `terminus.toml` | Schema value serialized to a temp file, passed as `--output-schema`. On `turn.completed` the agent_message text is parsed as JSON and emitted as `HarnessEvent::StructuredOutput { schema, value, run_id }` | Yes — when the entry has `webhook` + `webhook_secret_env` set; HMAC-SHA256-signed POST with retry queue |
+| **File path** (relative-to-cwd or absolute) | Read, validated as UTF-8 + JSON, copied to a temp, passed as `--output-schema`. Validated response renders as `HarnessEvent::Text` | No — chat-only |
+| **Inline JSON** | Written to a temp, passed as `--output-schema`. Validated response renders as `HarnessEvent::Text` | No — chat-only |
+
+The registered-name form takes priority over inline JSON even when the literal string also happens to parse as JSON. This is the security-relevant ordering: a malicious user can't bypass the registry by passing inline JSON with the same shape.
+
+If `--schema=<name>` matches a registered entry but the response is not valid JSON (model deviated despite `--output-schema`), terminus emits `HarnessEvent::Error("codex: --schema='<name>' but response was not valid JSON: …")` followed by `HarnessEvent::Text(<raw text>)` so the content isn't lost. No webhook delivery is attempted.
+
+If `--schema=<name>` matches a registered entry but the entry has NO webhook configured, the harness falls back to the chat-only `HarnessEvent::Text` path — the user gets validation but no webhook fan-out.
+
+Behavioural parity with the claude harness: identical event variant (`HarnessEvent::StructuredOutput`), identical webhook plumbing (`drive_harness` queues the job, `WebhookClient` POSTs with HMAC, retry worker handles transient failures), identical run-id format (ULID).
+
+Configure schemas in `terminus.toml`:
+
+```toml
+[schemas.orders_v1]
+schema = '''
+{
+  "type": "object",
+  "required": ["order_id", "items"],
+  "properties": {
+    "order_id": { "type": "string" },
+    "items":    { "type": "array", "items": { "type": "string" } }
+  }
+}
+'''
+webhook = "https://your-server.example.com/webhooks/orders"
+webhook_secret_env = "ORDERS_WEBHOOK_SECRET"
+```
+
+Then invoke from chat:
+
+```
+: codex --schema=orders_v1 list the latest 5 orders as JSON
+```
+
 ---
 
 ## Error messages
@@ -267,7 +317,7 @@ The codex harness has 44 deterministic unit tests + 20 command-parser tests, non
 - **`reasoning` items dropped silently.** When codex emits `item.completed { type: "reasoning" }`, terminus drops it without surfacing to chat. Surfacing reasoning would create noisy chat output; revisit if users ask.
 - **Token usage from `turn.completed.usage` not surfaced to chat.** Parity with gemini, where `result` event stats are also unsurfaced today.
 - **Image-only attachment whitelist.** `image/png`, `image/jpeg`, `image/jpg`, `image/webp` only. HEIC, PDF, video, etc. are rejected with chat-safe errors. Multimodal expansion deferred.
-- **No structured-output rendering as anything richer than text.** `--schema` validates the response and returns it as `HarnessEvent::Text` (gemini-parity). The dedicated `HarnessEvent::StructuredOutput` channel is reserved for the Claude SDK's webhook-delivery pipeline.
+- **Inline-JSON and file-path `--schema` forms render as `HarnessEvent::Text` only.** They never feed the webhook pipeline — that is reserved for registered names from `[schemas.<name>]` so the HMAC secret env var lookup is registry-driven (see [Structured output and webhooks](#structured-output-and-webhooks)).
 - **`gpt-5.5` rejected with ChatGPT auth.** Codex's default model on a ChatGPT account run won't accept `gpt-5.5` (API-only). Use `gpt-5.4` or `gpt-5.3-codex` via `--model` or `[harness.codex].model`.
 - **Stderr ERROR lines are benign.** The `failed to record rollout items: thread <id> not found` line is filtered automatically by `sanitize_stderr` and does not propagate to chat. Same for `Reading additional input from stdin...` (only appears if stdin redirection regresses).
 - **Cross-harness session-name persist failure (terminus-wide).** State file persists one entry per key; the `codex:` prefix prevents collisions with other harnesses, but a write-failure mode shared with opencode/gemini is documented in CLAUDE.md as a known limitation. Not codex-specific.
