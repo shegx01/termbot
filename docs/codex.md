@@ -212,6 +212,10 @@ All fields are optional. When omitted, terminus resolves `codex` from PATH and i
 
 Terminus already sets the child process's working directory via `tokio::process::Command::current_dir(cwd)`. Passing `--cd` redundantly risks divergence if codex resolves `--cd` differently from the OS-level `current_dir`.
 
+### Schema registry entries
+
+Schema registry entries (`[schemas.<name>]` with `schema`, `webhook`, `webhook_secret_env` keys) are documented in [Structured output and webhooks](#structured-output-and-webhooks) — they're not codex-specific and are validated at startup against all schema-supporting harnesses (claude + codex).
+
 ---
 
 ## Structured output and webhooks
@@ -237,7 +241,14 @@ Configure schemas in `terminus.toml`:
 ```toml
 [schemas.orders_v1]
 schema = '''
-{ "type": "object", "required": ["order_id", "items"], "properties": { ... } }
+{
+  "type": "object",
+  "required": ["order_id", "items"],
+  "properties": {
+    "order_id": { "type": "string" },
+    "items":    { "type": "array", "items": { "type": "string" } }
+  }
+}
 '''
 webhook = "https://your-server.example.com/webhooks/orders"
 webhook_secret_env = "ORDERS_WEBHOOK_SECRET"

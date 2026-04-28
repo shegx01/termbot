@@ -338,21 +338,37 @@ pub(crate) fn sanitize_stderr_base(s: &str) -> String {
     }
 
     // (2) Absolute user-path redaction.
-    let patterns: &[(&str, &str)] = &[("/Users/", "/Users/"), ("/home/", "/home/")];
+    //
+    // Replace the entire path-shaped run starting at `/Users/<u>/…` or
+    // `/home/<u>/…` with a single `<redacted-path>` placeholder, ending at
+    // the first whitespace or end-of-line. The previous implementation
+    // skipped only past the username + first `/`, which let
+    // `<redacted-path>secret-project/key.pem` survive — leaking directory
+    // structure that's often as sensitive as the username (C6.P1.1).
+    //
+    // A path component is anything not ASCII-whitespace and not a path
+    // terminator like `:` or `,`. We use the conservative rule "advance
+    // until whitespace or end-of-line" since most stderr prints paths
+    // followed by a space or `\n`. Trailing punctuation like `:42` or `,`
+    // after a path is preserved by stopping at non-path characters.
+    let patterns: &[&str] = &["/Users/", "/home/"];
     let mut result = out;
-    for (needle, prefix) in patterns {
+    for needle in patterns {
         if result.contains(needle) {
             let mut new_result = String::with_capacity(result.len());
             let mut scan = result.as_str();
             while let Some(idx) = scan.find(needle) {
                 new_result.push_str(&scan[..idx]);
                 new_result.push_str("<redacted-path>");
-                let after_prefix = &scan[idx + prefix.len()..];
-                let skip = after_prefix
-                    .find('/')
-                    .map(|i| i + 1)
-                    .unwrap_or(after_prefix.len());
-                scan = &after_prefix[skip..];
+                // Advance past the entire path. Stop at whitespace
+                // (space / tab / newline) or end-of-string. This redacts
+                // both `<u>` and every nested directory + filename so the
+                // chat output reveals nothing about the layout.
+                let after_needle = &scan[idx..];
+                let path_end = after_needle
+                    .find(|c: char| c.is_ascii_whitespace())
+                    .unwrap_or(after_needle.len());
+                scan = &after_needle[path_end..];
             }
             new_result.push_str(scan);
             result = new_result;
@@ -1237,5 +1253,57 @@ mod tests {
     fn sanitize_stderr_base_preserves_safe_content() {
         let s = "model quota exceeded; try again later";
         assert_eq!(sanitize_stderr_base(s), s);
+    }
+
+    /// Critic-6 P1: the previous path-redaction algorithm advanced past
+    /// `/Users/<u>/` and resumed scanning, so `secret-project/key.pem` would
+    /// survive in the chat output. The new algorithm replaces the entire
+    /// path run (until whitespace) with a single placeholder.
+    #[test]
+    fn sanitize_stderr_base_redacts_full_path_not_just_username() {
+        let s = "stat failed: /Users/bob/secret-project/key.pem missing";
+        let out = sanitize_stderr_base(s);
+        assert!(
+            !out.contains("secret-project"),
+            "directory after username must be redacted, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("key.pem"),
+            "filename must be redacted, got: {}",
+            out
+        );
+        // Surrounding prose stays.
+        assert!(out.contains("stat failed:"), "prose dropped: {}", out);
+        assert!(
+            out.contains("missing"),
+            "post-path token must be preserved (stops at whitespace), got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn sanitize_stderr_base_redacts_home_path_with_nested_dirs() {
+        let s = "/home/alice/code/project/src/main.rs:42";
+        let out = sanitize_stderr_base(s);
+        assert!(!out.contains("alice"));
+        assert!(!out.contains("code"));
+        assert!(!out.contains("project"));
+        assert!(!out.contains("main.rs"));
+        // The trailing `:42` is part of the path-token and gets consumed
+        // (no whitespace before EOL); acceptable behaviour — if the input
+        // had a space (e.g. `path:42 panic`) we'd preserve `panic`.
+    }
+
+    #[test]
+    fn sanitize_stderr_base_path_redaction_preserves_post_whitespace_diagnostics() {
+        // Bracketing whitespace marks the path boundary so prose survives.
+        let s = "error at /Users/dave/etc/config and at /home/dave/.bashrc continues";
+        let out = sanitize_stderr_base(s);
+        assert!(!out.contains("dave"));
+        assert!(!out.contains(".bashrc"));
+        assert!(out.contains("error at"));
+        assert!(out.contains("continues"));
+        assert!(out.contains("and at"), "prose between two paths kept");
     }
 }

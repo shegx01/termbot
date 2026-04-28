@@ -296,7 +296,7 @@ impl Harness for GeminiHarness {
         if options.schema.is_some() {
             let _ = event_tx
                 .send(HarnessEvent::Error(
-                    "gemini does not support --schema. Try: `: claude --schema=<name> <prompt>` or `: codex --schema=<name> <prompt>`"
+                    "gemini does not support --schema. Try: `: claude --schema=<registered-name> <prompt>` or `: codex --schema=<registered-name> <prompt>` (codex also accepts inline-JSON / file-path schema forms, but only registered names trigger webhook delivery)"
                         .into(),
                 ))
                 .await;

@@ -205,7 +205,7 @@ chars. For long outputs, run the CLI in your terminal.
   As of the Bug 3 fix, named-session persistence is *atomic*: in-memory mutations
   happen ONLY after `state_tx.send().await` accepts the batch (5-second timeout).
   If the state worker is stalled or its channel is closed, the prompt's chat
-  output gains a `⚠️ Session-state persistence failed; this prompt's named
+  output gains a `Session-state persistence failed; this prompt's named
   session won't survive a restart` line so the failure is visible rather than
   silent. See `App::persist_named_session` in `src/app.rs`.
 

@@ -104,7 +104,7 @@ impl Harness for OpencodeHarness {
         if options.schema.is_some() {
             let _ = event_tx
                 .send(HarnessEvent::Error(
-                    "opencode does not support --schema. Try: `: claude --schema=<name> <prompt>` or `: codex --schema=<name> <prompt>`"
+                    "opencode does not support --schema. Try: `: claude --schema=<registered-name> <prompt>` or `: codex --schema=<registered-name> <prompt>` (codex also accepts inline-JSON / file-path schema forms, but only registered names trigger webhook delivery)"
                         .into(),
                 ))
                 .await;
@@ -593,18 +593,29 @@ async fn run_opencode_inner(
     };
 
     // Drain stderr concurrently with stdout so opencode doesn't pipe-deadlock
-    // when its stderr buffer fills (~64 KiB on Linux, ~8 KiB on macOS). Without
-    // a concurrent drain, if opencode writes substantial stderr while also
-    // writing stdout, opencode will block on the stderr write — and we'll
-    // block on stdout's `next_line()` waiting for output that never comes.
-    // The 5-minute idle timeout would eventually fire, but the deadlock is
-    // avoidable with one extra task.
+    // when its stderr buffer fills (~64 KiB on Linux, ~8 KiB on macOS).
+    //
+    // The buffered portion (first 64 KiB) is captured for sanitization on
+    // non-zero exit. Anything past 64 KiB is forwarded to `tokio::io::sink`
+    // so the child can keep writing without blocking — without the post-cap
+    // drain, opencode could fill the OS pipe buffer past 64 KiB and stall
+    // on its next stderr write, hanging `child.wait()` until the 5-minute
+    // idle timeout fired. (Critic-2 P1.)
     let stderr_handle: Option<tokio::task::JoinHandle<Vec<u8>>> = child.stderr.take().map(|s| {
         tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf: Vec<u8> = Vec::new();
-            let mut limited = s.take(64 * 1024);
-            let _ = limited.read_to_end(&mut buf).await;
+            let mut s = s;
+            // Capture up to 64 KiB for sanitization.
+            {
+                let mut limited = (&mut s).take(64 * 1024);
+                let _ = limited.read_to_end(&mut buf).await;
+            }
+            // Drain anything past the cap into a sink so the child never
+            // blocks on stderr writes.
+            let mut sink = tokio::io::sink();
+            let _ = tokio::io::copy(&mut s, &mut sink).await;
+            let _ = sink.flush().await;
             buf
         })
     });
@@ -758,7 +769,12 @@ async fn run_opencode_inner(
     // non-zero-exit paths but the drain task must run to completion to
     // avoid a leaked tokio task and a half-open pipe.
     let raw_stderr_buf: Vec<u8> = match stderr_handle {
-        Some(h) => h.await.unwrap_or_default(),
+        Some(h) => h.await.unwrap_or_else(|e| {
+            // Don't silently swallow drain-task panics; log so a half-open
+            // pipe + missing stderr buffer can be diagnosed.
+            tracing::warn!("opencode stderr drain task failed: {}", e);
+            Vec::new()
+        }),
         None => Vec::new(),
     };
 

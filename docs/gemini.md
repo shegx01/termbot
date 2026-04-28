@@ -34,7 +34,7 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 | Bare `--continue` (continue last) | Working | Translates to `gemini -r latest` |
 | `--model <x>` / `-m <x>` | Working | Aliases: `pro`, `flash`, `flash-lite`. Per-prompt wins over `[harness.gemini].model` |
 | `--approval-mode <x>` | Working | Values: `default`, `auto_edit`, `yolo`, `plan`. Per-prompt wins over `[harness.gemini].approval_mode` |
-| `--schema <name>` | Working (error-redirect) | Returns `"gemini does not support --schema. Try: \`: claude --schema=<name> <prompt>\`"` |
+| `--schema <name>` | Working (error-redirect) | Returns a chat-safe error pointing at `: claude --schema=<registered-name>` or `: codex --schema=<registered-name>` (codex also accepts inline-JSON / file-path schema forms, but only registered names trigger webhook delivery) |
 | `--title`, `--share`, `--pure`, `--fork` | Not shipped | Opencode-only; no gemini analog |
 | **Event translation (`stream-json` → `HarnessEvent`)** |||
 | `init` → capture `session_id` + model | Working | Feeds `HarnessEvent::Done.session_id` |
@@ -78,12 +78,12 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 | **Attachments** |||
 | Inbound image / file attachments | Not shipped | Rejected with `"gemini: attachments are not yet supported — send text only"` |
 | **Testing** |||
-| Unit tests (deterministic, no external deps) | Working | 55 tests in `harness::gemini` covering `translate_event` for all 6 event types incl. `tool_result.error` object/string variants, `ToolPairingBuffer` incl. capacity eviction, `sanitize_stderr` env-var (upper/lower-case) + home-path redaction + truncation, `build_argv` flag ordering + precedence, ambient-event shape, attachment rejection, schema-redirect, mutex-poison recovery |
+| Unit tests (deterministic, no external deps) | Working | 58 tests in `harness::gemini` covering `translate_event` for all 6 event types incl. `tool_result.error` object/string variants, `ToolPairingBuffer` incl. capacity eviction, `sanitize_stderr` env-var (upper/lower-case) + home-path redaction + truncation, `build_argv` flag ordering + precedence, ambient-event shape, attachment rejection, schema-redirect, mutex-poison recovery, chat-safe subcommand argv + spawn-failure Done invariant |
 | `ac1` one-shot streams + completes (live-binary) | Working | Gated by `TERMINUS_HAS_GEMINI=1` |
 | `ac2` interactive two-prompt session reuse (live-binary) | Working | Gated |
 | `ac3` bogus session id surfaces error (live-binary) | Working | Gated |
 | `ac4` tool-use visibility with approval=yolo (live-binary) | Working | Gated |
-| `ac5` subcommand output (live-binary) | Not shipped | Originally planned from the opencode ACs; skipped because no chat-safe gemini subcommand was shipped. An equivalent non-gated test covers attachment rejection instead |
+| `ac5` subcommand output (live-binary) | Not shipped | F5 added chat-safe subcommands (`sessions`, `extensions`) but the live-binary AC was skipped in favor of unit-level argv + spawn-failure Done tests (`subcommand_argv_*`, `subcommand_missing_binary_emits_error_then_done`) which run unconditionally |
 
 ---
 
@@ -226,7 +226,7 @@ The `[harness.gemini]` block in `terminus.toml` is entirely optional. If omitted
 | `gemini: no recognized events received (version drift — check \`gemini --version\`)` | Exit 0, only unknown event types | Upgrade or downgrade gemini-cli to a compatible version |
 | `gemini: event schema mismatch (version drift — check \`gemini --version\`)` | Recognized type but required field missing | Schema changed upstream; report to terminus |
 | `gemini result status: <status>` | `result` event with non-success status and no detail | Check auth / quota / model availability |
-| `gemini does not support --schema. Try: \`: claude --schema=<name> <prompt>\`` | `--schema` passed to gemini | Use the claude harness for structured output |
+| `gemini does not support --schema. Try: \`: claude --schema=<registered-name> <prompt>\` or \`: codex --schema=<registered-name> <prompt>\` (…)` | `--schema` passed to gemini | Use the claude or codex harness for structured output |
 | `` `gemini <sub>` is not available from chat — run it in your terminal. Safe chat subcommands: sessions, extensions. `` | Blocked subcommand invoked | Use a safe subcommand or run the native command in terminal |
 | `gemini does not support --fork — remove the flag` | `--fork` passed for gemini | gemini-cli has no fork analog; drop the flag |
 | `gemini: attachments are not yet supported — send text only` | An attachment was sent to the harness | Send the prompt without the attachment |
@@ -255,7 +255,7 @@ En-dash (U+2013) is intentionally NOT normalized — it appears in legitimate pr
 
 See [docs/integration-tests.md](integration-tests.md) for the general gated-test model.
 
-**Unit tests (always run):** 54 tests in `src/harness/gemini.rs::tests` cover argv construction (including flag-ordering and per-prompt-vs-config precedence), event translation for all six event types (with `tool_result.error` as both structured `{type, message}` and forward-compat string variants), the pairing buffer's lifecycle including `CAP`-based eviction, `sanitize_stderr` redaction (upper- and lower-case env vars, home-path stripping) with truncation-after-redaction ordering, attachment rejection, ambient-event shape, panic formatting, and session-key prefixing.
+**Unit tests (always run):** 58 tests in `src/harness/gemini.rs::tests` cover argv construction (including flag-ordering and per-prompt-vs-config precedence), event translation for all six event types (with `tool_result.error` as both structured `{type, message}` and forward-compat string variants), the pairing buffer's lifecycle including `CAP`-based eviction, `sanitize_stderr` redaction (upper- and lower-case env vars, home-path stripping) with truncation-after-redaction ordering, attachment rejection, ambient-event shape, panic formatting, session-key prefixing, mutex-poison recovery, and chat-safe subcommand argv + spawn-failure Done invariant.
 
 **Gated live-binary tests** (`#[ignore]` + `TERMINUS_HAS_GEMINI=1`):
 

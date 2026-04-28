@@ -65,11 +65,13 @@ pub struct CodexHarness {
     /// form used for cross-harness isolation in state.
     sessions: Arc<StdMutex<HashMap<String, String>>>,
     ambient_tx: Option<broadcast::Sender<AmbientEvent>>,
-    /// Optional schema registry. When set, `--schema=<name>` resolves against
-    /// `[schemas.<name>]` in `terminus.toml` (in addition to the existing
-    /// inline-JSON / file-path forms). Required for full webhook-delivery
-    /// parity with the claude harness — see F11.
-    schema_registry: Option<Arc<crate::structured_output::SchemaRegistry>>,
+    /// Schema registry. Defaults to an empty registry; `with_schema_registry`
+    /// swaps in the App-shared one. Symmetric with `ClaudeHarness` so the
+    /// failure mode is consistent across harnesses: an unknown
+    /// `--schema=<name>` always produces a deterministic "unknown schema /
+    /// not registered" error rather than a silent no-op when the builder is
+    /// forgotten. (Critic-4 P1.1.)
+    schema_registry: Arc<crate::structured_output::SchemaRegistry>,
 }
 
 impl CodexHarness {
@@ -79,7 +81,7 @@ impl CodexHarness {
             config,
             sessions: Arc::new(StdMutex::new(HashMap::new())),
             ambient_tx: Some(ambient_tx),
-            schema_registry: None,
+            schema_registry: Arc::new(crate::structured_output::SchemaRegistry::default()),
         }
     }
 
@@ -90,7 +92,7 @@ impl CodexHarness {
             config,
             sessions: Arc::new(StdMutex::new(HashMap::new())),
             ambient_tx: None,
-            schema_registry: None,
+            schema_registry: Arc::new(crate::structured_output::SchemaRegistry::default()),
         }
     }
 
@@ -101,7 +103,7 @@ impl CodexHarness {
         mut self,
         registry: Arc<crate::structured_output::SchemaRegistry>,
     ) -> Self {
-        self.schema_registry = Some(registry);
+        self.schema_registry = registry;
         self
     }
 }
@@ -146,7 +148,7 @@ impl Harness for CodexHarness {
         let resolved = match handle_schema(
             options.schema.as_deref(),
             cwd,
-            self.schema_registry.as_deref(),
+            Some(self.schema_registry.as_ref()),
         ) {
             Ok(r) => r,
             Err(msg) => {
@@ -197,7 +199,7 @@ impl Harness for CodexHarness {
         // (parity with claude) or fall back to plain `HarnessEvent::Text`.
         let structured_schema_for_run: Option<String> = decide_structured_schema(
             registered_schema_name.as_deref(),
-            self.schema_registry.as_deref(),
+            Some(self.schema_registry.as_ref()),
         );
 
         let run_id_for_task = run_id.clone();
@@ -529,20 +531,38 @@ fn handle_schema(
     // Explicit error for the "exists but not a file" case (typically a
     // directory). The previous fallthrough produced a misleading
     // "neither a file path nor valid JSON" error for valid-looking paths.
+    //
+    // Echoing `candidate.display()` here would reflect the cwd-joined
+    // resolved path back to chat — a small information-disclosure oracle
+    // for whoever sent the prompt (Critic-6 P1.2). Echo only the user's
+    // raw input instead.
     if candidate.exists() {
         return Err(format!(
             "codex: --schema path exists but is not a file (directory or special file): {}",
-            candidate.display()
+            s
         ));
     }
 
     // (3) Inline JSON.
     if let Err(e) = serde_json::from_str::<serde_json::Value>(s) {
         // If a registry is attached, fold the known-schemas list into the
-        // error so users discover the registered-name shortcut.
+        // error so users discover the registered-name shortcut. Cap at 5
+        // names with an "…and N more" suffix so a 50-schema registry
+        // doesn't produce an unreadable 500-character error line.
+        // (Critic-4 P2.5.)
         let known_hint = match registry {
             Some(reg) if !reg.schema_names().is_empty() => {
-                format!(" (registered schemas: {})", reg.schema_names().join(", "))
+                let names = reg.schema_names();
+                const SHOW: usize = 5;
+                if names.len() <= SHOW {
+                    format!(" (registered schemas: {})", names.join(", "))
+                } else {
+                    format!(
+                        " (registered schemas: {}, …and {} more)",
+                        names[..SHOW].join(", "),
+                        names.len() - SHOW
+                    )
+                }
             }
             _ => String::new(),
         };
@@ -684,17 +704,25 @@ async fn run_codex_inner(
 
     // Drain stderr concurrently with stdout so codex doesn't pipe-deadlock
     // when its stderr buffer fills (~64 KiB on Linux, ~8 KiB on macOS).
-    // Without a concurrent drain, if codex writes substantial stderr while
-    // also writing stdout, codex will block on the stderr write — and we'll
-    // block on stdout's `next_line()` waiting for output that never comes.
-    // The 5-minute idle timeout would eventually fire, but the deadlock is
-    // avoidable with one extra task.
+    //
+    // The buffered portion (first 64 KiB) is captured for sanitization on
+    // non-zero exit. Anything past 64 KiB is forwarded to `tokio::io::sink`
+    // so the child can keep writing without blocking — without the post-cap
+    // drain, codex could fill the OS pipe buffer past 64 KiB and stall on
+    // its next stderr write, hanging `child.wait()` until the 5-minute
+    // idle timeout fired. (Critic-2 P1.)
     let stderr_handle: Option<tokio::task::JoinHandle<Vec<u8>>> = child.stderr.take().map(|s| {
         tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf: Vec<u8> = Vec::new();
-            let mut limited = s.take(64 * 1024);
-            let _ = limited.read_to_end(&mut buf).await;
+            let mut s = s;
+            {
+                let mut limited = (&mut s).take(64 * 1024);
+                let _ = limited.read_to_end(&mut buf).await;
+            }
+            let mut sink = tokio::io::sink();
+            let _ = tokio::io::copy(&mut s, &mut sink).await;
+            let _ = sink.flush().await;
             buf
         })
     });
@@ -811,14 +839,29 @@ async fn run_codex_inner(
                         }
                         TranslatedEvent::TurnCompleted => {
                             saw_recognized = true;
-                            // Structured-output emission, if enabled. We only
-                            // attempt parse + emit when we actually accumulated
-                            // text — an empty buffer means codex returned no
-                            // agent_message at all, so falling through to the
-                            // `!saw_recognized` / "no response content" path
-                            // below is the right behaviour.
+                            // Structured-output emission, if enabled.
                             if let Some(ref schema_name) = structured_schema {
-                                if !structured_buffer.is_empty() {
+                                if structured_buffer.is_empty() {
+                                    // Empty buffer in structured mode means
+                                    // codex completed with no agent_message
+                                    // (model produced reasoning only, or
+                                    // a tool-only turn). The bare
+                                    // `!saw_recognized` fallback further
+                                    // down doesn't fire here because
+                                    // saw_recognized is true, so we'd
+                                    // surface a misleading "no response
+                                    // received" from the App layer
+                                    // (Critic-1 P1.3). Emit an explicit
+                                    // chat message instead so the user
+                                    // knows the run completed but no
+                                    // structured payload was produced.
+                                    let _ = event_tx
+                                        .send(HarnessEvent::Text(format!(
+                                            "codex: --schema='{}' completed without producing structured output (no agent_message in this turn)",
+                                            schema_name
+                                        )))
+                                        .await;
+                                } else {
                                     match serde_json::from_str::<serde_json::Value>(
                                         &structured_buffer,
                                     ) {
@@ -833,20 +876,24 @@ async fn run_codex_inner(
                                                 .await;
                                         }
                                         Err(e) => {
-                                            // Schema-constrained mode but the
-                                            // model returned non-JSON — surface
-                                            // a clear error so the user knows
-                                            // delivery did NOT happen, and fall
-                                            // back to streaming the raw text
-                                            // so the content isn't lost.
+                                            // Schema-constrained mode but
+                                            // the model returned non-JSON.
+                                            // `drive_harness` breaks on
+                                            // the first Error event, so
+                                            // any subsequent Text would be
+                                            // dropped — emit only the
+                                            // Error with an action hint
+                                            // pointing at the codex prompt
+                                            // / model choice as the likely
+                                            // root cause. (Critic-1 P1.1,
+                                            // Critic-2 P1.2, Critic-4 P1.3.)
                                             let _ = event_tx
                                                 .send(HarnessEvent::Error(format!(
-                                                    "codex: --schema='{}' but response was not valid JSON: {}",
+                                                    "codex: --schema='{}' but response was not valid JSON ({}). \
+                                                     The model produced free-form text instead of schema-conformant JSON; \
+                                                     try a clearer prompt or a model with stronger structured-output support.",
                                                     schema_name, e
                                                 )))
-                                                .await;
-                                            let _ = event_tx
-                                                .send(HarnessEvent::Text(structured_buffer.clone()))
                                                 .await;
                                         }
                                     }
@@ -907,7 +954,10 @@ async fn run_codex_inner(
     // non-zero-exit paths but the drain task must run to completion to
     // avoid a leaked tokio task and a half-open pipe.
     let raw_stderr_buf: Vec<u8> = match stderr_handle {
-        Some(h) => h.await.unwrap_or_default(),
+        Some(h) => h.await.unwrap_or_else(|e| {
+            tracing::warn!("codex stderr drain task failed: {}", e);
+            Vec::new()
+        }),
         None => Vec::new(),
     };
 
@@ -1142,6 +1192,29 @@ mod tests {
     fn supports_resume_true() {
         let h = empty_harness();
         assert!(h.supports_resume());
+    }
+
+    /// Critic-3 P1.6: gemini and opencode have `arc_forwarder_*` tests that
+    /// pin the `Arc<H>` blanket impl after F8 deleted the per-type
+    /// forwarders. Codex was missing the same coverage — an
+    /// `unimplemented!()` mutation in the blanket would survive without a
+    /// codex-specific test exercising the Arc path.
+    #[test]
+    fn arc_forwarder_delegates_kind_and_resume_for_codex() {
+        let inner = Arc::new(empty_harness());
+        let dyn_handle: &dyn Harness = &inner;
+        assert_eq!(dyn_handle.kind(), HarnessKind::Codex);
+        assert!(dyn_handle.supports_resume());
+    }
+
+    #[test]
+    fn arc_forwarder_delegates_session_id_mutation_for_codex() {
+        let inner = Arc::new(empty_harness());
+        let dyn_handle: &dyn Harness = &inner;
+        dyn_handle.set_session_id("foo", "ses_codex".into());
+        assert_eq!(dyn_handle.get_session_id("foo"), Some("ses_codex".into()));
+        // The inner struct sees the mutation too.
+        assert_eq!(inner.get_session_id("foo"), Some("ses_codex".into()));
     }
 
     // ── session id storage ──────────────────────────────────────────────────
@@ -2206,6 +2279,76 @@ mod tests {
         assert!(
             err.contains("orders_v1"),
             "error should mention registered schemas; got: {}",
+            err
+        );
+    }
+
+    /// Critic-4 P2.5: registered-schemas hint in the parse-failure error
+    /// must cap at 5 names to avoid unreadable 500-character error lines
+    /// when a user has 50 schemas configured.
+    #[test]
+    fn registered_schemas_hint_caps_at_five_with_more_suffix() {
+        // Registry with 7 schemas — we expect the first 5 listed plus
+        // "…and 2 more".
+        let mut entries = std::collections::HashMap::new();
+        for i in 0..7 {
+            entries.insert(
+                format!("schema_{:02}", i),
+                crate::config::SchemaEntry {
+                    schema: r#"{"type":"object"}"#.to_string(),
+                    webhook: None,
+                    webhook_secret_env: None,
+                },
+            );
+        }
+        let reg = Arc::new(
+            crate::structured_output::SchemaRegistry::from_config(&entries).expect("registry"),
+        );
+        let err = handle_schema(Some("not json {"), Path::new("/tmp"), Some(&reg))
+            .expect_err("invalid input should error");
+        assert!(
+            err.contains("…and 2 more"),
+            "expected '…and N more' suffix when >5 schemas registered, got: {}",
+            err
+        );
+        // No more than 5 schema names appear before the "…and" suffix.
+        let listed = err.matches("schema_").count();
+        assert!(
+            listed <= 5,
+            "at most 5 schemas should appear in the hint, got {} in: {}",
+            listed,
+            err
+        );
+    }
+
+    /// Critic-6 P1.2: the "directory or special file" error must NOT echo
+    /// the resolved cwd-joined path back to chat (it would leak the
+    /// server's cwd to whoever sent the prompt). Echo only the user's
+    /// raw input string.
+    #[test]
+    fn directory_path_error_does_not_leak_resolved_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // User passes a relative name that resolves to a directory under
+        // the test cwd. The cwd path must NOT appear in the error.
+        let err = handle_schema(Some("subdir"), dir.path(), None);
+        // Ensure it's actually a directory case: create the dir.
+        std::fs::create_dir_all(dir.path().join("subdir")).expect("mkdir");
+        let err = handle_schema(Some("subdir"), dir.path(), None)
+            .err()
+            .or(err.err())
+            .expect("directory should produce an error");
+        // The cwd's full path must NOT appear in the error.
+        let cwd_str = dir.path().display().to_string();
+        assert!(
+            !err.contains(&cwd_str),
+            "resolved cwd path leaked to chat: {}\ncwd: {}",
+            err,
+            cwd_str
+        );
+        // The user's raw input is allowed (and expected) in the error.
+        assert!(
+            err.contains("subdir"),
+            "raw input should appear in error; got: {}",
             err
         );
     }

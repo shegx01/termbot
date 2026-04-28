@@ -424,7 +424,7 @@ Optional overrides:
 
 **Blocked from chat** (run in your terminal instead): `acp`, `agent`, `attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`, `session`, `tui`, `uninstall`, `upgrade`, `web`. Terminus returns a clear error if you try these from chat. Note: `session list` / `session ls` and `auth list` / `auth ls` ARE supported as safe read-only aliases.
 
-**`--schema` is not supported.** Opencode's CLI has no schema-constrained output surface; passing `--schema` to `: opencode ...` returns a chat-safe redirect error pointing at the claude harness. Use `: claude --schema=<name> <prompt>` or `: codex --schema=<name> <prompt>` for validated structured output with full webhook delivery (both harnesses now ship the same pipeline).
+**`--schema` is not supported.** Opencode's CLI has no schema-constrained output surface; passing `--schema` to `: opencode ...` returns a chat-safe redirect error pointing at the claude or codex harness. Use `: claude --schema=<registered-name> <prompt>` or `: codex --schema=<registered-name> <prompt>` for validated structured output with full webhook delivery. (Codex also accepts `--schema=<inline-or-path>` forms, but those validate the response against the schema without triggering webhook delivery — see footnote ⁶.)
 
 See [docs/opencode.md](docs/opencode.md) for the full CLI reference.
 
@@ -452,7 +452,7 @@ Optional overrides:
 
 **Per-prompt flags:** `--name`, `--resume`, `--continue` (named or bare), `--model` / `-m`, `--approval-mode`. Opencode-only flags (`--title`, `--share`, `--pure`, `--fork`) are not supported by gemini and return a parse error. Attachments (images / files) are rejected with a chat-safe error -- multimodal threading is a follow-up.
 
-**`--schema` is not supported.** Gemini-cli has no schema-constrained output surface; passing `--schema` to `: gemini ...` returns a chat-safe redirect error pointing at the claude harness. Use `: claude --schema=<name> <prompt>` or `: codex --schema=<name> <prompt>` for validated structured output with full webhook delivery.
+**`--schema` is not supported.** Gemini-cli has no schema-constrained output surface; passing `--schema` to `: gemini ...` returns a chat-safe redirect error pointing at the claude or codex harness. Use `: claude --schema=<registered-name> <prompt>` or `: codex --schema=<registered-name> <prompt>` for validated structured output with full webhook delivery. (Codex also accepts `--schema=<inline-or-path>` forms, but those validate the response against the schema without triggering webhook delivery — see footnote ⁶.)
 
 See [docs/gemini.md](docs/gemini.md) for the full CLI reference, event schema, error table, and functionality matrix.
 

@@ -163,7 +163,7 @@ The `[harness.opencode]` block in `terminus.toml` is entirely optional. If omitt
 | `opencode: no response content` | Exit 0, zero recognized events | Model returned nothing; check provider quota |
 | `opencode: no recognized events received (version drift — check opencode --version)` | Exit 0, only unknown events | Upgrade or downgrade opencode to a compatible version |
 | `opencode: event schema mismatch (version drift — check opencode --version)` | Recognized event type but required field missing | opencode's JSON shape changed; report to terminus |
-| `opencode does not support --schema. Try: : claude --schema=<name> <prompt>` | `--schema` flag passed to opencode harness | Use the claude harness for structured output |
+| `opencode does not support --schema. Try: : claude --schema=<registered-name> <prompt> or : codex --schema=<registered-name> <prompt> (codex also accepts inline-JSON / file-path schema forms, but only registered names trigger webhook delivery)` | `--schema` flag passed to opencode harness | Use the claude or codex harness for structured output |
 | `opencode <sub> is not available from chat — run it in your terminal. Safe chat subcommands: models, stats, sessions, providers, export.` | Blocked subcommand invoked | Use a safe subcommand or run the native command in terminal |
 
 ---
