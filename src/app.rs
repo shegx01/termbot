@@ -103,6 +103,15 @@ pub struct App {
     /// `mark_clean_shutdown` so the worker can check between-jobs and break out
     /// of an active drain loop without waiting for the next await point.
     retry_worker_shutdown_flag: Arc<AtomicBool>,
+    /// Claude SDK harness (typed Arc for symmetry with the other three; future
+    /// claude-specific inherent methods can be reached without a type-erased
+    /// downcast). Kept alongside the type-erased entry in `harnesses`.
+    /// Currently unread because `ClaudeHarness` exposes nothing the `Harness`
+    /// trait doesn't already cover; the field exists so a future
+    /// `run_subcommand` / claude-specific inherent method has a typed call
+    /// site without a breaking signature change. (Architect P1.2.)
+    #[allow(dead_code)]
+    pub(crate) claude: Arc<ClaudeHarness>,
     /// Opencode CLI-subprocess harness (kept as a typed Arc for direct access
     /// alongside the type-erased entry in `harnesses`).
     pub(crate) opencode: Arc<OpencodeHarness>,
@@ -141,9 +150,11 @@ impl App {
         let (ambient_tx, _) = broadcast::channel::<AmbientEvent>(512);
 
         let mut harnesses: HashMap<HarnessKind, Box<dyn Harness>> = HashMap::new();
+        let claude =
+            Arc::new(ClaudeHarness::new().with_schema_registry(Arc::clone(&schema_registry)));
         harnesses.insert(
             HarnessKind::Claude,
-            Box::new(ClaudeHarness::new().with_schema_registry(Arc::clone(&schema_registry))),
+            Box::new(Arc::clone(&claude)) as Box<dyn Harness>,
         );
         let opencode_cfg = config.harness.opencode.clone().unwrap_or_default();
         let opencode = Arc::new(OpencodeHarness::new(opencode_cfg, ambient_tx.clone()));
@@ -218,6 +229,7 @@ impl App {
             ambient_tx,
             retry_worker_shutdown: Arc::clone(&retry_worker_shutdown),
             retry_worker_shutdown_flag: Arc::clone(&retry_worker_shutdown_flag),
+            claude,
             opencode,
             gemini,
             codex,

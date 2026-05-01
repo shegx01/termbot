@@ -221,7 +221,7 @@ Can you fix the JWT validation bug?
 : codex off
 ```
 
-Codex always runs with `--full-auto --skip-git-repo-check` (codex 0.125.0 removed the prior `--ask-for-approval` flag, so `--full-auto` is the only non-interactive default that won't deadlock). Sandbox values: `read-only` / `workspace-write` / `danger-full-access`. ChatGPT-account auth rejects `gpt-5.5` (API-only); use `gpt-5.4` or `gpt-5.3-codex`. Image attachments are forwarded via `-i` (image-only whitelist). All native subcommands (`login`, `cloud`, `apply`, `mcp`, `plugin`, `debug`, etc.) are blocked from chat — run them in your terminal.
+Codex always runs with `--full-auto --skip-git-repo-check` (codex 0.125.0 removed the prior `--ask-for-approval` flag, so `--full-auto` is the only non-interactive default that won't deadlock). Sandbox values: `read-only` / `workspace-write` / `danger-full-access`. ChatGPT-account auth rejects `gpt-5.5` (API-only); use `gpt-5.4` or `gpt-5.3-codex`. Image attachments are forwarded via `-i` (image-only whitelist). Chat-safe subcommands: `: codex sessions`, `: codex apply <task_id>`, and `: codex cloud {list,status,diff,apply,exec}` — see [docs/codex.md](docs/codex.md). Other native subcommands (`login`, `mcp`, `resume`, `fork`, etc.) remain blocked.
 
 **Full flag + event-schema reference:** [docs/codex.md](docs/codex.md)
 

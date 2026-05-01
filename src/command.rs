@@ -115,6 +115,22 @@ pub struct ClaudeExtras {
     pub permission_mode: Option<String>,
 }
 
+impl ClaudeExtras {
+    /// `true` iff every field is `None` (no flags supplied). Preferred over
+    /// `*self == ClaudeExtras::default()` because it is robust to a future
+    /// field whose `Default` value is meaningful (e.g. `bool` defaulting to
+    /// `false` would otherwise silently misfire the comparison).
+    pub fn is_empty(&self) -> bool {
+        self.effort.is_none()
+            && self.system_prompt.is_none()
+            && self.append_system_prompt.is_none()
+            && self.max_turns.is_none()
+            && self.settings.is_none()
+            && self.mcp_config.is_none()
+            && self.permission_mode.is_none()
+    }
+}
+
 /// Codex-only flags (`--sandbox`, `--profile`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CodexExtras {
@@ -126,12 +142,26 @@ pub struct CodexExtras {
     pub profile: Option<String>,
 }
 
+impl CodexExtras {
+    /// `true` iff every field is `None`.
+    pub fn is_empty(&self) -> bool {
+        self.sandbox.is_none() && self.profile.is_none()
+    }
+}
+
 /// Gemini-only flags (`--approval-mode`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GeminiExtras {
     /// `--approval-mode <default|auto_edit|yolo|plan>`. Overrides
     /// `[harness.gemini].approval_mode` when set.
     pub approval_mode: Option<String>,
+}
+
+impl GeminiExtras {
+    /// `true` iff every field is `None`.
+    pub fn is_empty(&self) -> bool {
+        self.approval_mode.is_none()
+    }
 }
 
 /// Opencode-only flags (`--agent`, `--title`, `--share`, `--pure`, `--fork`).
@@ -147,6 +177,14 @@ pub struct OpencodeExtras {
     pub pure: bool,
     /// Fork the session before continuing (requires --continue or --resume).
     pub fork: bool,
+}
+
+impl OpencodeExtras {
+    /// `true` iff every field is at its "no flag" value (None for Options,
+    /// false for booleans).
+    pub fn is_empty(&self) -> bool {
+        self.agent.is_none() && self.title.is_none() && !self.share && !self.pure && !self.fork
+    }
 }
 
 /// CLI-style options that can be passed with `: <harness> [options] [prompt]`
@@ -689,33 +727,45 @@ impl ParsedCommand {
                         }
                         let rest_args: Vec<String> = subword_iter.map(String::from).collect();
 
-                        // Subcommands that REQUIRE a task_id arg — reject early.
-                        let needs_task_id = matches!(
-                            subcommand,
-                            CodexSubcommand::Apply
-                                | CodexSubcommand::Cloud(CodexCloudSubcommand::Status)
-                                | CodexSubcommand::Cloud(CodexCloudSubcommand::Diff)
-                                | CodexSubcommand::Cloud(CodexCloudSubcommand::Apply)
-                        );
-                        if needs_task_id && rest_args.is_empty() {
-                            let label = match &subcommand {
-                                CodexSubcommand::Apply => "apply",
-                                CodexSubcommand::Cloud(CodexCloudSubcommand::Status) => {
-                                    "cloud status"
-                                }
-                                CodexSubcommand::Cloud(CodexCloudSubcommand::Diff) => "cloud diff",
-                                CodexSubcommand::Cloud(CodexCloudSubcommand::Apply) => {
-                                    "cloud apply"
-                                }
-                                _ => unreachable!(),
-                            };
-                            return Err(ParseError::InvalidHarnessOption(format!(
-                                "`: codex {}` requires a task id (e.g. `: codex {} task_abc123`)",
-                                label, label
-                            )));
+                        // Subcommands that REQUIRE a task_id arg — produce both the
+                        // boolean and the display label from a single exhaustive
+                        // match so a future variant addition that needs a task_id
+                        // can't slip past the rejection guard. (Architect P1.)
+                        let task_label: Option<&str> = match &subcommand {
+                            CodexSubcommand::Apply => Some("apply"),
+                            CodexSubcommand::Cloud(CodexCloudSubcommand::Status) => {
+                                Some("cloud status")
+                            }
+                            CodexSubcommand::Cloud(CodexCloudSubcommand::Diff) => {
+                                Some("cloud diff")
+                            }
+                            CodexSubcommand::Cloud(CodexCloudSubcommand::Apply) => {
+                                Some("cloud apply")
+                            }
+                            CodexSubcommand::Sessions
+                            | CodexSubcommand::Cloud(CodexCloudSubcommand::List)
+                            | CodexSubcommand::Cloud(CodexCloudSubcommand::Exec) => None,
+                        };
+                        if let Some(label) = task_label {
+                            if rest_args.is_empty() {
+                                return Err(ParseError::InvalidHarnessOption(format!(
+                                    "`: codex {}` requires a task id (e.g. `: codex {} task_abc123`)",
+                                    label, label
+                                )));
+                            }
                         }
                         // `cloud exec` requires `--env <env_id>` upstream; let codex
                         // surface its own usage error rather than gatekeeping here.
+                        // `sessions` takes no arguments — reject extras up front so
+                        // the user gets a chat-side message rather than a confusing
+                        // codex error from `codex resume --all extra args`. (Critic P2.)
+                        if matches!(subcommand, CodexSubcommand::Sessions) && !rest_args.is_empty()
+                        {
+                            return Err(ParseError::InvalidHarnessOption(
+                                "`: codex sessions` takes no arguments — drop the extra tokens"
+                                    .into(),
+                            ));
+                        }
 
                         return Ok(ParsedCommand::HarnessSubcommand {
                             harness: kind,
@@ -1258,33 +1308,34 @@ fn parse_harness_options_tokens(
         ));
     }
 
-    // Materialize the right extras variant. Skip if no per-harness flags were
-    // set (so `is_empty()` stays meaningful and `summary()` doesn't render a
-    // bunch of no-op default fields).
+    // Materialize the right extras variant. Use the per-struct `is_empty()`
+    // (not `== Default::default()`) so a future field whose Default value is
+    // meaningful — e.g. an integer defaulting to `0` being a real choice —
+    // doesn't silently misfire this guard. (Code-reviewer LOW-1.)
     let extras = match kind {
         HarnessKind::Claude => {
-            if claude_e == ClaudeExtras::default() {
+            if claude_e.is_empty() {
                 None
             } else {
                 Some(HarnessExtras::Claude(claude_e))
             }
         }
         HarnessKind::Codex => {
-            if codex_e == CodexExtras::default() {
+            if codex_e.is_empty() {
                 None
             } else {
                 Some(HarnessExtras::Codex(codex_e))
             }
         }
         HarnessKind::Gemini => {
-            if gemini_e == GeminiExtras::default() {
+            if gemini_e.is_empty() {
                 None
             } else {
                 Some(HarnessExtras::Gemini(gemini_e))
             }
         }
         HarnessKind::Opencode => {
-            if opencode_e == OpencodeExtras::default() {
+            if opencode_e.is_empty() {
                 None
             } else {
                 Some(HarnessExtras::Opencode(opencode_e))
@@ -2278,6 +2329,46 @@ mod tests {
             ..Default::default()
         };
         assert!(!opts.is_empty());
+    }
+
+    #[test]
+    fn harness_options_is_empty_iff_summary_is_empty() {
+        // Roundtrip invariant: a "no flags set" object must produce an empty
+        // summary, and vice versa. Catches drift when a future field is added
+        // to summary() without updating is_empty(), or vice versa.
+        // (Test-engineer P1.)
+        let empty = HarnessOptions::default();
+        assert!(empty.is_empty(), "default must be is_empty");
+        assert!(
+            empty.summary().is_empty(),
+            "default must have empty summary"
+        );
+
+        let with_model = HarnessOptions {
+            model: Some("sonnet".into()),
+            ..Default::default()
+        };
+        assert!(!with_model.is_empty(), "model-set must not be is_empty");
+        assert!(
+            !with_model.summary().is_empty(),
+            "model-set must produce non-empty summary"
+        );
+
+        let with_codex_extras = HarnessOptions {
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                sandbox: Some("read-only".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(
+            !with_codex_extras.is_empty(),
+            "codex-extras-set must not be is_empty"
+        );
+        assert!(
+            !with_codex_extras.summary().is_empty(),
+            "codex-extras-set must produce non-empty summary"
+        );
     }
 
     // ── Round 1 bug-fix tests ───────────────────────────────────────────────
@@ -4100,6 +4191,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_codex_multiple_add_dir_threads_all_paths() {
+        // Codex's --add-dir is repeatable. The shared add_dirs Vec<PathBuf>
+        // must accumulate every value (a `push` mutation that no-ops the second
+        // call would otherwise survive). (Test-engineer P1.)
+        let cmd =
+            ParsedCommand::parse(": codex --add-dir /tmp/a --add-dir /tmp/b hi", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(prompt, "hi");
+                assert_eq!(
+                    options.add_dirs,
+                    vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+                );
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_gemini_add_dir_rejected() {
         // gemini does not accept --add-dir.
         let err = ParsedCommand::parse(": gemini --add-dir /tmp/a hi", ':').unwrap_err();
@@ -4235,6 +4347,24 @@ mod tests {
                 assert!(args.is_empty());
             }
             other => panic!("expected HarnessSubcommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_sessions_with_extra_args_rejected() {
+        // `codex resume --all` (the underlying CLI form) takes no positional
+        // arguments. Reject extras chat-side rather than passing through to a
+        // confusing codex-side error. (Critic P2.)
+        let err = ParsedCommand::parse(": codex sessions --limit 5", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("takes no arguments"),
+                    "expected no-args rejection; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
         }
     }
 

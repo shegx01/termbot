@@ -309,7 +309,9 @@ async fn run_subcommand_inner(
         } else {
             format!(" {}", extra_args.join(" "))
         };
-        format!("codex {}{}: no output", sub_label, arg_summary)
+        // "no results" matches the wording used by gemini and opencode for the
+        // same situation (Code-reviewer MED-1, cross-harness wording parity).
+        format!("codex {}{}: no results", sub_label, arg_summary)
     } else {
         // Truncate at 3000 chars for chat-friendliness, mirroring opencode.
         const MAX_CHARS: usize = 3000;
@@ -2852,13 +2854,15 @@ mod tests {
 
     /// Mirror of `gemini.rs::run_subcommand_emits_done_after_panic`: when the
     /// subprocess body panics the spawned task must still emit a terminal Done
-    /// after the Error so the receiver doesn't hang. We force a panic by
-    /// pointing the binary at a missing path: that itself doesn't panic, but it
-    /// does exercise the spawn-failure path which also produces Error+Done.
+    /// after the Error so the receiver doesn't hang. We force a spawn failure
+    /// by pointing the binary at a missing path; the spawn-failure arm
+    /// produces the same Error+Done pair as a panic. The path mirrors the
+    /// gemini convention (`/nonexistent/...-cN`) so the test reliably hits
+    /// `ErrorKind::NotFound` on both macOS and Linux. (Test-engineer P1.)
     #[tokio::test]
     async fn run_subcommand_spawn_failure_emits_error_then_done() {
         let cfg = CodexConfig {
-            binary_path: Some(PathBuf::from("/var/empty/definitely-not-codex-binary")),
+            binary_path: Some(PathBuf::from("/nonexistent/codex-binary-for-tests-c2a9")),
             ..Default::default()
         };
         let h = CodexHarness::new_with_config(cfg);

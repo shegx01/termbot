@@ -39,7 +39,7 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 | `--approval-mode on-request` | Working (rejected) | Codex 0.125.0 has no `--ask-for-approval` flag at all; terminus passes `--full-auto` unconditionally. Passing `--approval-mode on-request` returns a chat-safe error explaining the deadlock risk |
 | `--schema <name>` | Working | Three forms: (a) registered name from `[schemas.<name>]` in `terminus.toml`; (b) absolute or cwd-relative file path; (c) inline JSON. All three resolve to a temp file passed via `codex exec --output-schema <path>`. The registered-name form additionally drives the webhook-delivery pipeline (see [Structured output and webhooks](#structured-output-and-webhooks)) |
 | `--fork` | Working (rejected) | Codex's `fork` is a separate interactive subcommand; not exposed in non-interactive mode. Returns "codex does not support --fork in non-interactive mode" |
-| `--title`, `--share`, `--pure`, `--agent` | Not shipped | Opencode-only; no codex analog (silently ignored) |
+| `--title`, `--share`, `--pure`, `--agent` | Working (rejected) | Opencode-only; using one with `: codex` returns a cross-harness redirect error (`"--<flag> is only supported by opencode (you used `: codex`)"`) |
 | **Always-on flags** |||
 | `--full-auto` | Working | Sandboxed automatic execution; replaces the removed `--ask-for-approval` knob |
 | `--skip-git-repo-check` | Working | Tmux cwd may not always be a git repo |
@@ -89,7 +89,7 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 | `Stdio::null()` for child stdin | Working | Codex 0.125.0 reads stdin even when prompt is supplied as arg; `null` prevents indefinite blocking |
 | **Testing** |||
 | Unit tests (deterministic, no external deps) | Working | 44 tests in `harness::codex` covering `build_argv` for fresh/resume/continue with all flag combinations, `translate_event` for every event type, `ToolPairingBuffer` integration, MIME-whitelist enforcement, schema temp-file lifecycle, `sanitize_stderr` for codex-specific noise + env-vars + home paths, panic-message formatting |
-| Command parser tests | Working | 20 tests in `command::tests::parse_codex_*` covering basic prompt, named session, resume, continue, sandbox/profile/model overrides, every blocked subcommand, on-request rejection, fork rejection (flag + on form), em-dash normalization, on/off toggles, summary/is_empty regression |
+| Command parser tests | Working | `command::tests::parse_codex_*` covers basic prompt, named session, resume, continue, sandbox/profile/model overrides, blocked subcommands, on-request rejection, fork rejection (flag + on form), em-dash normalization, on/off toggles, summary/is_empty regression, the F6+F7 chat-safe subcommand routing surface (sessions / apply / cloud / cloud-{list,status,diff,apply,exec}), and F10 cross-harness flag rejection. Run `cargo test --lib command::tests::parse_codex` for the current list. |
 | Cross-harness regression: gemini buffer relocation | Working | All gemini tests pass with the relocated `ToolPairingBuffer` from `crate::harness` |
 
 ---
