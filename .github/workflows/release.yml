@@ -3,6 +3,17 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - patch
+          - rtc
 
 permissions:
   contents: read
@@ -125,16 +136,31 @@ jobs:
             echo '```'
           } > ../release-notes.md
 
-      - name: Set tag name
+      - name: Set build metadata
         env:
-          COMMIT_SHA: ${{ github.sha }}
-        run: echo "TAG=build-${COMMIT_SHA::8}" >> "$GITHUB_ENV"
+          RELEASE_CHANNEL: ${{ github.event.inputs.channel || 'stable' }}
+        run: |
+          case "$RELEASE_CHANNEL" in
+            stable | patch | rtc) ;;
+            *)
+              echo "Invalid release channel: $RELEASE_CHANNEL" >&2
+              exit 1
+              ;;
+          esac
+
+          BUILD_DATE="$(date -u +'%Y_%m_%d')"
+          BUILD_TIME="$(date -u +'%H:%M')"
+          TAG_TIME="$(date -u +'%H%M')"
+
+          echo "RELEASE_CHANNEL=$RELEASE_CHANNEL" >> "$GITHUB_ENV"
+          echo "TAG=${BUILD_DATE}__${TAG_TIME}_${RELEASE_CHANNEL}" >> "$GITHUB_ENV"
+          echo "BUILD_NAME=${BUILD_DATE}__${BUILD_TIME}_${RELEASE_CHANNEL}" >> "$GITHUB_ENV"
 
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
-          name: "Build ${{ env.TAG }}"
+          name: "Build ${{ env.BUILD_NAME }}"
           body_path: release-notes.md
           files: |
             artifacts/terminus-*
