@@ -1,243 +1,196 @@
 # terminus
 
-Control your terminal from Telegram, Slack, Discord, or any WebSocket client. Built in Rust.
+**Control your terminal and AI agents from Telegram, Slack, Discord, or any WebSocket client.**
 
-terminus gives you remote access to terminal sessions and AI harnesses from your phone or from code. Run shell commands, manage tmux sessions, send images, and have multi-turn AI conversations -- through chat platforms or a programmatic WebSocket API.
+terminus is a single-user Rust bot that bridges tmux sessions and AI harnesses
+(Claude, Codex, Gemini, opencode) to chat platforms and a programmatic
+WebSocket API. Run shell commands, manage sessions, send images, and hold
+multi-turn AI conversations — from your phone or from code.
 
----
-
-## Contents
-
-- [Support matrix](#support-matrix)
-- [Quick start](#quick-start)
-- [What can it do?](#what-can-it-do)
-- [Requirements](#requirements)
-- [Configuration](#configuration)
-- [Commands reference](#commands-reference)
-- [Named sessions](#named-sessions)
-- [Structured Output (--schema)](#structured-output---schema)
-- [Socket API](#socket-api)
-- [How it works](#how-it-works)
-- [Security](#security)
-- [Configuration reference](#configuration-reference)
-- [Troubleshooting](#troubleshooting)
+```
+: new dev
+: cargo build --release
+: claude on --name auth --model sonnet
+What does the auth module do?
+```
 
 ---
 
-## Support matrix
-
-**Chat platforms** (inbound + outbound messages):
-
-| Platform  | Text | Inbound attachments | Notes |
-|-----------|:----:|:-------------------:|-------|
-| Telegram  |  ✓   |          ✓          | Long-polling |
-| Slack     |  ✓   |          ✓          | Socket Mode; lossless wake-recovery via `conversations.history` catchup |
-| Discord   |  ✓   |          ✓          | Gateway; hybrid Threads (guilds) / MessageReference (DMs); REST catchup on wake |
-| WebSocket |  ✓   |          ✓          | Binary-frame upload; opt-in |
-
-**AI harnesses** (the `: <name>` prefixed commands):
-
-| Harness  | One-shot | Interactive | Named sessions | Tool-use events | Structured output | Attachments |
-|----------|:--------:|:-----------:|:--------------:|:---------------:|:-----------------:|:-----------:|
-| claude   |    ✓     |      ✓      |       ✓        |        ✓        |         ✓         |      ✓      |
-| opencode |    ✓     |      ✓      |       ✓        |       ✓¹        |         ✗²        |      ✓      |
-| gemini   |    ✓     |      ✓      |       ✓        |       ✓³        |         ✗²        |      ✗⁴     |
-| codex    |    ✓     |      ✓      |       ✓        |       ✓⁵        |        ✓⁶         |     ✓⁷      |
-
-¹ Tool-use events are forwarded when opencode emits them; tool-enabled agents (e.g. "build") emit tool_use JSON events, others may not. Set `agent = "build"` in `[harness.opencode]` config or pass `--agent build` per-prompt
-² Opencode and gemini CLIs have no schema-constrained output surface -- use the claude harness for `--schema` workflows
-³ Tool-use events from gemini arrive as separate `tool_use` + `tool_result` frames linked by `tool_id`; terminus coalesces them into a single event with both input and output. Enable tool-using behavior with `--approval-mode yolo` (or `auto_edit` / `plan`)
-⁴ Inbound attachments (images / files) are rejected by the gemini harness with a chat-safe error rather than silently dropped; multimodal threading is a follow-up
-⁵ Tool-use events from codex arrive as paired `item.started` + `item.completed` frames linked by `item.id` for tool kinds (`command_execution`, `file_change`, `mcp_tool_call`, `web_search`, `plan_update`); `agent_message` items go straight to text. terminus reuses the same `ToolPairingBuffer` as gemini
-⁶ Codex `--schema` accepts three forms — registered name (`[schemas.<name>]` in `terminus.toml`), file path, or inline JSON — all resolved to a temp file and passed as `--output-schema <path>`. The registered-name form additionally feeds the webhook-delivery pipeline (HMAC-SHA256, retry queue, full parity with claude). Inline-JSON and file-path forms render as chat-only fenced JSON, no webhook delivery.
-⁷ Image-only attachment whitelist (case-insensitive): `image/png`, `image/jpeg`, `image/jpg`, `image/webp`. Non-image MIME types are rejected with a chat-safe error
-
----
-
-## Quick start
-
-### One-line install (recommended)
-
-The installer downloads the binary, walks you through configuration, installs dependencies, and sets up a system service with auto-restart and update notifications.
+## Install
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/shegx01/terminus/main/install.sh | bash
 ```
 
-That's it. Open Telegram, Slack, or Discord and start typing.
+The installer detects your OS, walks you through configuration, registers a
+system service with auto-restart, and starts terminus. Open your chat client
+and start typing.
 
 <details>
 <summary>What the installer does</summary>
 
-1. Detects your OS and architecture (macOS/Linux, x86_64/ARM64)
-2. Checks for tmux (offers to install if missing) and Claude Code CLI (required)
-3. Walks you through Telegram/Slack configuration with inline help
-4. Downloads the correct binary to `~/.local/bin/terminus`
+1. Detects OS and architecture (macOS / Linux, x86_64 / ARM64)
+2. Checks for tmux and Claude Code CLI
+3. Walks you through Telegram / Slack / Discord configuration
+4. Downloads the binary to `~/.local/bin/terminus`
 5. Writes config to `~/.config/terminus/terminus.toml`
-6. Registers a system service (systemd on Linux, launchd on macOS) with auto-restart
-7. Sets up a daily update check with OS-native notifications
+6. Registers a system service (systemd / launchd) with auto-restart
+7. Sets up a daily update check
 8. Starts terminus
 
-**Flags:**
-- `--quick` — skip inline help text during setup
-- `--upgrade` — download latest binary, restart service (config untouched)
-- `--uninstall` — stop service, remove files (config preserved by default)
+**Flags:** `--quick` (skip help text), `--upgrade` (replace binary, keep config), `--uninstall` (stop service, keep config).
 
 ```bash
-# Upgrade
 curl -sSL https://raw.githubusercontent.com/shegx01/terminus/main/install.sh | bash -s -- --upgrade
-
-# Uninstall
 curl -sSL https://raw.githubusercontent.com/shegx01/terminus/main/install.sh | bash -s -- --uninstall
 ```
 </details>
 
-### Download a pre-built binary
+<details>
+<summary>Manual install (pre-built binary or from source)</summary>
 
-Pre-built binaries are also available directly on the [Releases](https://github.com/shegx01/terminus/releases/latest) page if you prefer manual setup.
+Pre-built binaries are on the [Releases](https://github.com/shegx01/terminus/releases/latest) page.
 
 ```bash
-# Download for your platform (macOS Apple Silicon shown)
+# Pre-built (macOS Apple Silicon shown)
 curl -L -o terminus \
   https://github.com/shegx01/terminus/releases/latest/download/terminus-aarch64-apple-darwin
-
 chmod +x terminus
 cp terminus.example.toml terminus.toml   # edit with your tokens
 ./terminus
-```
 
-### Build from source
-
-```bash
+# Or build from source (Rust 1.70+)
 git clone https://github.com/shegx01/terminus.git
 cd terminus
-cp terminus.example.toml terminus.toml   # edit with your tokens
+cp terminus.example.toml terminus.toml
 cargo build --release
 ./target/release/terminus
 ```
 
-To use a config file at a custom path, set `TERMINUS_CONFIG`:
-
-```bash
-TERMINUS_CONFIG=/path/to/config.toml ./terminus
-```
+Set `TERMINUS_CONFIG=/path/to/config.toml` to use a non-default config location.
+</details>
 
 ---
 
-## What can it do?
+## What it does
 
-**Terminal control** -- run commands, see output, manage sessions:
+**Terminal control** — run commands and manage tmux sessions:
 
 ```
-: new dev                        # create a session
-: cargo build --release          # run a command
-: list                           # see all sessions
-: bg                             # background current session
-: fg dev                         # switch to a session
-: kill dev                       # destroy a session
-: screen                         # snapshot the terminal screen
+: new dev                 # create a session
+: cargo build --release   # run a command in the foreground session
+: list                    # see all sessions
+: bg                      # background the current session
+: fg dev                  # switch sessions
+: kill dev                # destroy a session
+: screen                  # snapshot the terminal screen
 ```
 
-**Claude Code** -- ask questions, refactor code, explore projects, with named sessions, structured output, image input, and real-time tool activity:
+**Claude Code** — uses your Claude Pro/Max subscription, not API credits.
+Structured typed output, real-time tool activity, image input, named
+sessions:
 
 ```
 : claude explain this codebase
 : claude on --name auth --model sonnet
 What does the auth module do?
-Can you refactor it?
 [send a screenshot] what's wrong with this error?
 : claude off
 ```
 
-Uses your **Claude subscription** (Pro/Max), not API credits. SDK mode (above) gives structured typed output with tool-activity streaming; you can also run Claude Code as a full interactive CLI inside a tmux session for slash commands and skills.
+Full reference: [docs/claude.md](docs/claude.md)
 
-**Full flag + option reference:** [docs/claude.md](docs/claude.md)
-
-**OpenCode** -- prompt a different AI via the `opencode` CLI:
-
-```
-: opencode explain this codebase
-: opencode on --name review
-What does the auth module do?
-Is this idiomatic Rust?
-: opencode off
-```
-
-**OpenCode CLI subcommands** -- query opencode directly from chat:
-
-```
-: opencode models openrouter        # list configured models
-: opencode stats --days 7           # token usage + cost
-: opencode sessions                 # recent session IDs
-: opencode providers                # configured providers
-: opencode export ses_abc...        # dump a session as JSON
-```
-
-**Full flag + subcommand reference:** [docs/opencode.md](docs/opencode.md)
-
-**Gemini** -- prompt Google's `gemini` CLI from chat, with tool-use events and named sessions:
-
-```
-: gemini explain this codebase
-: gemini on --name review --approval-mode yolo
-What does the auth module do?
-Can you also run the unit tests?
-: gemini off
-```
-
-Gemini CLI flags are mapped to their own idioms -- `-r latest` for bare `--continue`, `-m <alias>` for model (`pro` / `flash` / `flash-lite`), and `--approval-mode` (`default` / `auto_edit` / `yolo` / `plan`). Gemini's interactive subcommands (`update`, `mcp`, `extensions`, `skills`) are blocked from chat.
-
-**Full flag + event-schema reference:** [docs/gemini.md](docs/gemini.md)
-
-**Codex** -- prompt OpenAI's `codex` CLI from chat (verified against codex-cli **0.128.0**), with paired tool-use events, named sessions, image attachments, and structured output:
+**Codex** — OpenAI's `codex` CLI from chat (verified against codex-cli
+**0.128.0**), with paired tool-use events, named sessions, image attachments,
+and structured output:
 
 ```
 : codex --model gpt-5.5 explain this codebase
 : codex on --name auth --sandbox workspace-write
-What does the auth module do?
 Can you fix the JWT validation bug?
-: codex off
 ```
 
-Codex always runs with `-s workspace-write --skip-git-repo-check` (codex 0.128 deprecated `--full-auto` in favor of explicit `-s <sandbox>`; `codex exec` is non-interactive by default in 0.128 so no separate "skip approval" flag is needed). Sandbox values: `read-only` / `workspace-write` / `danger-full-access`. Default model is `gpt-5.5` as of codex 0.128 — universally available; `gpt-5.4` and `gpt-5.4-mini` are alternatives. (`gpt-5.3-codex` was removed in 0.128.) Image attachments are forwarded via `-i` (image-only whitelist). Chat-safe subcommands: `: codex sessions`, `: codex apply <task_id>`, and `: codex cloud {list,status,diff,apply,exec}` — see [docs/codex.md](docs/codex.md). Other native subcommands (`login`, `mcp`, `resume`, `fork`, etc.) remain blocked.
+Defaults to `gpt-5.5` with `workspace-write` sandbox. Full reference: [docs/codex.md](docs/codex.md)
 
-**Full flag + event-schema reference:** [docs/codex.md](docs/codex.md)
+**Gemini** — Google's `gemini` CLI from chat, with tool-use events and named
+sessions:
 
-**Programmatic access** -- drive terminus from scripts, agents, or dashboards via WebSocket:
+```
+: gemini on --name review --approval-mode yolo
+What does the auth module do?
+Can you also run the unit tests?
+```
+
+Full reference: [docs/gemini.md](docs/gemini.md)
+
+**opencode** — prompt opencode from chat with named sessions and CLI
+subcommand passthrough:
+
+```
+: opencode --agent build refactor this module
+: opencode stats --days 7      # token usage + cost
+: opencode sessions            # recent session IDs
+```
+
+Full reference: [docs/opencode.md](docs/opencode.md)
+
+**Programmatic access** — drive terminus from scripts and agents over
+WebSocket:
 
 ```bash
-# Connect with websocat
 websocat ws://127.0.0.1:7645 -H "Authorization: Bearer tk_live_..."
-
-# Send a command and get structured JSON back
-> {"type":"request","request_id":"r1","command":": list"}
-< {"type":"ack","request_id":"r1","accepted_at":"..."}
-< {"type":"result","request_id":"r1","value":{"text":"..."},"cancelled":false}
-< {"type":"end","request_id":"r1"}
-
-# Subscribe to live session output
-> {"type":"subscribe","subscription_id":"s1","filter":{"event_types":["session_output"]}}
 ```
+
+```json
+> {"type":"request","request_id":"r1","command":": list"}
+< {"type":"result","request_id":"r1","value":{"text":"..."},"cancelled":false}
+```
+
+Full reference: [docs/socket.md](docs/socket.md)
+
+---
+
+## Support matrix
+
+| Platform  | Inbound text | Inbound attachments | Notes |
+|-----------|:------------:|:-------------------:|-------|
+| Telegram  |      ✓       |          ✓          | Long-polling |
+| Slack     |      ✓       |          ✓          | Socket Mode + `conversations.history` wake-recovery |
+| Discord   |      ✓       |          ✓          | Gateway + REST catchup; threads in guilds, replies in DMs |
+| WebSocket |      ✓       |          ✓          | Binary-frame upload; opt-in |
+
+| Harness  | One-shot | Interactive | Named sessions | Tool events | Schema | Attachments |
+|----------|:--------:|:-----------:|:--------------:|:-----------:|:------:|:-----------:|
+| claude   |    ✓     |      ✓      |       ✓        |      ✓      |   ✓    |     ✓       |
+| codex    |    ✓     |      ✓      |       ✓        |      ✓      |   ✓    | image-only  |
+| gemini   |    ✓     |      ✓      |       ✓        |      ✓      |   ✗    |     ✗       |
+| opencode |    ✓     |      ✓      |       ✓        |   ✓ (build) |   ✗    |     ✓       |
+
+**Notes:** opencode emits tool events only when run with a tool-enabled agent
+(`--agent build`). gemini and opencode have no schema-constrained output
+surface — use `: claude --schema=<name>` or `: codex --schema=<name>` for
+validated structured output. Codex image-attachment whitelist:
+`image/png`, `image/jpeg`, `image/jpg`, `image/webp`. See the per-harness docs
+for full event schemas.
 
 ---
 
 ## Requirements
 
-- **Rust 1.70+** (for building from source)
-- **tmux** (for terminal sessions)
-- **Claude Code CLI** (for `: claude` commands -- `npm i -g @anthropic-ai/claude-code`)
-- **opencode** (optional, for `: opencode` commands -- see [OpenCode integration](#opencode-integration-optional))
-- **gemini** (optional, for `: gemini` commands -- see [Gemini integration](#gemini-integration-optional))
-- **codex** (optional, for `: codex` commands -- see [Codex integration](#codex-integration-optional))
-- At least one of: Telegram bot token, Slack bot + app tokens, Discord bot token, or Socket API enabled
+- **Rust 1.70+** (only for building from source)
+- **tmux** on PATH
+- **Claude Code CLI** for `: claude` (`npm i -g @anthropic-ai/claude-code`)
+- **opencode** / **gemini** / **codex** CLIs on PATH for those harnesses (all optional)
+- At least one of: Telegram bot token, Slack bot + app tokens, Discord bot token, or socket API enabled
 
 ---
 
 ## Configuration
 
-The `[blocklist]` and `[streaming]` sections are the same across all platforms. See the Telegram example below for the full defaults -- the other platform snippets omit them for brevity.
+The `[blocklist]` and `[streaming]` sections are shared across all platforms.
+Defaults shown in the Telegram example below; other snippets omit them.
 
-### Telegram only
+### Telegram
 
 ```toml
 [auth]
@@ -264,21 +217,13 @@ max_sessions = 10
 ```
 
 <details>
-<summary>How to get your Telegram bot token and user ID</summary>
+<summary>How to get a bot token and your user ID</summary>
 
-**Bot token:**
-1. Message [@BotFather](https://t.me/BotFather) on Telegram
-2. Send `/newbot`, follow the prompts
-3. Copy the token
-
-**Your user ID:**
-1. Message [@userinfobot](https://t.me/userinfobot)
-2. It replies with your numeric ID
-
-**Permissions:** The default bot token grants everything terminus needs (receive messages, send messages, edit messages). No extra config required.
+**Bot token:** message [@BotFather](https://t.me/BotFather), send `/newbot`, follow prompts.
+**User ID:** message [@userinfobot](https://t.me/userinfobot) — it replies with your numeric ID.
 </details>
 
-### Slack only
+### Slack
 
 ```toml
 [auth]
@@ -288,39 +233,22 @@ slack_user_id = "U01ABCDEF"
 bot_token = "xoxb-..."
 app_token = "xapp-..."
 channel_id = "C01ABCDEF"
-
-[blocklist]
-patterns = [
-  "rm\\s+-[a-z]*f[a-z]*r[a-z]*\\s+/",
-  "sudo\\s+",
-  ":\\(\\)\\{\\s*:\\|:\\&\\s*\\};:",
-]
-
-[streaming]
-edit_throttle_ms = 2000
-poll_interval_ms = 250
-chunk_size = 4000
-offline_buffer_max_bytes = 1048576
-max_sessions = 10
 ```
 
 <details>
 <summary>How to set up a Slack app</summary>
 
-1. Go to [api.slack.com/apps](https://api.slack.com/apps), create a new app ("From scratch")
-2. **Socket Mode**: enable it, generate an app-level token with `connections:write` scope (`xapp-...`)
-3. **OAuth & Permissions**: add bot scopes `chat:write`, `channels:history`, `channels:read`
+1. [api.slack.com/apps](https://api.slack.com/apps) → create new app ("From scratch")
+2. **Socket Mode**: enable, generate app-level token with `connections:write` (`xapp-...`)
+3. **OAuth & Permissions**: add bot scopes `chat:write`, `channels:history`, `channels:read` (add `groups:*` for private channels)
 4. Install to workspace, copy bot token (`xoxb-...`)
-5. **Event Subscriptions**: enable, subscribe to `message.channels`
-6. Invite the bot to your channel: `/invite @botname`
-7. Get channel ID: right-click channel > "View channel details" > ID at bottom
-
-**Your member ID:** Click profile picture > "Profile" > three dots > "Copy member ID"
-
-**For private channels**, also add `groups:history` and `groups:read` scopes, and subscribe to `message.groups`.
+5. **Event Subscriptions**: enable, subscribe to `message.channels` (and `message.groups` for private)
+6. Invite the bot: `/invite @botname`
+7. Channel ID: right-click channel → "View channel details"
+8. Member ID: profile → three dots → "Copy member ID"
 </details>
 
-### Discord only
+### Discord
 
 ```toml
 [auth]
@@ -328,47 +256,25 @@ discord_user_id = 123456789012345678
 
 [discord]
 bot_token = "YOUR_BOT_TOKEN_HERE"
-# guild_id = 111222333444555666
+# guild_id   = 111222333444555666     # omit for DM-only mode
 # channel_id = 666555444333222111
-
-[blocklist]
-patterns = [
-  "rm\\s+-[a-z]*f[a-z]*r[a-z]*\\s+/",
-  "sudo\\s+",
-  ":\\(\\)\\{\\s*:\\|:\\&\\s*\\};:",
-]
-
-[streaming]
-edit_throttle_ms = 2000
-poll_interval_ms = 250
-chunk_size = 4000
-offline_buffer_max_bytes = 1048576
-max_sessions = 10
 ```
 
 <details>
 <summary>How to set up a Discord bot</summary>
 
-1. Go to [discord.com/developers/applications](https://discord.com/developers/applications), create a new application
-2. **Bot section**: click "Reset Token" to generate a bot token, copy it
-3. **Privileged Gateway Intents**: toggle ON **MESSAGE CONTENT INTENT** (required for reading message text). Also toggle ON **SERVER MEMBERS INTENT** if you plan to use guild channels
-4. **Generate an invite URL**: go to OAuth2 > URL Generator. Select the **bot** scope (no `applications.commands` needed). Under Bot Permissions select: **View Channels**, **Send Messages**, **Attach Files**, **Read Message History**. Copy the generated URL and open it in your browser to invite the bot to your server
-5. **DM-only mode**: omit `guild_id` and `channel_id` from the config. The bot will only respond to direct messages from the authorized user
-6. **Guild channel mode**: set both `guild_id` and `channel_id`. The bot will respond in that channel AND in DMs
+1. [discord.com/developers/applications](https://discord.com/developers/applications) → create app
+2. **Bot section**: reset token, copy
+3. **Privileged Gateway Intents**: enable **MESSAGE CONTENT INTENT** (required); also **SERVER MEMBERS INTENT** for guild channels
+4. **OAuth2 → URL Generator**: scope `bot`, permissions: View Channels, Send Messages, Attach Files, Read Message History. Open the generated URL to invite the bot.
+5. **DM-only mode**: omit `guild_id` and `channel_id`. **Guild mode**: set both.
 
-**How to get snowflake IDs:**
-1. In Discord, go to Settings > Advanced > toggle ON **Developer Mode**
-2. Right-click your username > **Copy User ID** (this is `discord_user_id`)
-3. Right-click a server > **Copy Server ID** (this is `guild_id`)
-4. Right-click a channel > **Copy Channel ID** (this is `channel_id`)
+**Snowflake IDs**: Settings → Advanced → Developer Mode, then right-click → Copy.
 </details>
 
-### Socket API only
+### Socket API
 
 ```toml
-# [auth] and [blocklist] are optional — omit them for socket-only deployments.
-# Add [blocklist] if you want to forbid dangerous shell commands sent over the socket.
-
 [socket]
 enabled = true
 
@@ -377,188 +283,97 @@ name = "my-agent"
 token = "tk_live_your-32-character-minimum-secret"
 ```
 
-The socket API is opt-in (`enabled = false` by default). Each client authenticates with a named Bearer token. See [Socket API](#socket-api) below for usage and [docs/socket.md](docs/socket.md) for the full wire protocol reference.
+Opt-in (`enabled = false` by default). Each client authenticates with a named
+Bearer token. See [Socket API](#socket-api) below and [docs/socket.md](docs/socket.md)
+for the wire protocol.
 
-### OpenCode integration (optional)
+### Harness overrides
 
-Opencode runs as a subprocess -- terminus spawns `opencode run --format json` per prompt and inherits the user's opencode CLI config (default model, agent, provider, auth). No extra terminus config is required if `opencode` is on PATH and authenticated.
-
-Optional overrides:
+All harness configuration is optional — terminus inherits each CLI's own
+config (auth, default model, profiles).
 
 ```toml
+[harness.claude]
+# See docs/claude.md for the full set.
+
 [harness.opencode]
-# Override the opencode binary location (default: resolved via PATH)
 # binary_path = "/usr/local/bin/opencode"
-
-# Per-run model override (passed as `-m <model>` to opencode run)
 # model = "openrouter/anthropic/claude-haiku-4-5"
+# agent = "build"   # use "build" for tool-use-enabled prompts
 
-# Per-run agent override (passed as `--agent <name>`). Use "build" for
-# tool-use-enabled agents.
-# agent = "build"
-```
-
-**Requirements:** `opencode` on PATH (same pattern as `tmux`). Run `opencode auth login` once before using any `: opencode ...` commands.
-
-**Blocked from chat** (run in your terminal instead): `acp`, `agent`, `attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`, `session`, `tui`, `uninstall`, `upgrade`, `web`. Terminus returns a clear error if you try these from chat. Note: `session list` / `session ls` and `auth list` / `auth ls` ARE supported as safe read-only aliases.
-
-**`--schema` is not supported.** Opencode's CLI has no schema-constrained output surface; passing `--schema` to `: opencode ...` returns a chat-safe redirect error pointing at the claude or codex harness. Use `: claude --schema=<registered-name> <prompt>` or `: codex --schema=<registered-name> <prompt>` for validated structured output with full webhook delivery. (Codex also accepts `--schema=<inline-or-path>` forms, but those validate the response against the schema without triggering webhook delivery — see footnote ⁶.)
-
-See [docs/opencode.md](docs/opencode.md) for the full CLI reference.
-
-### Gemini integration (optional)
-
-Gemini runs as a subprocess -- terminus spawns `gemini -o stream-json [flags] <prompt>` per prompt and inherits gemini-cli's own defaults (auth, default model). No extra terminus config is required if `gemini` is on PATH and authenticated.
-
-Optional overrides:
-
-```toml
 [harness.gemini]
-# Override the gemini binary location (default: resolved via PATH)
-# binary_path = "/usr/local/bin/gemini"
+# binary_path   = "/usr/local/bin/gemini"
+# model         = "flash"          # pro | flash | flash-lite
+# approval_mode = "default"        # default | auto_edit | yolo | plan
 
-# Per-run model override. Aliases: "pro" | "flash" | "flash-lite"
-# model = "flash"
-
-# Per-run approval mode. Values: "default" | "auto_edit" | "yolo" | "plan"
-# approval_mode = "default"
-```
-
-**Requirements:** `gemini` on PATH, already authenticated via gemini-cli's own config / OAuth flow.
-
-**Blocked from chat** (all four are interactive or destructive; run in your terminal instead): `update`, `mcp`, `extensions`, `skills`. No chat-safe gemini subcommands are shipped yet -- a `--list-sessions` passthrough is a planned follow-up.
-
-**Per-prompt flags:** `--name`, `--resume`, `--continue` (named or bare), `--model` / `-m`, `--approval-mode`. Opencode-only flags (`--title`, `--share`, `--pure`, `--fork`) are not supported by gemini and return a parse error. Attachments (images / files) are rejected with a chat-safe error -- multimodal threading is a follow-up.
-
-**`--schema` is not supported.** Gemini-cli has no schema-constrained output surface; passing `--schema` to `: gemini ...` returns a chat-safe redirect error pointing at the claude or codex harness. Use `: claude --schema=<registered-name> <prompt>` or `: codex --schema=<registered-name> <prompt>` for validated structured output with full webhook delivery. (Codex also accepts `--schema=<inline-or-path>` forms, but those validate the response against the schema without triggering webhook delivery — see footnote ⁶.)
-
-See [docs/gemini.md](docs/gemini.md) for the full CLI reference, event schema, error table, and functionality matrix.
-
-### Codex integration (optional)
-
-Codex runs as a subprocess -- terminus spawns `codex exec --json --full-auto --skip-git-repo-check [flags] <prompt>` per prompt (or `codex exec resume <thread_id>` for a named-session continuation) and inherits codex's own config (`~/.codex/config.toml`, profiles, ChatGPT/API auth). No extra terminus config is required if `codex` is on PATH and authenticated.
-
-Optional overrides:
-
-```toml
 [harness.codex]
-# Override the codex binary location (default: resolved via PATH)
-# binary_path = "/opt/homebrew/bin/codex"
-
-# Per-run model override. Default in codex 0.128: "gpt-5.5". Other models
-# available: "gpt-5.4", "gpt-5.4-mini". ("gpt-5.3-codex" was removed in 0.128.)
-# model = "gpt-5.5"
-
-# Per-run profile override (passed as `-p / --profile <name>`). Selects a
-# [profiles.<name>] block from ~/.codex/config.toml.
-# profile = "default"
-
-# Per-run sandbox policy. Values: "read-only" | "workspace-write" | "danger-full-access"
-# sandbox = "workspace-write"
-
-# Defense-in-depth: when true, terminus passes --ignore-user-config so codex
-# skips ~/.codex/config.toml entirely. Useful if a future codex profile field
-# could re-introduce TTY approval prompts. Default: false (respect user's profile).
+# binary_path        = "/opt/homebrew/bin/codex"
+# model              = "gpt-5.5"           # gpt-5.4 / gpt-5.4-mini also valid
+# sandbox            = "workspace-write"   # read-only | workspace-write | danger-full-access
+# profile            = "default"
 # ignore_user_config = false
 ```
 
-**Requirements:** `codex` on PATH (`brew install --cask codex` or `npm install -g @openai/codex`), authenticated via `codex login` (ChatGPT account or API key).
+Run each CLI's auth flow once before use (`opencode auth login`,
+`gemini` OAuth, `codex login`). Per-harness flag references and blocked-from-chat
+subcommand lists live in [docs/claude.md](docs/claude.md), [docs/codex.md](docs/codex.md),
+[docs/gemini.md](docs/gemini.md), and [docs/opencode.md](docs/opencode.md).
 
-**Defaults applied unconditionally** by terminus regardless of these fields:
-- `-s workspace-write` -- replaces the deprecated-in-0.128 `--full-auto`. `codex exec` is non-interactive by default in 0.128 (no `--ask-for-approval` flag exists on the exec subcommand). User-supplied `--sandbox` / `[harness.codex].sandbox` overrides this default.
-- `--skip-git-repo-check` -- terminus's tmux cwd may not always be a git repo.
-- `--ephemeral` -- added when no named/resumed session is in play, so one-shot prompts don't pollute codex's session log.
-- `Stdio::null()` for child stdin -- `codex exec` reads stdin even when prompt is supplied as an arg (still true in 0.128), blocking forever otherwise.
+### Sleep/wake (optional)
 
-**Blocked from chat** (interactive, destructive, or v1.1-deferred; run in your terminal instead): `login`, `logout`, `mcp`, `mcp-server`, `app`, `app-server`, `exec-server`, `plugin`, `completion`, `features`, `debug`, `sandbox` (subcommand form, distinct from `--sandbox` flag), `review`, `resume` (use `--resume <name>` flag), `fork`. **Now chat-safe (F6+F7):** `sessions`, `apply <task_id>`, and the `cloud {list,status,diff,apply,exec}` subgroup — see [docs/codex.md](docs/codex.md#chat-safe-subcommands).
-
-**Per-prompt flags:** `--name`, `--resume`, `--continue` (named or bare), `--model` / `-m`, `--sandbox`, `--profile` (no `-p` short alias — collides with claude's `--permission-mode`), `--add-dir` / `-d` (repeatable), `--schema` (three forms — registered name from `[schemas.<name>]`, file path, or inline JSON; all passed as `--output-schema`. Registered names additionally drive webhook delivery with HMAC-SHA256-signed POST + retry queue, full parity with claude). Image attachments (`image/png`, `image/jpeg`, `image/jpg`, `image/webp`) are forwarded via codex's `-i` flag.
-
-See [docs/codex.md](docs/codex.md) for the full CLI reference, verified event schema, error table, and functionality matrix.
-
-### Multiple platforms
-
-Include any combination of `[telegram]`, `[slack]`, `[discord]`, and `[socket]` sections. Any platform can be omitted -- terminus starts with whatever is configured.
-
-### Sleep/wake management (optional)
-
-By default, terminus holds an idle-sleep inhibitor whenever the lid is open (or the device has no lid) and the host is on AC. Drop a `[power]` section into `terminus.toml` to adjust:
+terminus prevents idle sleep while the lid is open and the host is on AC.
+Override in `[power]`:
 
 ```toml
 [power]
-# Enable the power-management subsystem (default: true).
-# Set to false for CI/headless environments with no caffeinate/systemd-inhibit.
-enabled = true
-
-# Hold the inhibitor on battery power too (default: false = AC-only).
-# Turn on only if you want real-time delivery while unplugged; it will drain
-# the battery faster since the host can't idle-sleep.
-stayawake_on_battery = false
-
-# Override the state-file location (default: <terminus.toml dir>/terminus-state.json).
-# This file stores the Telegram offset, chat bindings, last-seen-wall timestamp,
-# and the clean-shutdown flag. It MUST be writable by the terminus process.
+enabled              = true     # set false for CI/headless
+stayawake_on_battery = false    # true to inhibit on battery too
 # state_file = "/absolute/path/to/terminus-state.json"
 ```
 
-All fields are optional — an empty `[power]` section (or no section at all) uses the defaults above. Verify the inhibitor is live with:
-
-- macOS: `pmset -g assertions | grep PreventUserIdleSystem`
-- Linux: `systemd-inhibit --list | grep terminus`
-
 ### Command trigger (optional)
-
-The default command prefix is `: ` (colon + space). Change it in `[commands]`:
 
 ```toml
 [commands]
-trigger = "!"   # Now use `! ls -la` instead of `: ls -la`
+trigger = "!"   # default is `: ` — allowed: `: ! > ; . , @ ~ ^ - + = | % ?`
 ```
 
-Allowed characters: `` : ! > ; . , @ ~ ^ - + = | % ? ``.
+### Multiple platforms
+
+Include any combination of `[telegram]`, `[slack]`, `[discord]`, and
+`[socket]`. terminus starts with whatever is configured.
 
 ---
 
 ## Commands reference
 
-All commands use the `: ` (colon + space) prefix:
-
-### Session management
+All commands use the `: ` (colon + space) prefix. Plain text (no prefix) is
+sent as stdin to the foreground session — or to the active harness when one
+is on.
 
 | Command | What it does |
-|---------|-------------|
+|---------|--------------|
 | `: new <name>` | Create a named terminal session |
 | `: fg <name>` | Bring a session to the foreground |
 | `: bg` | Background the current session |
-| `: list` | Show all sessions with their status |
+| `: list` | Show all sessions and their status |
 | `: kill <name>` | Destroy a session |
-| `: screen` | Send a snapshot of the current terminal screen to chat |
+| `: screen` | Send a snapshot of the terminal screen to chat |
+| `: <command>` | Run in the foreground session (e.g. `: ls -la`) |
+| `: claude <prompt>` | One-shot Claude prompt with structured response |
+| `: claude on [opts]` | Enter interactive Claude mode |
+| `: claude off` | Exit Claude mode |
+| `: codex <prompt>` | One-shot Codex prompt |
+| `: gemini <prompt>` | One-shot Gemini prompt |
+| `: opencode <prompt>` | One-shot opencode prompt |
 
-Session names can contain letters, numbers, hyphens, and underscores (max 64 characters).
+Session names: alphanumeric, hyphens, underscores, max 64 characters.
 
-### Shell commands
+---
 
-| Command | What it does |
-|---------|-------------|
-| `: <command>` | Run in the foreground session (e.g., `: ls -la`) |
-| *(plain text)* | Sent as stdin to the foreground session |
+## Named sessions
 
-### Claude Code
-
-| Command | What it does |
-|---------|-------------|
-| `: claude <prompt>` | One-shot prompt with structured response |
-| `: claude on` | Enter interactive Claude mode |
-| `: claude on [options]` | Enter Claude mode with CLI options |
-| `: claude off` | Exit Claude mode, back to terminal |
-
-In Claude mode, plain text goes to Claude instead of the terminal. Multi-turn — each message continues the same conversation. Uses your **Claude subscription** (Pro/Max), not API credits.
-
-**Full flag + option reference:** [docs/claude.md](docs/claude.md)
-
-### Named sessions
-
-Harnesses that support resume (Claude, opencode, gemini, codex) accept `--name <name>` (create-or-resume) and `--resume <name>` / `--continue <name>` (strict resume). Names persist across restarts in `terminus-state.json` under per-harness prefixes (`claude:<name>`, `opencode:<name>`, etc.) and are LRU-evicted at `max_named_sessions` (default 50, shared across harnesses).
+All four harnesses support named, resumable sessions:
 
 ```
 : claude --name auth fix the JWT validation
@@ -566,36 +381,34 @@ Harnesses that support resume (Claude, opencode, gemini, codex) accept `--name <
 : codex --resume auth keep going
 ```
 
-`--name` and `--resume` are mutually exclusive. Session names: alphanumeric, hyphens, underscores, max 64 chars. Per-harness details: [docs/claude.md](docs/claude.md), [docs/opencode.md](docs/opencode.md#per-prompt-flags), [docs/gemini.md](docs/gemini.md#per-prompt-flags), [docs/codex.md](docs/codex.md#per-prompt-flags).
+- `--name <x>` — **create-or-resume** (upsert)
+- `--resume <x>` / `--continue <x>` — **strict resume** (errors if missing)
+- `--name` and `--resume` are mutually exclusive
 
-**Breaking change:** `-n` was previously the short flag for `--max-turns`. It now means `--name`. Use `-t` for `--max-turns`.
+Names persist across restarts in `terminus-state.json` under per-harness
+prefixes (`claude:auth`, `codex:auth`, etc.) and are LRU-evicted at
+`max_named_sessions` (default 50, shared across harnesses).
+
+> **Breaking change:** `-n` was previously the short flag for `--max-turns`.
+> It now means `--name`. Use `-t` for `--max-turns`.
 
 ---
 
-## Structured Output (--schema)
+## Structured output
 
-terminus can instruct an AI harness to emit a validated JSON response that matches a JSON Schema you define, then optionally POST it to a webhook endpoint with HMAC-SHA256 authentication.
+The claude and codex harnesses can emit a JSON response validated against a
+schema you define, then POST it to a webhook with HMAC-SHA256 authentication.
 
-**Harness support:**
+| Harness  | Validation | Fenced JSON in chat | Webhook delivery |
+|----------|:----------:|:-------------------:|:----------------:|
+| claude   |     ✓      |          ✓          |        ✓         |
+| codex    |     ✓      |          ✓          | registered names only |
+| gemini   |     ✗      |          —          |        —         |
+| opencode |     ✗      |          —          |        —         |
 
-| Harness  | Schema validation | In-chat fenced JSON | Webhook delivery + retry queue |
-|----------|:----:|:----:|:----:|
-| claude   |  ✓   |  ✓   | ✓ (full pipeline below) |
-| codex    |  ✓   |  ✓   | ✓ (registered names only; inline-JSON / file-path forms remain chat-only) |
-| opencode |  ✗   |  ✗   | n/a |
-| gemini   |  ✗   |  ✗   | n/a |
-
-The codex harness reaches webhook parity with claude when `--schema=<name>` resolves against a `[schemas.<name>]` entry in `terminus.toml`. Inline-JSON and file-path forms (`--schema='{...}'` / `--schema=path/to/schema.json`) remain chat-only — they validate against the schema but never feed the delivery queue, because the security model (HMAC secret env var) is registry-driven.
-
-### Why
-
-- **Type-safe pipeline**: Claude produces JSON that your code can parse directly without post-processing.
-- **Webhook delivery**: results flow into your automation stack (Zapier, n8n, custom microservices, databases) without polling.
-- **Write-ahead durability**: the job is written to disk before the first network attempt. Transient failures are retried automatically with exponential backoff.
-
-### Setup
-
-1. Define a named schema in `terminus.toml`:
+Codex `--schema` accepts three forms — registered name (`[schemas.<name>]`),
+file path, or inline JSON — but only registered names feed the webhook
+delivery pipeline.
 
 ```toml
 [schemas.todos]
@@ -619,110 +432,39 @@ schema = '''
 }
 '''
 
-# Optional: deliver to a webhook.
-webhook = "https://your-server.example.com/webhooks/todos"
+# Optional webhook delivery
+webhook            = "https://your-server.example.com/webhooks/todos"
 webhook_secret_env = "TODOS_WEBHOOK_SECRET"
 ```
-
-2. Set the HMAC secret (if using a webhook):
 
 ```sh
 export TODOS_WEBHOOK_SECRET="$(openssl rand -hex 32)"
 ```
 
-3. Use it:
-
 ```
-: harness --schema todos list my open tasks
+: claude --schema todos list my open tasks
 ```
 
-Claude's response is rendered as a JSON code block in chat and, if a webhook is configured, POSTed to your endpoint immediately. On transient failure the job is queued for automatic retry.
+Webhook requests carry `X-Terminus-Schema`, `X-Terminus-Run-Id` (ULID),
+`X-Terminus-Timestamp`, and `X-Terminus-Signature: v1=<hmac-sha256-hex>`. The
+signature covers `"<timestamp>.<raw_body>"` (Stripe-style). Transient
+failures are retried with exponential backoff up to 60s; jobs survive
+restarts in `<queue_dir>/pending/`. Cap retry duration via
+`structured_output.max_retry_age_hours`.
 
-### Webhook request
-
-```
-POST https://your-server.example.com/webhooks/todos
-Content-Type: application/json
-X-Terminus-Schema: todos
-X-Terminus-Run-Id: 01J8...   (ULID, unique per run)
-X-Terminus-Timestamp: 1713193920
-X-Terminus-Signature: v1=<hmac-sha256-hex>
-
-{"todos":[{"title":"Write tests","done":false}]}
-```
-
-The signature covers `"<timestamp>.<raw_body>"` (Stripe-style), which binds the timestamp into the MAC so neither field can be altered without invalidating the signature.
-
-### Verifying in Python
-
-```python
-import hmac, hashlib, time
-
-def verify(secret: str, body: bytes, timestamp: str, signature: str) -> bool:
-    # Reject replays older than 5 minutes.
-    if abs(time.time() - int(timestamp)) > 300:
-        return False
-    payload = f"{timestamp}.".encode() + body
-    expected = "v1=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
-```
-
-### Verifying in Node.js
-
-```js
-const crypto = require("crypto");
-
-function verify(secret, body, timestamp, signature) {
-  // Reject replays older than 5 minutes.
-  if (Math.abs(Date.now() / 1000 - parseInt(timestamp)) > 300) return false;
-  const payload = `${timestamp}.${body}`;
-  const expected = "v1=" + crypto.createHmac("sha256", secret).update(payload).digest("hex");
-  const expectedBuf = Buffer.from(expected);
-  const signatureBuf = Buffer.from(signature);
-  // timingSafeEqual requires equal-length buffers; length mismatch => invalid.
-  if (expectedBuf.length !== signatureBuf.length) return false;
-  return crypto.timingSafeEqual(expectedBuf, signatureBuf);
-}
-```
-
-### Retry behaviour
-
-| Attempt | Delay (±20% jitter) |
-|---------|---------------------|
-| 1       | 1s                  |
-| 2       | 2s                  |
-| 3       | 4s                  |
-| 4       | 8s                  |
-| 5       | 16s                 |
-| 6       | 32s                 |
-| 7+      | 60s (cap)           |
-
-Jobs survive restarts -- they are stored in `<queue_dir>/pending/` and picked up by the retry worker on startup. Set `structured_output.max_retry_age_hours` in `terminus.toml` to cap how long terminus will retry before abandoning a job (0 = forever, the default).
+Verification snippets (Python, Node.js) and the full retry table:
+[docs/claude.md#structured-output](docs/claude.md).
 
 ---
 
 ## Socket API
 
-The socket API lets programs, scripts, and agents drive terminus over WebSocket. It supports every command available in chat, with typed JSON envelopes, request pipelining, and live event subscriptions.
+Programs, scripts, and agents drive terminus over WebSocket with typed JSON
+envelopes, request pipelining, and live event subscriptions.
 
-**Transport:** Plain `ws://` (deploy behind nginx/caddy/Traefik for `wss://` TLS termination).
-**Auth:** Bearer token in the `Authorization` header at the HTTP upgrade.
-**Protocol:** `terminus/v1` -- one JSON envelope per WebSocket text message.
-
-### Quick start
-
-1. Add to `terminus.toml`:
-
-```toml
-[socket]
-enabled = true
-
-[[socket.client]]
-name = "my-agent"
-token = "tk_live_your-32-character-minimum-secret"
-```
-
-2. Connect and send a command:
+- **Transport:** plain `ws://` (deploy behind nginx / Caddy for TLS)
+- **Auth:** Bearer token at the HTTP upgrade
+- **Protocol:** `terminus/v1` — one JSON envelope per WebSocket message
 
 ```bash
 websocat ws://127.0.0.1:7645 -H "Authorization: Bearer tk_live_your-32-character-minimum-secret"
@@ -732,147 +474,37 @@ websocat ws://127.0.0.1:7645 -H "Authorization: Bearer tk_live_your-32-character
 {"type":"request","request_id":"r1","command":": new build"}
 ```
 
-The server responds with a sequence of typed frames:
+The server responds with a sequence: `ack` → optional streaming frames →
+`result` or `error` → `end`. Multiple requests can be pipelined (FIFO per
+connection).
 
-```json
-{"type":"ack","request_id":"r1","accepted_at":"2026-04-15T12:00:01Z"}
-{"type":"result","request_id":"r1","value":{"text":"Session 'build' created"},"cancelled":false}
-{"type":"end","request_id":"r1"}
-```
+**Subscriptions** filter on `event_types`, `schemas`, and `sessions` (OR
+within a facet, AND across facets). Available event types:
+`structured_output`, `webhook_status`, `queue_drained`, `session_output`,
+`session_created`, `session_killed`, `session_started`, `session_exited`,
+`session_limit_reached`, `chat_forward`, `harness_started`, `harness_finished`,
+`gap_banner`.
 
-### Per-request lifecycle
+**Defaults:** 60-request burst / 20 req/s sustained, 32 pending requests, 16
+concurrent connections, 1 MiB max message, 300s idle timeout. Rate-limited
+requests get an `error` with `code: "rate_limited"` and `retry_after_ms`.
 
-Every request follows this frame sequence:
-
-```
-request → ack → [text_chunk | tool_call | partial_result]* → result | error → end
-```
-
-- **`ack`** -- server accepted the request
-- **`result`** -- terminal success with the command's output
-- **`error`** -- terminal failure with an error code
-- **`end`** -- sentinel marking the response is complete
-
-Multiple requests can be pipelined without waiting for results (FIFO per connection).
-
-### Subscriptions
-
-Subscribe to ambient events (session lifecycle, structured output, chat messages) with facet filters:
-
-```json
-{"type":"subscribe","subscription_id":"s1","filter":{
-  "event_types":["session_output","structured_output"],
-  "sessions":["build"]
-}}
-```
-
-Events arrive as they happen:
-
-```json
-{"type":"event","subscription_id":"s1","event":{
-  "type":"session_output","session":"build","chunk":"cargo test\n   Compiling..."
-}}
-```
-
-Filter facets: `event_types`, `schemas`, `sessions`. OR within a facet, AND across facets. Empty filter = receive everything. Up to 8 named subscriptions per connection.
-
-<details>
-<summary>Available event types</summary>
-
-| Event type | What it delivers |
-|---|---|
-| `structured_output` | Claude `--schema` results (schema, value, run_id) |
-| `webhook_status` | Webhook delivery attempts (Delivered/Abandoned/Error) |
-| `queue_drained` | Webhook queue drain cycle complete |
-| `session_output` | Terminal output from tmux sessions |
-| `session_created` | New session created (`: new`) |
-| `session_killed` | Session destroyed (`: kill`) |
-| `session_limit_reached` | Max session cap hit |
-| `session_started` | Session foregrounded (`: fg`) |
-| `session_exited` | Session process exited |
-| `chat_forward` | Message received from a chat platform |
-| `harness_started` | Claude turn started |
-| `harness_finished` | Claude turn completed |
-| `gap_banner` | Sleep/wake gap detected |
-
-</details>
-
-### Rate limiting and backpressure
-
-Each client has a per-client token bucket (survives reconnects):
-
-| Control | Default |
-|---|---|
-| Burst capacity | 60 requests |
-| Sustained rate | 20 requests/sec |
-| Max pending requests | 32 per connection |
-| Max connections | 16 total |
-| Idle timeout | 300s |
-| Max message size | 1 MiB |
-
-Rate-limited requests receive an `error` with `code: "rate_limited"` and a machine-readable `retry_after_ms` field.
-
-### Proxy setup for TLS
-
-terminus listens on plain `ws://`. For production, terminate TLS at a reverse proxy:
-
-**Caddy** (automatic TLS):
-```caddyfile
-terminus.example.com {
-    reverse_proxy 127.0.0.1:7645
-}
-```
-
-**nginx:**
-```nginx
-location / {
-    proxy_pass http://127.0.0.1:7645;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_read_timeout 3600s;
-}
-```
-
-### Full reference
-
-See [docs/socket.md](docs/socket.md) for the complete wire protocol specification, all envelope types, error codes, and configuration details.
-
----
-
-## How it works
-
-### Terminal output
-
-terminus uses `tmux capture-pane` to read the rendered terminal screen -- no raw byte streaming, no ANSI escape stripping. Output is diffed against the previous snapshot so only new content is delivered.
-
-- Output arrives as new messages in Telegram (no edit-in-place accumulation)
-- Long output is automatically split at ~4000 chars (within Telegram's 4096 limit)
-- Slack output goes into per-session threads for clean separation
-
-### Claude Code integration
-
-The `: claude` command uses the `claude-agent-sdk-rust` crate, which calls the Claude CLI with `--output-format stream-json`. This gives structured typed output (no terminal scraping), real-time tool-activity streaming, multi-turn sessions, image input, and automatic delivery of files Claude creates back to chat (with an extension allowlist and a 50 MB cap).
-
-See [docs/claude.md](docs/claude.md) for the full reference (flags, modes, named sessions, output file delivery, troubleshooting).
-
-### Session persistence
-
-When terminus shuts down (Ctrl+C), tmux sessions keep running. On restart, terminus automatically reconnects to surviving `term-*` sessions. Send any command (e.g., `: list`) to re-bind the chat delivery.
+Full wire protocol, all envelope types, error codes, and proxy examples:
+[docs/socket.md](docs/socket.md).
 
 ---
 
 ## Security
 
-### Authentication
+**Authentication.** Single-user only on chat platforms — messages from any
+user ID other than the configured one are silently ignored (the bot does not
+reveal its existence). Socket clients authenticate with per-client Bearer
+tokens (≥32 characters) validated with constant-time comparison; missing or
+invalid tokens get HTTP 401 before a WebSocket is established.
 
-**Chat platforms:** Single-user only. Messages from any user ID other than the configured one are **silently ignored** -- the bot does not reveal its existence to unauthorized users.
-
-**Socket API:** Per-client Bearer tokens (`Authorization: Bearer <token>`) validated at the HTTP upgrade with constant-time comparison. Missing or invalid tokens receive HTTP 401 before a WebSocket is established. Tokens must be at least 32 characters; the `Debug` impl redacts them from logs. Token comparison is timing-safe to prevent side-channel enumeration.
-
-### Command blocklist
-
-Dangerous commands are blocked by regex patterns in `terminus.toml`. Both `: ` prefixed commands AND plain text input (including text routed to Claude) are checked. The defaults block:
+**Command blocklist.** Both `: ` prefixed commands and plain-text input
+(including text routed to a harness) are checked against regex patterns. The
+defaults block:
 
 | Pattern | Blocks |
 |---------|--------|
@@ -882,154 +514,57 @@ Dangerous commands are blocked by regex patterns in `terminus.toml`. Both `: ` p
 | `mkfs\.` | Filesystem format |
 | `dd\s+if=` | Raw disk write |
 
-### Evasion prevention
+Commands are normalized before matching to defeat common evasion: path
+prefixes are stripped (`/usr/bin/sudo` → `sudo`), backslashes removed
+(`su\do` → `sudo`), flag order ignored (`rm -fr /` ≡ `rm -rf /`), whitespace
+collapsed. Multi-line messages are rejected outright.
 
-Commands are normalized before matching to prevent common evasion techniques:
-
-- **Path prefix stripping** -- `/usr/bin/sudo reboot` is caught as `sudo reboot`
-- **Backslash removal** -- `su\do reboot` is caught as `sudo reboot`
-- **Flag reordering** -- `rm -fr /`, `rm -rf /`, and `rm -r -f /` all normalize to the same form
-- **Space collapsing** -- extra whitespace between tokens is collapsed
-
-Multi-line messages are rejected to prevent newline injection bypasses.
-
-Add your own patterns:
+Add patterns:
 
 ```toml
 [blocklist]
-patterns = [
-  "rm\\s+-[a-z]*f[a-z]*r[a-z]*\\s+/",
-  "sudo\\s+",
-  "shutdown",
-  "reboot",
-]
+patterns = ["shutdown", "reboot"]
 ```
 
-### Output file safety
+**Output file safety.** Files delivered from Claude must have allowlisted
+extensions, be under the working directory or `/tmp` (path traversal
+blocked), and be ≤50 MB. Sensitive filenames are never delivered.
 
-Files delivered from Claude are restricted:
-
-- Only allowlisted extensions (images, documents, data files)
-- Files must be under the working directory or `/tmp` (path traversal blocked)
-- Sensitive filenames are never delivered
-- Max 50 MB per file
-
-### Smart quote normalization
-
-Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. terminus automatically normalizes these so shell commands work correctly.
+**Smart quote normalization.** Mobile keyboards' curly quotes are normalized
+to ASCII automatically so shell commands work.
 
 ---
 
-## Configuration reference
+## Sleep/wake recovery
 
-Override the config file path with `TERMINUS_CONFIG=/path/to/file.toml`.
+terminus holds a platform-appropriate idle-sleep assertion (`caffeinate -i`
+on macOS, `systemd-inhibit --what=idle:sleep` on Linux). Closed-lid sleep is
+never blocked.
 
-### Telegram
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `auth.telegram_user_id` | integer | Your Telegram numeric user ID |
-| `telegram.bot_token` | string | Telegram Bot API token |
-
-### Slack
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `auth.slack_user_id` | string | Your Slack member ID |
-| `slack.bot_token` | string | Slack bot token (`xoxb-`) |
-| `slack.app_token` | string | Slack app token for Socket Mode (`xapp-`) |
-| `slack.channel_id` | string | Slack channel to operate in |
-
-### Discord
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `auth.discord_user_id` | integer | Your Discord user snowflake |
-| `discord.bot_token` | string | Discord bot token |
-| `discord.guild_id` | integer | Discord server snowflake (optional; omit for DM-only) |
-| `discord.channel_id` | integer | Discord channel snowflake (optional; requires `guild_id`) |
-
-### Socket API
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `socket.enabled` | bool | Enable WebSocket API (default: false) |
-| `socket.bind` | string | Bind address (default: `127.0.0.1`; use `0.0.0.0` for containers) |
-| `socket.port` | integer | Listener port (default: 7645) |
-| `socket.max_connections` | integer | Max concurrent WebSocket connections (default: 16) |
-| `socket.max_subscriptions_per_connection` | integer | Named subscriptions per connection (default: 8) |
-| `socket.max_pending_requests` | integer | Pipelined request queue depth (default: 32) |
-| `socket.rate_limit_per_second` | float | Token bucket refill rate (default: 20.0) |
-| `socket.rate_limit_burst` | float | Token bucket capacity (default: 60.0) |
-| `socket.max_message_bytes` | integer | Max inbound message size (default: 1048576) |
-| `socket.ping_interval_secs` | integer | Server ping interval (default: 30) |
-| `socket.pong_timeout_secs` | integer | Close if pong not received (default: 10) |
-| `socket.idle_timeout_secs` | integer | Close if no inbound activity (default: 300) |
-| `socket.shutdown_drain_secs` | integer | Grace period on shutdown (default: 30) |
-| `socket.client[].name` | string | Client display name (unique) |
-| `socket.client[].token` | string | Bearer token (min 32 characters) |
-
-### Shared (all platforms)
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `blocklist.patterns` | string[] | Regex patterns to block |
-| `streaming.edit_throttle_ms` | integer | Min ms between message edits (default: 2000) |
-| `streaming.poll_interval_ms` | integer | Terminal output poll interval (default: 250) |
-| `streaming.chunk_size` | integer | Max chars per message (default: 4000) |
-| `streaming.offline_buffer_max_bytes` | integer | Max offline buffer (default: 1048576) |
-| `streaming.max_sessions` | integer | Max concurrent terminal sessions (default: 10) |
-| `commands.trigger` | char | Command prefix character (default: `:`). Must be one of `: ! > ; . , @ ~ ^ - + = \| % ?` |
-| `power.enabled` | bool | Enable the power-management subsystem (default: true). Set false for CI / headless |
-| `power.stayawake_on_battery` | bool | Prevent idle sleep on battery power too (default: false; AC-only) |
-| `power.state_file` | string | Override for the persisted-state JSON file (default: adjacent to `terminus.toml`) |
-
-### Sleep/wake behavior
-
-terminus holds a platform-appropriate idle-sleep assertion while the lid is
-open (or the device has no lid) and the host is on AC. On macOS this is a
-supervised `caffeinate -i` child; on Linux it's `systemd-inhibit --what=idle:sleep`.
-Closed-lid sleep is **never** blocked — macOS clamshell and Linux
-lid-close suspend continue to work normally.
-
-When the host does sleep (lid close, forced suspend, overnight), terminus
-detects the gap on wake via monotonic/wall-clock divergence (>30s) and emits
-a one-time banner per active chat:
+When the host sleeps anyway (lid close, forced suspend, overnight), terminus
+detects the wake via monotonic/wall-clock divergence (>30s) and emits a
+one-time banner per chat:
 
 ```
 ⏸ paused at 02:13, resumed at 07:45 (gap: 5h 32m)
 ```
 
-Adapter polling/handling is paused until each banner is confirmed delivered
-(per-chat oneshot ack, 5s timeout); then the backlog drains. Telegram queues
-updates server-side and drains them in `update_id` order on resume. Slack
-pauses its Socket Mode WebSocket loop and, after the banner is acked, fetches
-every message sent during sleep via `conversations.history` since a per-channel
-`last_seen_ts` watermark; the watermark is force-persisted to
-`terminus-state.json` so even a multi-hour sleep does not lose messages, and a
-ring-buffered dedup window prevents double-delivery against any in-flight
-Socket Mode reconnect. Discord uses a handler-gate (gateway events during the
-pause window are discarded for simplicity) combined with REST catchup on
-resume: after the gap-banner is acked, terminus paginates
-`GET /channels/{id}/messages?after={snowflake}` (cap 100/page, 1000/channel)
-to backfill missed messages. Per-channel snowflake watermarks are
-force-persisted to `terminus-state.json`. A 200-entry dedup ring prevents
-double-delivery between in-flight gateway events and REST replay. Multi-hour
-sleep cycles do not lose messages. If a banner fails to deliver within the timeout
-(e.g., rate-limit or network blip), terminus falls back to prepending
-`[gap: Xm Ys] ` inline to the first outbound message for that chat so the gap
-is never silently hidden.
+Adapter polling is paused until each banner is acked, then the backlog
+drains: Telegram via server-side queueing, Slack via `conversations.history`
+catchup, Discord via REST pagination. Per-channel watermarks are
+force-persisted to `terminus-state.json` so multi-hour sleep cycles do not
+lose messages. Restart-during-sleep is gated by a compound check
+(`wall_gap > 30s` AND previous shutdown was unclean) so build-and-restart
+cycles don't fire spurious banners.
 
-The Telegram offset and chat bindings persist atomically to
-`terminus-state.json` (adjacent to `terminus.toml` by default). A restart
-during sleep still delivers a banner and drains the backlog, guarded by a
-compound gate: wall-gap > 30s **AND** the previous shutdown was unclean
-(so `cargo build`-and-restart cycles don't fire spurious banners).
+Verify the inhibitor:
 
-Verify the assertion with:
+```sh
+pmset -g assertions | grep PreventUserIdleSystem    # macOS
+systemd-inhibit --list | grep terminus              # Linux
+```
 
-- macOS: `pmset -g assertions | grep PreventUserIdleSystem`
-- Linux: `systemd-inhibit --list | grep terminus`
+Full mechanism: [docs/slack-parity.md](docs/slack-parity.md), [docs/discord-parity.md](docs/discord-parity.md).
 
 ---
 
@@ -1038,98 +573,74 @@ Verify the assertion with:
 <details>
 <summary>"No active session"</summary>
 
-Create a session first: `: new <name>`. If you just restarted, sessions auto-reconnect -- send `: list` to check.
+Create one: `: new <name>`. After a restart, sessions auto-reconnect — send
+`: list` to check.
 </details>
 
 <details>
 <summary>No output after restart</summary>
 
-Reconnected sessions need a chat binding. Send `: list` or `: fg <name>` first -- this tells terminus which chat to deliver to.
+Reconnected sessions need a chat binding. Send `: list` or `: fg <name>`
+first — this tells terminus which chat to deliver to.
 </details>
 
 <details>
 <summary>No output appearing at all</summary>
 
-Check that tmux is installed (`tmux -V`). Try `: new test` then `: echo hello`.
+Check tmux is installed (`tmux -V`). Try `: new test` then `: echo hello`.
 </details>
 
 <details>
 <summary>Telegram rate limit errors</summary>
 
-Increase `streaming.edit_throttle_ms` in the config. Telegram allows ~30 edits/min.
+Increase `streaming.edit_throttle_ms`. Telegram allows ~30 edits/min.
 </details>
 
 <details>
 <summary>Slack not connecting</summary>
 
-Verify Socket Mode is enabled and that the `xapp-` token is correct. Check that you subscribed to `message.channels` events.
+Verify Socket Mode is enabled and the `xapp-` token is correct. Check that
+you subscribed to `message.channels`.
 </details>
 
 <details>
-<summary>Claude commands not working</summary>
+<summary>Claude / opencode / gemini / codex commands not working</summary>
 
-The Claude CLI must be installed and authenticated: `npm i -g @anthropic-ai/claude-code && claude login`. Verify with `claude -p "hello"` in your terminal. Full troubleshooting (smart quotes, images, session persistence): [docs/claude.md](docs/claude.md#troubleshooting).
-</details>
+Each harness needs its CLI on PATH and authenticated:
+- **Claude:** `npm i -g @anthropic-ai/claude-code && claude login` — verify `claude -p "hello"`
+- **opencode:** install from [opencode.ai](https://opencode.ai), `opencode auth login` — verify `opencode models`
+- **gemini:** install from [google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli), authenticate via OAuth — verify `gemini --help`
+- **codex:** `brew install --cask codex` or `npm i -g @openai/codex`, `codex login` — verify `codex --version`
 
-<details>
-<summary>OpenCode commands not working</summary>
-
-Opencode must be installed and authenticated: install from [opencode.ai](https://opencode.ai) and run `opencode auth login`. Verify with `opencode models` in your terminal. If terminus can't find it, set `binary_path` in `[harness.opencode]`. Blocked subcommands (auth login/logout, serve, web, etc.) must be run in your terminal, not via chat.
-</details>
-
-<details>
-<summary>Gemini commands not working</summary>
-
-Gemini CLI must be installed from [github.com/google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli) and already authenticated (via its own OAuth / config flow -- terminus does not proxy credentials). Verify with `gemini --help` in your terminal. If terminus can't find it, set `binary_path` in `[harness.gemini]`. Interactive gemini subcommands (`update`, `mcp`, `extensions`, `skills`) are blocked from chat -- run them in your terminal. Use `--approval-mode yolo` (per-prompt or in config) if you want gemini to execute tools without prompting.
-</details>
-
-<details>
-<summary>Codex commands not working</summary>
-
-Codex CLI must be installed (`brew install --cask codex` or `npm install -g @openai/codex`) and authenticated via `codex login` (ChatGPT account or API key). Verify with `codex --version` and `codex login status` in your terminal. If terminus can't find it, set `binary_path` in `[harness.codex]`. Verified against codex-cli **0.128.0** -- newer versions may emit different event schemas (terminus logs a "version drift" warning on unrecognized event types).
-</details>
-
-<details>
-<summary>Codex: "model not supported"</summary>
-
-Codex 0.128's default model is `gpt-5.5` and it is universally available, including on ChatGPT-account auth. If you set a `model = "..."` override that codex doesn't recognize, the call will surface codex's own error. Valid choices include `gpt-5.5` (default), `gpt-5.4`, `gpt-5.4-mini`. (`gpt-5.3-codex` was removed in 0.128 — if you have it pinned in `[harness.codex] model`, switch to `gpt-5.5` or remove the field to inherit the codex default.)
-</details>
-
-<details>
-<summary>Codex: blocked subcommand error</summary>
-
-All native codex subcommands are blocked from chat in v1 (`login`, `logout`, `mcp`, `cloud`, `apply`, `plugin`, `debug`, `app`, `sessions`, `resume` (bare), `fork`, etc.). Each returns a targeted chat-safe error pointing you at the right path. For named-session resume use the `--resume <name>` flag (e.g. `: codex --resume auth keep going`), not the `: codex resume` subcommand. Run management subcommands in your terminal directly.
+If terminus can't find a binary, set `binary_path` in the relevant
+`[harness.<name>]` table. Per-harness troubleshooting: [docs/claude.md](docs/claude.md#troubleshooting), [docs/codex.md](docs/codex.md), [docs/gemini.md](docs/gemini.md), [docs/opencode.md](docs/opencode.md).
 </details>
 
 <details>
 <summary>"Maximum session limit reached"</summary>
 
-The default limit is 10 concurrent sessions. Kill unused sessions with `: kill <name>` or increase `streaming.max_sessions` in the config.
+Default is 10 concurrent sessions. Kill unused with `: kill <name>` or raise
+`streaming.max_sessions`.
 </details>
 
 <details>
-<summary>Socket: connection refused</summary>
+<summary>Socket: connection refused / 401 / lagged</summary>
 
-Check `[socket] enabled = true` in `terminus.toml`, verify at least one `[[socket.client]]` is configured, and confirm the bind address and port (`ss -tlnp | grep 7645`).
-</details>
-
-<details>
-<summary>Socket: 401 Unauthorized</summary>
-
-Verify the `Authorization: Bearer <token>` header is present and the token matches a `[[socket.client]]` entry exactly (minimum 32 characters).
-</details>
-
-<details>
-<summary>Socket: "lagged" warnings</summary>
-
-The broadcast buffer overflowed because the client is consuming events too slowly. Events were dropped. Increase `socket.send_buffer_size` or process events faster. This is non-fatal; the connection continues.
+- **Refused:** check `[socket] enabled = true`, at least one
+  `[[socket.client]]`, and the bind/port (`ss -tlnp | grep 7645`).
+- **401:** verify `Authorization: Bearer <token>` header and that the token
+  matches a `[[socket.client]]` entry exactly (≥32 chars).
+- **Lagged warnings:** the broadcast buffer overflowed because the client is
+  consuming events too slowly. Events were dropped. Increase
+  `socket.send_buffer_size` or process events faster. Non-fatal.
 </details>
 
 ---
 
 ## tmux compatibility
 
-terminus works with any `base-index` or `pane-base-index` setting. Sessions are targeted by name (`term-build`), never by numeric index.
+terminus works with any `base-index` or `pane-base-index` setting. Sessions
+are targeted by name (`term-build`), never by numeric index.
 
 ---
 
