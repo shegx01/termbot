@@ -31,9 +31,9 @@ terminus gives you remote access to terminal sessions and AI harnesses from your
 
 | Platform  | Text | Inbound attachments | Notes |
 |-----------|:----:|:-------------------:|-------|
-| Telegram  |  ✓   |          ✓          | Long-polling; most complete integration |
+| Telegram  |  ✓   |          ✓          | Long-polling |
 | Slack     |  ✓   |          ✓          | Socket Mode; lossless wake-recovery via `conversations.history` catchup |
-| Discord   |  ✓   |          ✗          | Gateway; inbound attachments deferred |
+| Discord   |  ✓   |          ✓          | Gateway; hybrid Threads (guilds) / MessageReference (DMs); REST catchup on wake |
 | WebSocket |  ✓   |          ✓          | Binary-frame upload; opt-in |
 
 **AI harnesses** (the `: <name>` prefixed commands):
@@ -1134,8 +1134,13 @@ every message sent during sleep via `conversations.history` since a per-channel
 `terminus-state.json` so even a multi-hour sleep does not lose messages, and a
 ring-buffered dedup window prevents double-delivery against any in-flight
 Socket Mode reconnect. Discord uses a handler-gate (gateway events during the
-pause window are discarded -- the pause is typically <5s and the `: ` command
-protocol is self-recoverable). If a banner fails to deliver within the timeout
+pause window are discarded for simplicity) combined with REST catchup on
+resume: after the gap-banner is acked, terminus paginates
+`GET /channels/{id}/messages?after={snowflake}` (cap 100/page, 1000/channel)
+to backfill missed messages. Per-channel snowflake watermarks are
+force-persisted to `terminus-state.json`. A 200-entry dedup ring prevents
+double-delivery between in-flight gateway events and REST replay. Multi-hour
+sleep cycles do not lose messages. If a banner fails to deliver within the timeout
 (e.g., rate-limit or network blip), terminus falls back to prepending
 `[gap: Xm Ys] ` inline to the first outbound message for that chat so the gap
 is never silently hidden.
@@ -1190,7 +1195,7 @@ src/
     mod.rs             ChatPlatform trait + Attachment type
     telegram.rs        Telegram adapter (teloxide, long-polling)
     slack.rs           Slack adapter (Socket Mode, tokio-tungstenite)
-    discord.rs         Discord adapter (serenity, gateway + handler-gate pause)
+    discord.rs         Discord adapter (serenity, gateway + handler-gate pause/resume; REST catchup on wake)
   socket/
     mod.rs             WebSocket server (TcpListener, Bearer auth, per-connection spawn)
     connection.rs      Per-connection task (select! loop, pipelining, subscriptions)

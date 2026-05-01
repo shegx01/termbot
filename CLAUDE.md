@@ -124,11 +124,15 @@ Cross-platform (macOS + Linux) per the consensus plan:
   `<terminus.toml parent>/terminus-state.json` (or the `power.state_file`
   override). The restart-banner gate requires `last_clean_shutdown == false`
   AND `wall_gap > 30s` so graceful restarts don't trigger spurious banners.
-- **Discord pause** uses a handler-gate rather than a poll-gate. Gateway events
-  arriving during the pause window are discarded, unlike Telegram's server-side
-  update list which queues messages for drain on resume. The pause window is
-  bounded by gap-banner dispatch timing (typically <5s) and the `: ` command
-  protocol is self-recoverable, so this is an accepted v1 tradeoff.
+- **Discord pause** uses a handler-gate combined with REST catchup. Gateway events
+  arriving during the pause window are discarded (handler-gate retained for in-pause
+  discard simplicity), but on resume `App::handle_gap` spawns `DiscordAdapter::run_catchup`
+  which paginates `GET /channels/{id}/messages?after={snowflake}` (paginated, hard cap
+  1000 msgs/channel) to backfill missed messages. Per-channel `last_seen_message_id`
+  snowflakes are persisted to `terminus-state.json` via `StateUpdate::DiscordWatermark`
+  (force-persist, bypasses debounce). A 200-entry dedup ring prevents double-delivery
+  between in-flight gateway events and REST replay. Multi-hour sleep cycles do not lose
+  messages.
 - Verify the assertion is held with `pmset -g assertions` (macOS) or
   `systemd-inhibit --list` (Linux).
 
@@ -338,7 +342,7 @@ Full flag semantics, event schema, error table, and functionality matrix:
 
 ### Platform adapters
 
-All three implement `ChatPlatform` (async_trait). Auth is single-user: messages from non-authorized user IDs are silently dropped. Telegram uses manual `getUpdates` long-polling (not webhooks). Slack uses Socket Mode WebSocket with auto-reconnect. Discord uses the serenity crate with gateway intents `DIRECT_MESSAGES | GUILD_MESSAGES | MESSAGE_CONTENT` (privileged). Inbound Discord attachments (images/files sent by the user to the bot) are not currently processed -- only `msg.content` text is forwarded to the main loop. Telegram-parity for inbound attachments is a follow-up.
+All three implement `ChatPlatform` (async_trait). Auth is single-user: messages from non-authorized user IDs are silently dropped. Telegram uses manual `getUpdates` long-polling (not webhooks). Slack uses Socket Mode WebSocket with auto-reconnect. Discord uses the serenity crate with gateway intents `DIRECT_MESSAGES | GUILD_MESSAGES | MESSAGE_CONTENT` (privileged). Inbound Discord attachments (images and non-image files) are processed: extracted from `msg.attachments` via a reqwest-based downloader with SSRF allowlist (`cdn.discordapp.com`, `media.discordapp.net`), 25 MB Discord-native cap. Forwarded to the harness via `IncomingMessage.attachments`. Hybrid thread-aware delivery: Discord Threads (CHANNEL_THREAD) when `guild_id+channel_id` are configured and the incoming message is in a guild context; `MessageReference` reply-chain in DM mode. Thread-send failures (HTTP 400/403/404) evict the `thread_map` entry and retry via `MessageReference`. See `docs/discord-parity.md` for the wake-recovery sequence and the full capability matrix.
 
 **Slack pause/resume and wake-recovery:**
 Slack's `pause()` and `resume()` trait methods are overridden with a

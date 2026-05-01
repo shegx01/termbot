@@ -139,11 +139,20 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Typed Arc for direct catchup calls from App::handle_gap.
+    let discord_platform_typed: Option<Arc<DiscordAdapter>>;
     let discord: Option<Arc<dyn ChatPlatform>> = if config.discord_enabled() {
         let dc_config = config.discord.clone().unwrap();
         let dc_user_id = serenity::all::UserId::new(config.auth.discord_user_id.unwrap());
         let throttle = config.streaming.edit_throttle_ms;
-        let adapter = Arc::new(DiscordAdapter::new(dc_config, dc_user_id, throttle)?);
+        let initial_watermarks = app.initial_discord_watermarks();
+        let adapter = Arc::new(DiscordAdapter::new(
+            dc_config,
+            dc_user_id,
+            throttle,
+            state_tx.clone(),
+            initial_watermarks,
+        )?);
         let adapter_clone = Arc::clone(&adapter);
         let cmd_tx_clone = cmd_tx.clone();
         tokio::spawn(async move {
@@ -158,9 +167,11 @@ async fn main() -> Result<()> {
             app.gap_prefix_handle(),
         );
         tracing::info!("Discord adapter enabled");
+        discord_platform_typed = Some(Arc::clone(&adapter));
         Some(adapter)
     } else {
         tracing::info!("Discord not configured, skipping");
+        discord_platform_typed = None;
         None
     };
 
@@ -174,7 +185,13 @@ async fn main() -> Result<()> {
     .flatten()
     .collect();
 
-    app.set_platforms(telegram, slack, slack_platform_typed, discord);
+    app.set_platforms(
+        telegram,
+        slack,
+        slack_platform_typed,
+        discord,
+        discord_platform_typed,
+    );
 
     // Emit startup gap banners AFTER all delivery tasks are spawned and
     // subscribed to the stream channel — otherwise banners are lost.

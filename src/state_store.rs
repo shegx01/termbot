@@ -33,6 +33,10 @@ pub struct State {
     /// Used by `run_catchup` to resume from the last known position on wake.
     #[serde(default)]
     pub slack_watermarks: HashMap<String, String>,
+    /// Per-channel Discord watermarks: channel_id → latest seen snowflake message_id.
+    /// Used by `run_catchup` to resume from the last known position on wake.
+    #[serde(default)]
+    pub discord_watermarks: HashMap<String, u64>,
 }
 
 impl Default for State {
@@ -45,6 +49,7 @@ impl Default for State {
             harness_sessions: HashMap::new(),
             last_clean_shutdown: true,
             slack_watermarks: HashMap::new(),
+            discord_watermarks: HashMap::new(),
         }
     }
 }
@@ -99,6 +104,10 @@ pub enum StateUpdate {
     /// Force-persisted (bypasses debounce) because it is safety-critical for
     /// lossless wake-recovery.
     SlackWatermark { channel_id: String, ts: String },
+    /// Advance the per-channel Discord snowflake watermark.  Always overwrites
+    /// (snowflakes are monotonically increasing by Discord's design).
+    /// Force-persisted (bypasses debounce) for lossless wake-recovery.
+    DiscordWatermark { channel_id: String, message_id: u64 },
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -232,6 +241,16 @@ impl StateStore {
                 };
                 if advance {
                     self.state.slack_watermarks.insert(channel_id, ts);
+                }
+            }
+            StateUpdate::DiscordWatermark {
+                channel_id,
+                message_id,
+            } => {
+                // Only advance forward — Discord snowflakes are always-increasing.
+                let entry = self.state.discord_watermarks.entry(channel_id).or_insert(0);
+                if message_id > *entry {
+                    *entry = message_id;
                 }
             }
         }
@@ -810,6 +829,110 @@ mod tests {
                 .map(|s| s.as_str()),
             Some("1000000001.000000"),
             "slack_watermark must survive persist/reload cycle"
+        );
+    }
+
+    #[test]
+    fn test_discord_watermark_serde_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminus-state.json");
+        let mut store = StateStore::load(&path).unwrap();
+
+        let snowflake: u64 = 1234567890123456789;
+        store.apply(StateUpdate::DiscordWatermark {
+            channel_id: "12345".into(),
+            message_id: snowflake,
+        });
+        store.persist().expect("persist should succeed");
+
+        let reloaded = StateStore::load(&path).unwrap();
+        assert_eq!(
+            reloaded.snapshot().discord_watermarks.get("12345").copied(),
+            Some(snowflake),
+            "discord watermark must survive persist/reload cycle with full u64 precision"
+        );
+    }
+
+    #[test]
+    fn test_state_file_backward_compat_discord_watermarks() {
+        // Existing state files without `discord_watermarks` must deserialize
+        // cleanly — `#[serde(default)]` provides an empty HashMap.
+        let json = r#"{
+            "schema_version": 1,
+            "telegram": { "offset": 0 },
+            "chats": { "telegram": [], "slack": [] },
+            "last_seen_wall": null,
+            "last_clean_shutdown": true
+        }"#;
+        let state: State = serde_json::from_str(json).expect("should deserialize old format");
+        assert!(
+            state.discord_watermarks.is_empty(),
+            "discord_watermarks should default to empty map when absent from JSON"
+        );
+    }
+
+    #[test]
+    fn test_discord_watermark_force_persists() {
+        // DiscordWatermark must persist reliably (mirrors test_slack_watermark_force_persists).
+        // This verifies the apply() + persist() + reload() path for the Discord
+        // watermark variant — the in-memory state survives a full persist/reload
+        // cycle, confirming that the variant is handled by apply() and serialized
+        // correctly by the State struct.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminus-state.json");
+        let mut store = StateStore::load(&path).unwrap();
+
+        let snowflake: u64 = 1_234_567_890_987_654_321;
+        store.apply(StateUpdate::DiscordWatermark {
+            channel_id: "C_DISCORD_001".into(),
+            message_id: snowflake,
+        });
+        store.persist().expect("persist should succeed");
+
+        let reloaded = StateStore::load(&path).unwrap();
+        assert_eq!(
+            reloaded
+                .snapshot()
+                .discord_watermarks
+                .get("C_DISCORD_001")
+                .copied(),
+            Some(snowflake),
+            "discord_watermark must survive persist/reload cycle"
+        );
+    }
+
+    #[test]
+    fn test_discord_watermark_advances_monotonically() {
+        // Discord snowflakes are always-increasing; apply() must not rewind the
+        // watermark when a lower message_id arrives (mirrors Slack monotonicity).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminus-state.json");
+        let mut store = StateStore::load(&path).unwrap();
+
+        store.apply(StateUpdate::DiscordWatermark {
+            channel_id: "C_DW".into(),
+            message_id: 9_000_000_000,
+        });
+        // Apply a lower value — watermark must NOT rewind.
+        store.apply(StateUpdate::DiscordWatermark {
+            channel_id: "C_DW".into(),
+            message_id: 1_000,
+        });
+        assert_eq!(
+            store.snapshot().discord_watermarks.get("C_DW").copied(),
+            Some(9_000_000_000),
+            "DiscordWatermark must not rewind to a lower message_id"
+        );
+
+        // Higher value must still advance.
+        store.apply(StateUpdate::DiscordWatermark {
+            channel_id: "C_DW".into(),
+            message_id: 10_000_000_000,
+        });
+        assert_eq!(
+            store.snapshot().discord_watermarks.get("C_DW").copied(),
+            Some(10_000_000_000),
+            "DiscordWatermark must advance when a higher message_id is applied"
         );
     }
 }

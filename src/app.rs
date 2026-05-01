@@ -9,6 +9,7 @@ use futures_util::future::join_all;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::{OutputBuffer, StreamEvent};
+use crate::chat_adapters::discord::DiscordAdapter;
 use crate::chat_adapters::slack::SlackPlatform;
 use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
 use crate::command::{CommandBlocklist, HarnessOptions, HarnessSubcommandKind, ParsedCommand};
@@ -48,6 +49,9 @@ pub struct App {
     /// Kept alongside the dyn `slack` field — both point to the same object.
     slack_platform: Option<Arc<SlackPlatform>>,
     discord: Option<Arc<dyn ChatPlatform>>,
+    /// Typed Arc to the Discord platform for direct catchup calls.
+    /// Kept alongside the dyn `discord` field — both point to the same object.
+    discord_platform: Option<Arc<DiscordAdapter>>,
     offline_buffer_max: usize,
     trigger: char,
 
@@ -213,6 +217,7 @@ impl App {
             slack: None,
             slack_platform: None,
             discord: None,
+            discord_platform: None,
             offline_buffer_max: config.streaming.offline_buffer_max_bytes,
             trigger,
             named_harness_sessions,
@@ -270,11 +275,13 @@ impl App {
         slack: Option<Arc<dyn ChatPlatform>>,
         slack_platform: Option<Arc<SlackPlatform>>,
         discord: Option<Arc<dyn ChatPlatform>>,
+        discord_platform: Option<Arc<DiscordAdapter>>,
     ) {
         self.telegram = telegram;
         self.slack = slack;
         self.slack_platform = slack_platform;
         self.discord = discord;
+        self.discord_platform = discord_platform;
     }
 
     pub fn subscribe_stream(&self) -> broadcast::Receiver<StreamEvent> {
@@ -327,6 +334,12 @@ impl App {
     /// Call this before `seed_watermarks` on `SlackPlatform`.
     pub fn initial_slack_watermarks(&self) -> std::collections::HashMap<String, String> {
         self.store.snapshot().slack_watermarks.clone()
+    }
+
+    /// Returns the per-channel Discord snowflake watermarks from the persisted state snapshot.
+    /// Pass to `DiscordAdapter::new` as `initial_watermarks`.
+    pub fn initial_discord_watermarks(&self) -> std::collections::HashMap<String, u64> {
+        self.store.snapshot().discord_watermarks.clone()
     }
 
     pub async fn reconcile_startup(&mut self) {
@@ -628,6 +641,31 @@ impl App {
             }
         }
 
+        // 3b. Discord catchup: fetch missed messages since the stored snowflake watermarks.
+        //
+        // Spawned (not awaited) for the same reason as Slack catchup above:
+        // `run_catchup` calls `cmd_tx.send`, which would deadlock against the
+        // suspended `cmd_rx` branch in the main `tokio::select!` loop.
+        if let Some(discord) = self.discord_platform.clone() {
+            // Guard against concurrent catchup tasks (e.g. two rapid GapDetected
+            // signals).  If a task is already running, skip rather than spawn a
+            // second one — the running task will cover the gap.
+            if discord
+                .catchup_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                tokio::spawn(async move {
+                    if let Err(e) = discord.run_catchup().await {
+                        tracing::warn!("Discord catchup failed: {}", e);
+                    }
+                    discord.catchup_in_progress.store(false, Ordering::SeqCst);
+                });
+            } else {
+                tracing::warn!("Discord catchup already in progress, skipping duplicate spawn");
+            }
+        }
+
         // 4. Resume all adapters via trait method.
         for p in [&self.telegram, &self.slack, &self.discord]
             .into_iter()
@@ -676,6 +714,7 @@ impl App {
                 | StateUpdate::SetCleanShutdown(_)
                 | StateUpdate::HarnessSessionBatch(_)
                 | StateUpdate::SlackWatermark { .. }
+                | StateUpdate::DiscordWatermark { .. }
         );
         self.store.apply(update);
         self.updates_since_persist += 1;
