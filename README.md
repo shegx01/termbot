@@ -85,7 +85,7 @@ Set `TERMINUS_CONFIG=/path/to/config.toml` to use a non-default config location.
 
 ## What it does
 
-**Terminal control** — run commands and manage tmux sessions:
+**Terminal control** — run commands, manage tmux sessions, anything interactive you can do in terminal:
 
 ```
 : new dev                 # create a session
