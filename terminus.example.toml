@@ -110,9 +110,9 @@ stayawake_on_battery = false
 # (`codex login`) before terminus can spawn codex sessions.
 #
 # Defaults applied unconditionally by terminus (regardless of these fields):
-#   --full-auto              (sandboxed automatic execution; codex 0.125.0
-#                            removed --ask-for-approval, so this is the
-#                            non-interactive default that won't deadlock)
+#   -s workspace-write       (sandbox; replaces deprecated --full-auto from
+#                            codex 0.128. Overridable via the `sandbox =`
+#                            field below or per-prompt --sandbox)
 #   --skip-git-repo-check    (terminus's tmux cwd may not always be a git repo)
 #   --ephemeral              (passed when no named/resumed session is active,
 #                            so one-shot prompts don't pollute codex's session
@@ -120,10 +120,11 @@ stayawake_on_battery = false
 #
 # [harness.codex]
 # binary_path = "/opt/homebrew/bin/codex"   # default: resolved via PATH
-# model = "gpt-5.4"                         # default: codex's own default
-#                                           # ChatGPT-account models: gpt-5.4,
-#                                           # gpt-5.3-codex, etc. (gpt-5.5 is
-#                                           # API-only and rejects ChatGPT auth)
+# model = "gpt-5.5"                         # default: codex's own default
+#                                           # (gpt-5.5 since codex 0.128;
+#                                           # gpt-5.4 and gpt-5.4-mini also
+#                                           # available. gpt-5.3-codex was
+#                                           # removed in 0.128.)
 #                                           # can override per-prompt: --model / -m
 # profile = "default"                       # default: codex's own active profile
 #                                           # selects [profiles.<name>] from

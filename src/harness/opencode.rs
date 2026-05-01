@@ -32,6 +32,8 @@
 use super::build_session_key;
 use super::{Harness, HarnessEvent, HarnessKind};
 use crate::chat_adapters::Attachment;
+#[cfg(test)]
+use crate::command::{HarnessExtras, OpencodeExtras};
 use crate::command::{HarnessOptions, OpencodeSubcommand};
 use crate::config::OpencodeConfig;
 use crate::socket::events::AmbientEvent;
@@ -138,7 +140,10 @@ impl Harness for OpencodeHarness {
             args.push("-m".into());
             args.push(m.clone());
         }
-        let effective_agent = options.agent.as_ref().or(self.config.agent.as_ref());
+        let opencode_e = options.opencode_extras();
+        let effective_agent = opencode_e
+            .and_then(|o| o.agent.as_ref())
+            .or(self.config.agent.as_ref());
         if let Some(a) = effective_agent {
             args.push("--agent".into());
             args.push(a.clone());
@@ -148,17 +153,17 @@ impl Harness for OpencodeHarness {
             args.push(att.path.to_string_lossy().into_owned());
         }
         // Per-prompt flags (after attachments, before the prompt positional).
-        if let Some(ref t) = options.title {
+        if let Some(t) = opencode_e.and_then(|o| o.title.as_ref()) {
             args.push("--title".into());
             args.push(t.clone());
         }
-        if options.share {
+        if opencode_e.is_some_and(|o| o.share) {
             args.push("--share".into());
         }
-        if options.pure {
+        if opencode_e.is_some_and(|o| o.pure) {
             args.push("--pure".into());
         }
-        if options.fork {
+        if opencode_e.is_some_and(|o| o.fork) {
             args.push("--fork".into());
         }
         if options.continue_last {
@@ -1978,26 +1983,30 @@ mod tests {
         // White-box: reconstruct the argv the way `run_prompt` does when all
         // per-prompt flags are set, and assert the expected order.
         let options = HarnessOptions {
-            title: Some("my-session".into()),
-            share: true,
-            pure: true,
-            fork: true,
+            extras: Some(HarnessExtras::Opencode(OpencodeExtras {
+                title: Some("my-session".into()),
+                share: true,
+                pure: true,
+                fork: true,
+                ..Default::default()
+            })),
             continue_last: true,
             ..Default::default()
         };
+        let opencode_e = options.opencode_extras();
         let mut args: Vec<String> = vec!["run".into(), "--format".into(), "json".into()];
         // Per-prompt flags (mirrors run_prompt order):
-        if let Some(ref t) = options.title {
+        if let Some(t) = opencode_e.and_then(|o| o.title.as_ref()) {
             args.push("--title".into());
             args.push(t.clone());
         }
-        if options.share {
+        if opencode_e.is_some_and(|o| o.share) {
             args.push("--share".into());
         }
-        if options.pure {
+        if opencode_e.is_some_and(|o| o.pure) {
             args.push("--pure".into());
         }
-        if options.fork {
+        if opencode_e.is_some_and(|o| o.fork) {
             args.push("--fork".into());
         }
         if options.continue_last {

@@ -211,17 +211,17 @@ Gemini CLI flags are mapped to their own idioms -- `-r latest` for bare `--conti
 
 **Full flag + event-schema reference:** [docs/gemini.md](docs/gemini.md)
 
-**Codex** -- prompt OpenAI's `codex` CLI from chat (verified against codex-cli **0.125.0**), with paired tool-use events, named sessions, image attachments, and structured output:
+**Codex** -- prompt OpenAI's `codex` CLI from chat (verified against codex-cli **0.128.0**), with paired tool-use events, named sessions, image attachments, and structured output:
 
 ```
-: codex --model gpt-5.4 explain this codebase
+: codex --model gpt-5.5 explain this codebase
 : codex on --name auth --sandbox workspace-write
 What does the auth module do?
 Can you fix the JWT validation bug?
 : codex off
 ```
 
-Codex always runs with `--full-auto --skip-git-repo-check` (codex 0.125.0 removed the prior `--ask-for-approval` flag, so `--full-auto` is the only non-interactive default that won't deadlock). Sandbox values: `read-only` / `workspace-write` / `danger-full-access`. ChatGPT-account auth rejects `gpt-5.5` (API-only); use `gpt-5.4` or `gpt-5.3-codex`. Image attachments are forwarded via `-i` (image-only whitelist). All native subcommands (`login`, `cloud`, `apply`, `mcp`, `plugin`, `debug`, etc.) are blocked from chat — run them in your terminal.
+Codex always runs with `-s workspace-write --skip-git-repo-check` (codex 0.128 deprecated `--full-auto` in favor of explicit `-s <sandbox>`; `codex exec` is non-interactive by default in 0.128 so no separate "skip approval" flag is needed). Sandbox values: `read-only` / `workspace-write` / `danger-full-access`. Default model is `gpt-5.5` as of codex 0.128 — universally available; `gpt-5.4` and `gpt-5.4-mini` are alternatives. (`gpt-5.3-codex` was removed in 0.128.) Image attachments are forwarded via `-i` (image-only whitelist). Chat-safe subcommands: `: codex sessions`, `: codex apply <task_id>`, and `: codex cloud {list,status,diff,apply,exec}` — see [docs/codex.md](docs/codex.md). Other native subcommands (`login`, `mcp`, `resume`, `fork`, etc.) remain blocked.
 
 **Full flag + event-schema reference:** [docs/codex.md](docs/codex.md)
 
@@ -467,9 +467,9 @@ Optional overrides:
 # Override the codex binary location (default: resolved via PATH)
 # binary_path = "/opt/homebrew/bin/codex"
 
-# Per-run model override. ChatGPT-account models: "gpt-5.4", "gpt-5.3-codex"
-# (gpt-5.5 is API-only and rejected on ChatGPT auth).
-# model = "gpt-5.4"
+# Per-run model override. Default in codex 0.128: "gpt-5.5". Other models
+# available: "gpt-5.4", "gpt-5.4-mini". ("gpt-5.3-codex" was removed in 0.128.)
+# model = "gpt-5.5"
 
 # Per-run profile override (passed as `-p / --profile <name>`). Selects a
 # [profiles.<name>] block from ~/.codex/config.toml.
@@ -487,14 +487,14 @@ Optional overrides:
 **Requirements:** `codex` on PATH (`brew install --cask codex` or `npm install -g @openai/codex`), authenticated via `codex login` (ChatGPT account or API key).
 
 **Defaults applied unconditionally** by terminus regardless of these fields:
-- `--full-auto` -- codex 0.125.0 removed `--ask-for-approval`; this is the non-interactive default that won't deadlock.
+- `-s workspace-write` -- replaces the deprecated-in-0.128 `--full-auto`. `codex exec` is non-interactive by default in 0.128 (no `--ask-for-approval` flag exists on the exec subcommand). User-supplied `--sandbox` / `[harness.codex].sandbox` overrides this default.
 - `--skip-git-repo-check` -- terminus's tmux cwd may not always be a git repo.
 - `--ephemeral` -- added when no named/resumed session is in play, so one-shot prompts don't pollute codex's session log.
-- `Stdio::null()` for child stdin -- codex 0.125.0 reads stdin even when prompt is supplied as an arg, blocking forever otherwise.
+- `Stdio::null()` for child stdin -- `codex exec` reads stdin even when prompt is supplied as an arg (still true in 0.128), blocking forever otherwise.
 
-**Blocked from chat** (interactive, destructive, or v1.1-deferred; run in your terminal instead): `login`, `logout`, `mcp`, `mcp-server`, `app`, `app-server`, `exec-server`, `plugin`, `completion`, `features`, `debug`, `sandbox` (subcommand form, distinct from `--sandbox` flag), `cloud`, `apply`, `review`, `resume` (use `--resume <name>` flag), `fork`, `sessions`. All return targeted chat-safe error messages.
+**Blocked from chat** (interactive, destructive, or v1.1-deferred; run in your terminal instead): `login`, `logout`, `mcp`, `mcp-server`, `app`, `app-server`, `exec-server`, `plugin`, `completion`, `features`, `debug`, `sandbox` (subcommand form, distinct from `--sandbox` flag), `review`, `resume` (use `--resume <name>` flag), `fork`. **Now chat-safe (F6+F7):** `sessions`, `apply <task_id>`, and the `cloud {list,status,diff,apply,exec}` subgroup — see [docs/codex.md](docs/codex.md#chat-safe-subcommands).
 
-**Per-prompt flags:** `--name`, `--resume`, `--continue` (named or bare), `--model` / `-m`, `--sandbox`, `--profile` (no `-p` short alias — collides with claude's `--permission-mode`), `--add-dir` / `-d` (repeatable, codex 0.125.0+), `--schema` (three forms — registered name from `[schemas.<name>]`, file path, or inline JSON; all passed as `--output-schema`. Registered names additionally drive webhook delivery with HMAC-SHA256-signed POST + retry queue, full parity with claude). Image attachments (`image/png`, `image/jpeg`, `image/jpg`, `image/webp`) are forwarded via codex's `-i` flag.
+**Per-prompt flags:** `--name`, `--resume`, `--continue` (named or bare), `--model` / `-m`, `--sandbox`, `--profile` (no `-p` short alias — collides with claude's `--permission-mode`), `--add-dir` / `-d` (repeatable), `--schema` (three forms — registered name from `[schemas.<name>]`, file path, or inline JSON; all passed as `--output-schema`. Registered names additionally drive webhook delivery with HMAC-SHA256-signed POST + retry queue, full parity with claude). Image attachments (`image/png`, `image/jpeg`, `image/jpg`, `image/webp`) are forwarded via codex's `-i` flag.
 
 See [docs/codex.md](docs/codex.md) for the full CLI reference, verified event schema, error table, and functionality matrix.
 
@@ -1288,13 +1288,13 @@ Gemini CLI must be installed from [github.com/google-gemini/gemini-cli](https://
 <details>
 <summary>Codex commands not working</summary>
 
-Codex CLI must be installed (`brew install --cask codex` or `npm install -g @openai/codex`) and authenticated via `codex login` (ChatGPT account or API key). Verify with `codex --version` and `codex login status` in your terminal. If terminus can't find it, set `binary_path` in `[harness.codex]`. Verified against codex-cli **0.125.0** -- newer versions may emit different event schemas (terminus logs a "version drift" warning on unrecognized event types).
+Codex CLI must be installed (`brew install --cask codex` or `npm install -g @openai/codex`) and authenticated via `codex login` (ChatGPT account or API key). Verify with `codex --version` and `codex login status` in your terminal. If terminus can't find it, set `binary_path` in `[harness.codex]`. Verified against codex-cli **0.128.0** -- newer versions may emit different event schemas (terminus logs a "version drift" warning on unrecognized event types).
 </details>
 
 <details>
-<summary>Codex: "model not supported when using Codex with a ChatGPT account"</summary>
+<summary>Codex: "model not supported"</summary>
 
-ChatGPT-account auth rejects API-only models (e.g. `gpt-5.5`). Use a ChatGPT-compatible model: `gpt-5.4`, `gpt-5.3-codex`. Set per-prompt with `: codex --model gpt-5.4 ...` or persistently via `[harness.codex] model`.
+Codex 0.128's default model is `gpt-5.5` and it is universally available, including on ChatGPT-account auth. If you set a `model = "..."` override that codex doesn't recognize, the call will surface codex's own error. Valid choices include `gpt-5.5` (default), `gpt-5.4`, `gpt-5.4-mini`. (`gpt-5.3-codex` was removed in 0.128 — if you have it pinned in `[harness.codex] model`, switch to `gpt-5.5` or remove the field to inherit the codex default.)
 </details>
 
 <details>

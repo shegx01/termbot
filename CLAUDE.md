@@ -253,18 +253,26 @@ Full flag semantics, event schema, error table, and functionality matrix: [docs/
 ### Codex integration
 
 Uses OpenAI's `codex` CLI (`github.com/openai/codex`, verified against codex-cli
-**0.125.0**) — each prompt spawns `codex exec --json --full-auto
+**0.128.0**) — each prompt spawns `codex exec --json -s workspace-write
 --skip-git-repo-check [flags] <prompt>` as a short-lived child process with
 `kill_on_drop(true)`. Mirrors gemini's structure, including the shared
 `ToolPairingBuffer` for `item.started` + `item.completed` pairing.
 
-- **`--full-auto` is unconditional**: codex 0.125.0 removed `--ask-for-approval`,
-  so this is the only non-interactive default that won't deadlock on a missing
-  TTY. `--skip-git-repo-check` is also unconditional. `--ephemeral` is added
+- **`-s <sandbox>` replaces deprecated `--full-auto`**: codex 0.128 deprecated
+  `--full-auto` in favor of explicit `-s workspace-write`. `codex exec` runs
+  non-interactively by default in 0.128 (no `--ask-for-approval` exists on the
+  exec subcommand), so terminus just pins the sandbox; the deprecation warning
+  is avoided by emitting `-s workspace-write` directly. Per-prompt `--sandbox`
+  and `[harness.codex] sandbox = ...` override the default.
+- **`--skip-git-repo-check`** is unconditional. **`--ephemeral`** is added
   when no named session is in play.
-- **stdin must be `Stdio::null()`**: codex 0.125.0 reads stdin even when the
-  prompt is supplied as a positional arg, blocking forever on a TTY-less
-  subprocess otherwise.
+- **stdin must be `Stdio::null()`**: `codex exec` reads stdin even when the
+  prompt is supplied as a positional arg (still true in 0.128 — codex prints
+  "Reading additional input from stdin..." before continuing), blocking
+  forever on a TTY-less subprocess otherwise.
+- **Default model is `gpt-5.5`** as of codex 0.128 (priority 0 in the bundled
+  manifest). `gpt-5.4` and `gpt-5.4-mini` are also available; `gpt-5.3-codex`
+  was removed in 0.128.
 - Session resume uses the SUBCOMMAND form `codex exec resume <thread_id>`
   (not a `--resume` flag). Bare `--continue` maps to `codex exec resume
   --last`. Terminus captures the `thread_id` from the first `thread.started`
@@ -280,8 +288,8 @@ Uses OpenAI's `codex` CLI (`github.com/openai/codex`, verified against codex-cli
 
 Optional `[harness.codex]` overrides (see `terminus.example.toml`):
 - `binary_path`: override the codex CLI location (default: resolved via PATH)
-- `model`: pass `-m <value>` (default: codex's own default; ChatGPT-account
-  models include `gpt-5.4`, `gpt-5.3-codex`)
+- `model`: pass `-m <value>` (default: codex's own default — `gpt-5.5` as of
+  0.128. `gpt-5.4` and `gpt-5.4-mini` are also available)
 - `profile`: pass `-p <value>` to select a named profile from
   `~/.codex/config.toml`
 - `sandbox`: pass `-s <value>` (`read-only` | `workspace-write` |
@@ -290,11 +298,16 @@ Optional `[harness.codex]` overrides (see `terminus.example.toml`):
   it skips `~/.codex/config.toml` entirely (defense-in-depth against future
   profile fields re-introducing approval prompts)
 
-**Subcommands blocked from chat** (chat-safe errors returned; run in terminal):
+**Supported subcommands from chat:** `sessions` (→ `codex resume --all`),
+`apply <task_id>` (→ `codex apply <task_id>`), `cloud {list,status,diff,apply,exec}`
+(→ `codex cloud <sub>`). Each is a single-shot subprocess (30s timeout, output
+truncated at 3000 chars inside a fenced code block). Full reference:
+[docs/codex.md](docs/codex.md).
+
+**Blocked from chat** (chat-safe errors returned; run in terminal):
 `login`, `logout`, `mcp`, `mcp-server`, `app`, `app-server`, `exec-server`,
 `plugin`, `completion`, `features`, `debug`, `sandbox` (the subcommand form),
-`cloud`, `apply`, `resume` (use `--resume <name>` flag instead), `fork`,
-`sessions`, `review`. Full reference: [docs/codex.md](docs/codex.md).
+`resume` (use `--resume <name>` flag instead), `fork`, `review`.
 
 **Per-prompt flags** (`: codex [flags] <prompt>`):
 - `--name <x>` / `--resume <x>` / `--continue <x>` — named session
@@ -310,12 +323,13 @@ Full flag semantics, event schema, error table, and functionality matrix:
 [docs/codex.md](docs/codex.md).
 
 **Known limitations (codex-specific):**
-- Cloud surface (`codex cloud` / `codex apply`) deferred to v1.1; blocked at
-  the parser. Long-running, two-step submit-then-apply lifecycle doesn't fit
-  terminus's short-lived-subprocess pattern.
-- No chat-safe subcommand passthrough in v1 (`sessions`, `resume`, `models`
-  all blocked). Named-session resume still works via the `--resume <name>`
-  flag, independent of codex's `resume` subcommand.
+- Cloud surface is single-shot only. The submit-then-apply lifecycle is two
+  independent CLI calls; terminus does not retain task state between them
+  (use `: codex cloud list` / `cloud status <task_id>` to track tasks).
+- Interactive subcommands stay blocked: `: codex resume` / `fork` / `review`
+  all use a picker UI that can't be driven from chat. `: codex models` has no
+  top-level surface in codex 0.128. Named-session resume still works via the
+  `--resume <name>` flag, independent of codex's `resume` subcommand.
 - `reasoning` items are dropped silently.
 - Token usage from `turn.completed.usage` not surfaced to chat (parity with
   gemini).

@@ -1,24 +1,33 @@
 //! Codex CLI-subprocess harness.
 //!
-//! Wraps OpenAI's `codex` CLI (verified against codex-cli 0.125.0) — each
+//! Wraps OpenAI's `codex` CLI (verified against codex-cli 0.128.0) — each
 //! prompt spawns `codex exec --json` (or `codex exec resume --json …` for
 //! continuation) as a short-lived child process. Mirrors the structure of
 //! [`crate::harness::gemini`] and [`crate::harness::opencode`] with codex-
 //! specific argv construction and event translation.
 //!
-//! ## Codex 0.125.0 ground truth (verified by spike)
+//! ## Codex 0.128.0 ground truth (verified by spike)
 //!
-//! - **Approval flag removed.** Codex no longer accepts `--ask-for-approval`;
-//!   terminus passes `--full-auto` unconditionally so the harness never blocks
-//!   on a TTY approval prompt that has nowhere to be answered.
+//! - **Approval flag absent on `exec`.** `codex exec` does not accept
+//!   `--ask-for-approval` (it's a top-level-only flag). `codex exec` is
+//!   non-interactive by default in 0.128, so no replacement is needed —
+//!   the harness just pins the sandbox explicitly with `-s <value>`.
+//! - **`--full-auto` is deprecated.** Codex 0.128 prints
+//!   `"--full-auto is deprecated; use --sandbox workspace-write instead"`
+//!   on stderr if used. Terminus emits `-s workspace-write` instead (or
+//!   the user's per-prompt / config sandbox value when set), avoiding both
+//!   the deprecation warning and the future-removal risk.
 //! - **`--skip-git-repo-check`** is always passed because terminus's tmux cwd
 //!   may not be a git repo.
 //! - **`--ephemeral`** is passed when no named session is in play, so one-shot
 //!   prompts don't pollute codex's session log.
-//! - **stdin must be `Stdio::null()`** — codex 0.125.0 reads stdin even when
+//! - **stdin must be `Stdio::null()`** — `codex exec` reads stdin even when
 //!   the prompt is supplied as a positional arg, and the read blocks forever
 //!   if a TTY isn't attached.
 //! - **`--ignore-user-config`** is opt-in via `[harness.codex] ignore_user_config`.
+//! - **Default model is `gpt-5.5`** as of codex 0.128 (priority 0 in the
+//!   bundled model manifest). `gpt-5.4` and `gpt-5.4-mini` remain available;
+//!   `gpt-5.3-codex` was removed.
 //!
 //! ## Event schema (NDJSON, one JSON object per line)
 //!
@@ -42,7 +51,9 @@
 
 use super::{Harness, HarnessEvent, HarnessKind, ToolPairingBuffer};
 use crate::chat_adapters::Attachment;
-use crate::command::HarnessOptions;
+use crate::command::{CodexCloudSubcommand, CodexSubcommand, HarnessOptions};
+#[cfg(test)]
+use crate::command::{CodexExtras, HarnessExtras};
 use crate::config::CodexConfig;
 use crate::socket::events::AmbientEvent;
 use anyhow::Result;
@@ -106,6 +117,231 @@ impl CodexHarness {
         self.schema_registry = registry;
         self
     }
+
+    /// Spawn a chat-safe codex subcommand (`sessions` / `apply <id>` /
+    /// `cloud <sub>`) and stream the captured stdout back as a single
+    /// fenced-code Text event followed by Done. Mirrors
+    /// [`OpencodeHarness::run_subcommand`] / [`GeminiHarness::run_subcommand`]:
+    /// emits exactly one of `Text(fenced_stdout) + Done` or `Error(msg) + Done`.
+    /// No ambient events; subcommands are not AI runs and don't carry session
+    /// state. Bounded by a 30s timeout; output is truncated at 3000 chars
+    /// inside the fenced block to keep chat responses bounded.
+    pub async fn run_subcommand(
+        &self,
+        sub: CodexSubcommand,
+        args: Vec<String>,
+    ) -> Result<mpsc::Receiver<HarnessEvent>> {
+        let (event_tx, event_rx) = mpsc::channel::<HarnessEvent>(32);
+        let binary = self
+            .config
+            .binary_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("codex"));
+
+        let argv = build_subcommand_argv(&sub, &args);
+        tokio::spawn(async move {
+            let body = run_subcommand_inner(binary, argv, sub, args, event_tx.clone());
+            let result = AssertUnwindSafe(body).catch_unwind().await;
+            if let Err(panic_info) = result {
+                let msg = format_panic_message(&*panic_info);
+                let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
+            }
+        });
+        Ok(event_rx)
+    }
+}
+
+/// Pure function: build the argv for a chat-safe codex subcommand.
+///
+/// - `sessions` → `resume --all` (read-only listing of saved sessions)
+/// - `apply` / `cloud apply` → `apply <task_id>` / `cloud apply <task_id>`
+/// - `cloud {list|status|diff|exec}` → `cloud <sub> …`
+fn build_subcommand_argv(sub: &CodexSubcommand, extra_args: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = match sub {
+        CodexSubcommand::Sessions => vec!["resume".into(), "--all".into()],
+        CodexSubcommand::Apply => vec!["apply".into()],
+        CodexSubcommand::Cloud(c) => match c {
+            CodexCloudSubcommand::List => vec!["cloud".into(), "list".into()],
+            CodexCloudSubcommand::Status => vec!["cloud".into(), "status".into()],
+            CodexCloudSubcommand::Diff => vec!["cloud".into(), "diff".into()],
+            CodexCloudSubcommand::Apply => vec!["cloud".into(), "apply".into()],
+            CodexCloudSubcommand::Exec => vec!["cloud".into(), "exec".into()],
+        },
+    };
+    argv.extend(extra_args.iter().cloned());
+    argv
+}
+
+fn sub_display_name(sub: &CodexSubcommand) -> &'static str {
+    match sub {
+        CodexSubcommand::Sessions => "sessions",
+        CodexSubcommand::Apply => "apply",
+        CodexSubcommand::Cloud(c) => match c {
+            CodexCloudSubcommand::List => "cloud list",
+            CodexCloudSubcommand::Status => "cloud status",
+            CodexCloudSubcommand::Diff => "cloud diff",
+            CodexCloudSubcommand::Apply => "cloud apply",
+            CodexCloudSubcommand::Exec => "cloud exec",
+        },
+    }
+}
+
+/// Async inner body: spawn child, wait for output, emit Text + Done (or
+/// Error + Done). Bounded by a 30s timeout. Stdout is truncated at 3000
+/// chars inside the fenced block to keep chat responses bounded. Emits
+/// Done unconditionally before returning so receivers don't hang.
+async fn run_subcommand_inner(
+    binary: PathBuf,
+    argv: Vec<String>,
+    sub: CodexSubcommand,
+    extra_args: Vec<String>,
+    event_tx: mpsc::Sender<HarnessEvent>,
+) {
+    let sub_label = sub_display_name(&sub);
+
+    let mut cmd = Command::new(&binary);
+    cmd.args(&argv)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "codex binary not found: {} (set [harness.codex] binary_path or install codex on PATH)",
+                    binary.display()
+                )
+            } else {
+                format!("codex {} spawn failed: {}", sub_label, e)
+            };
+            let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let out =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+            .await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                let _ = event_tx
+                    .send(HarnessEvent::Error(format!(
+                        "codex {} wait failed: {}",
+                        sub_label, e
+                    )))
+                    .await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
+                return;
+            }
+            Err(_) => {
+                let _ = event_tx
+                    .send(HarnessEvent::Error(format!(
+                        "codex {} timed out after 30s",
+                        sub_label
+                    )))
+                    .await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    if !out.status.success() {
+        let raw_stderr = if out.stderr.len() > 64 * 1024 {
+            &out.stderr[..64 * 1024]
+        } else {
+            &out.stderr
+        };
+        let stderr_trim = String::from_utf8_lossy(raw_stderr).trim().to_string();
+        let code = out
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into());
+        let sanitized = sanitize_stderr(&stderr_trim);
+        // Log the sanitized stderr (env-vars and absolute user paths redacted)
+        // rather than the raw form so `RUST_LOG=debug` captures don't leak
+        // secrets into shared log aggregators. (Security review LOW-1.)
+        tracing::debug!(
+            "codex {} non-zero exit; sanitized stderr: {}",
+            sub_label,
+            sanitized
+        );
+        let detail = if sanitized.is_empty() {
+            format!(
+                "codex {} exited with status {} (no stderr)",
+                sub_label, code
+            )
+        } else {
+            format!(
+                "codex {} exited with status {}: {}",
+                sub_label, code, sanitized
+            )
+        };
+        let _ = event_tx.send(HarnessEvent::Error(detail)).await;
+        let _ = event_tx
+            .send(HarnessEvent::Done {
+                session_id: String::new(),
+            })
+            .await;
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stripped = stdout.trim();
+
+    let message = if stripped.is_empty() {
+        let arg_summary = if extra_args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", extra_args.join(" "))
+        };
+        // "no results" matches the wording used by gemini and opencode for the
+        // same situation (Code-reviewer MED-1, cross-harness wording parity).
+        format!("codex {}{}: no results", sub_label, arg_summary)
+    } else {
+        // Truncate at 3000 chars for chat-friendliness, mirroring opencode.
+        const MAX_CHARS: usize = 3000;
+        let body = if stripped.chars().count() > MAX_CHARS {
+            let truncated: String = stripped.chars().take(MAX_CHARS).collect();
+            format!(
+                "{}\n…[truncated; run from terminal for full output]",
+                truncated
+            )
+        } else {
+            stripped.to_string()
+        };
+        format!("```\n{}\n```", body)
+    };
+
+    let _ = event_tx.send(HarnessEvent::Text(message)).await;
+    let _ = event_tx
+        .send(HarnessEvent::Done {
+            session_id: String::new(),
+        })
+        .await;
 }
 
 #[async_trait]
@@ -282,13 +518,15 @@ impl Harness for CodexHarness {
 /// `session_id` is the *resolved* codex thread_id (or `None` for fresh).
 ///
 /// Branches:
-/// - Fresh prompt: `codex exec --json --full-auto --skip-git-repo-check [...] -- <prompt>`
-/// - Resume by id: `codex exec resume --json --full-auto --skip-git-repo-check [...] <session_id> <prompt>`
+/// - Fresh prompt: `codex exec --json -s workspace-write --skip-git-repo-check [...] -- <prompt>`
+/// - Resume by id: `codex exec resume --json -s workspace-write --skip-git-repo-check [...] <session_id> <prompt>`
 /// - Bare --continue: `codex exec resume --json [...] --last <prompt>`
 ///
 /// **Always-on flags** (cannot be overridden by user options):
-/// - `--full-auto` (codex 0.125.0 has no `--ask-for-approval`; this is the
-///   non-interactive default that doesn't deadlock).
+/// - `-s <sandbox>` — defaults to `workspace-write` when no user/config value
+///   is set. Replaces the deprecated-in-0.128 `--full-auto` flag (`codex exec`
+///   no longer accepts `--ask-for-approval` and runs non-interactively by
+///   default; the explicit sandbox value avoids the deprecation warning).
 /// - `--skip-git-repo-check` (terminus's tmux cwd may not be a git repo).
 /// - `--ignore-user-config` if `config.ignore_user_config = true`.
 /// - `--ephemeral` when no named/resumed session is active (one-shot prompts).
@@ -309,32 +547,41 @@ fn build_argv(
     }
 
     args.push("--json".into());
-    args.push("--full-auto".into());
     args.push("--skip-git-repo-check".into());
 
     if config.ignore_user_config {
         args.push("--ignore-user-config".into());
     }
 
-    // Sandbox: per-prompt > config > codex default.
-    // Validate the value here so a bad TOML setting (e.g. `sandbox = "banana"`)
-    // doesn't reach codex with a malformed flag — the parser already validates
-    // per-prompt values, but config-sourced values bypass the parser. Drop +
-    // log on invalid values so codex gets a clean argv (and falls back to its
-    // own default).
+    // Sandbox: per-prompt > config > workspace-write fallback.
+    //
+    // Codex 0.128 deprecated `--full-auto` in favor of explicit
+    // `-s <sandbox>`. `codex exec` runs non-interactively by default in 0.128
+    // (no `--ask-for-approval` flag exists on the exec subcommand), so we just
+    // need to pin the sandbox. `workspace-write` matches the deprecated
+    // `--full-auto` behavior — write access to the current workspace, no
+    // network, no parent-dir reads.
+    //
+    // Config-sourced values bypass the parser, so validate here too: drop +
+    // log on invalid input rather than emitting a malformed flag.
     const VALID_SANDBOX: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
-    let effective_sandbox = options.sandbox.as_ref().or(config.sandbox.as_ref());
-    if let Some(s) = effective_sandbox {
-        if VALID_SANDBOX.contains(&s.as_str()) {
-            args.push("-s".into());
-            args.push(s.clone());
-        } else {
+    let codex_e = options.codex_extras();
+    let effective_sandbox = codex_e
+        .and_then(|c| c.sandbox.as_ref())
+        .or(config.sandbox.as_ref());
+    let sandbox_value: &str = match effective_sandbox {
+        Some(s) if VALID_SANDBOX.contains(&s.as_str()) => s.as_str(),
+        Some(s) => {
             tracing::warn!(
                 value = %s,
-                "codex: invalid sandbox value in config (valid: read-only, workspace-write, danger-full-access); using codex default"
+                "codex: invalid sandbox value in config (valid: read-only, workspace-write, danger-full-access); falling back to workspace-write"
             );
+            "workspace-write"
         }
-    }
+        None => "workspace-write",
+    };
+    args.push("-s".into());
+    args.push(sandbox_value.into());
 
     // Model: per-prompt > config > codex default.
     let effective_model = options.model.as_ref().or(config.model.as_ref());
@@ -344,14 +591,16 @@ fn build_argv(
     }
 
     // Profile: per-prompt > config > codex default.
-    let effective_profile = options.profile.as_ref().or(config.profile.as_ref());
+    let effective_profile = codex_e
+        .and_then(|c| c.profile.as_ref())
+        .or(config.profile.as_ref());
     if let Some(p) = effective_profile {
         args.push("-p".into());
         args.push(p.clone());
     }
 
-    // Additional writable directories, repeatable. Codex 0.125.0+ accepts
-    // `--add-dir <DIR>` to extend the sandbox beyond the current cwd.
+    // Additional writable directories, repeatable. `codex exec --add-dir <DIR>`
+    // extends the sandbox beyond the current cwd (verified through 0.128).
     // Sourced from `HarnessOptions.add_dirs` (the same field claude consumes
     // via `--add-dir`); per-prompt only — no codex-config equivalent yet.
     for dir in &options.add_dirs {
@@ -608,7 +857,7 @@ impl TempFile {
 }
 
 /// Sanitize codex stderr before forwarding it to chat. Strips known-benign
-/// log lines that codex 0.125.0 emits during normal operation, then defers to
+/// log lines that the codex CLI emits during normal operation, then defers to
 /// the shared base in [`crate::harness::sanitize_stderr_base`] for env-var
 /// and path redaction plus 500-char truncation.
 pub(crate) fn sanitize_stderr(s: &str) -> String {
@@ -655,8 +904,10 @@ async fn run_codex_inner(
         .current_dir(&cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // CRITICAL: codex 0.125.0 reads stdin even when prompt is supplied as
-        // an arg. Pin stdin to /dev/null or it blocks indefinitely.
+        // CRITICAL: `codex exec` reads stdin even when prompt is supplied as
+        // a positional arg (still true in 0.128 — codex prints "Reading
+        // additional input from stdin..." before continuing). Pin stdin to
+        // /dev/null or it blocks indefinitely.
         .stdin(Stdio::null())
         .kill_on_drop(true);
 
@@ -1230,13 +1481,29 @@ mod tests {
     // ── build_argv ──────────────────────────────────────────────────────────
 
     #[test]
-    fn argv_fresh_prompt_passes_full_auto_and_skip_git_repo_check() {
+    fn argv_fresh_prompt_passes_workspace_write_and_skip_git_repo_check() {
+        // Codex 0.128 deprecated `--full-auto` in favor of `-s <sandbox>`. With
+        // no per-prompt or config sandbox set, terminus pins
+        // `-s workspace-write` (the same effective behavior as the deprecated
+        // `--full-auto`) to avoid the deprecation warning on stderr.
         let opts = HarnessOptions::default();
         let cfg = CodexConfig::default();
         let args = build_argv("hello", None, &opts, &cfg, &[], None);
         assert_eq!(args[0], "exec");
         assert!(args.contains(&"--json".to_string()));
-        assert!(args.contains(&"--full-auto".to_string()));
+        assert!(
+            !args.contains(&"--full-auto".to_string()),
+            "--full-auto is deprecated; expected -s workspace-write instead. argv: {:?}",
+            args
+        );
+        let s_pos = args
+            .iter()
+            .position(|a| a == "-s")
+            .expect("expected -s flag in argv");
+        assert_eq!(
+            args.get(s_pos + 1).map(String::as_str),
+            Some("workspace-write")
+        );
         assert!(args.contains(&"--skip-git-repo-check".to_string()));
         assert!(args.contains(&"--ephemeral".to_string()));
         assert_eq!(args.last().unwrap(), "hello");
@@ -1292,7 +1559,10 @@ mod tests {
     #[test]
     fn argv_sandbox_flag_when_set() {
         let opts = HarnessOptions {
-            sandbox: Some("read-only".into()),
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                sandbox: Some("read-only".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let args = build_argv("hi", None, &opts, &CodexConfig::default(), &[], None);
@@ -1303,7 +1573,10 @@ mod tests {
     #[test]
     fn argv_sandbox_per_prompt_overrides_config() {
         let opts = HarnessOptions {
-            sandbox: Some("danger-full-access".into()),
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                sandbox: Some("danger-full-access".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let cfg = CodexConfig {
@@ -1329,7 +1602,10 @@ mod tests {
     #[test]
     fn argv_profile_flag_when_set() {
         let opts = HarnessOptions {
-            profile: Some("dev".into()),
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                profile: Some("dev".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let args = build_argv("hi", None, &opts, &CodexConfig::default(), &[], None);
@@ -1972,10 +2248,12 @@ mod tests {
         let p1 = PathBuf::from("/tmp/a.png");
         let p2 = PathBuf::from("/tmp/schema.json");
         let opts = HarnessOptions {
-            sandbox: Some("read-only".into()),
-            profile: Some("dev".into()),
             model: Some("gpt-5.4".into()),
             add_dirs: vec![PathBuf::from("/tmp/lib")],
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                sandbox: Some("read-only".into()),
+                profile: Some("dev".into()),
+            })),
             ..Default::default()
         };
         let cfg = CodexConfig {
@@ -1996,7 +2274,6 @@ mod tests {
             .position(|a| a == "describe")
             .expect("prompt present");
         for flag in [
-            "--full-auto",
             "--skip-git-repo-check",
             "--ignore-user-config",
             "-s",
@@ -2054,10 +2331,19 @@ mod tests {
         );
     }
 
-    // ── Fix #8: invalid sandbox in config dropped ──────────────────────────
+    // ── Fix #8 (post-0.128): invalid sandbox in config falls back to default ─
+    //
+    // Behavior change rationale: codex 0.128 deprecated `--full-auto` in favor
+    // of explicit `-s <sandbox>`, and `codex exec` now requires a sandbox value
+    // for the non-interactive default to be applied. Previously terminus would
+    // drop the `-s` flag entirely on an invalid value and rely on `--full-auto`
+    // to provide the default. With `--full-auto` gone, an invalid config value
+    // must fall back to the explicit `workspace-write` default rather than
+    // emit no `-s` flag at all (which would leave codex in its own default,
+    // currently `read-only`-equivalent in 0.128).
 
     #[test]
-    fn argv_invalid_sandbox_in_config_dropped_with_warning() {
+    fn argv_invalid_sandbox_in_config_falls_back_to_workspace_write() {
         let cfg = CodexConfig {
             sandbox: Some("banana".into()),
             ..Default::default()
@@ -2068,24 +2354,43 @@ mod tests {
             "invalid sandbox must NOT appear in argv; got {:?}",
             args
         );
-        assert!(
-            !args.iter().any(|a| a == "-s"),
-            "no -s flag should be passed when sandbox value is invalid; got {:?}",
+        let s_pos = args
+            .iter()
+            .position(|a| a == "-s")
+            .expect("expected -s flag with workspace-write fallback; got {:?}");
+        assert_eq!(
+            args.get(s_pos + 1).map(String::as_str),
+            Some("workspace-write"),
+            "invalid value should fall back to workspace-write; got {:?}",
             args
         );
     }
 
     #[test]
-    fn argv_invalid_sandbox_in_options_per_prompt_path_unaffected() {
+    fn argv_invalid_sandbox_in_options_per_prompt_falls_back() {
         // Per-prompt sandbox is validated by the parser, not build_argv. If
         // somehow an invalid value reaches build_argv via options (bypassing
-        // the parser), it should also be dropped — defense in depth.
+        // the parser), it should also fall back to workspace-write — defense
+        // in depth.
         let opts = HarnessOptions {
-            sandbox: Some("not-a-real-policy".into()),
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                sandbox: Some("not-a-real-policy".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let args = build_argv("hi", None, &opts, &CodexConfig::default(), &[], None);
         assert!(!args.iter().any(|a| a == "not-a-real-policy"));
+        let s_pos = args
+            .iter()
+            .position(|a| a == "-s")
+            .expect("expected -s flag with fallback");
+        assert_eq!(
+            args.get(s_pos + 1).map(String::as_str),
+            Some("workspace-write"),
+            "invalid options.sandbox should fall back; got {:?}",
+            args
+        );
     }
 
     // ── Fix #4 + #7: handle_schema validation + directory error ────────────
@@ -2499,6 +2804,155 @@ mod tests {
             out.is_empty(),
             "agent_message item.started must be dropped; got {:?}",
             out
+        );
+    }
+
+    // ── chat-safe subcommand passthrough (F6 + F7) ──────────────────────────
+
+    #[test]
+    fn build_subcommand_argv_sessions_uses_resume_all() {
+        let argv = build_subcommand_argv(&CodexSubcommand::Sessions, &[]);
+        assert_eq!(argv, vec!["resume".to_string(), "--all".to_string()]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_apply_threads_task_id() {
+        let argv = build_subcommand_argv(&CodexSubcommand::Apply, &["task_abc123".to_string()]);
+        assert_eq!(argv, vec!["apply".to_string(), "task_abc123".to_string()]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_cloud_list_no_args() {
+        let argv = build_subcommand_argv(&CodexSubcommand::Cloud(CodexCloudSubcommand::List), &[]);
+        assert_eq!(argv, vec!["cloud".to_string(), "list".to_string()]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_cloud_status_with_id() {
+        let argv = build_subcommand_argv(
+            &CodexSubcommand::Cloud(CodexCloudSubcommand::Status),
+            &["task_xyz".to_string()],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "cloud".to_string(),
+                "status".to_string(),
+                "task_xyz".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn build_subcommand_argv_cloud_diff_with_id() {
+        let argv = build_subcommand_argv(
+            &CodexSubcommand::Cloud(CodexCloudSubcommand::Diff),
+            &["task_qq".to_string()],
+        );
+        assert_eq!(argv[0], "cloud");
+        assert_eq!(argv[1], "diff");
+        assert_eq!(argv[2], "task_qq");
+    }
+
+    #[test]
+    fn build_subcommand_argv_cloud_apply_with_id() {
+        let argv = build_subcommand_argv(
+            &CodexSubcommand::Cloud(CodexCloudSubcommand::Apply),
+            &["task_q".to_string()],
+        );
+        assert_eq!(argv, vec!["cloud", "apply", "task_q"]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_cloud_exec_threads_full_args() {
+        let argv = build_subcommand_argv(
+            &CodexSubcommand::Cloud(CodexCloudSubcommand::Exec),
+            &[
+                "--env".into(),
+                "env_main".into(),
+                "fix".into(),
+                "auth".into(),
+            ],
+        );
+        assert_eq!(argv[0], "cloud");
+        assert_eq!(argv[1], "exec");
+        assert_eq!(argv[2], "--env");
+        assert_eq!(argv[3], "env_main");
+        assert_eq!(argv[4], "fix");
+        assert_eq!(argv[5], "auth");
+    }
+
+    #[test]
+    fn sub_display_name_covers_all_variants() {
+        // Defends against a future enum-variant addition that forgets to
+        // extend sub_display_name. Uses string equality (not the enum) so
+        // that the chat-facing labels are pinned.
+        assert_eq!(sub_display_name(&CodexSubcommand::Sessions), "sessions");
+        assert_eq!(sub_display_name(&CodexSubcommand::Apply), "apply");
+        assert_eq!(
+            sub_display_name(&CodexSubcommand::Cloud(CodexCloudSubcommand::List)),
+            "cloud list"
+        );
+        assert_eq!(
+            sub_display_name(&CodexSubcommand::Cloud(CodexCloudSubcommand::Status)),
+            "cloud status"
+        );
+        assert_eq!(
+            sub_display_name(&CodexSubcommand::Cloud(CodexCloudSubcommand::Diff)),
+            "cloud diff"
+        );
+        assert_eq!(
+            sub_display_name(&CodexSubcommand::Cloud(CodexCloudSubcommand::Apply)),
+            "cloud apply"
+        );
+        assert_eq!(
+            sub_display_name(&CodexSubcommand::Cloud(CodexCloudSubcommand::Exec)),
+            "cloud exec"
+        );
+    }
+
+    /// Mirror of `gemini.rs::run_subcommand_emits_done_after_panic`: when the
+    /// subprocess body panics the spawned task must still emit a terminal Done
+    /// after the Error so the receiver doesn't hang. We force a spawn failure
+    /// by pointing the binary at a missing path; the spawn-failure arm
+    /// produces the same Error+Done pair as a panic. The path mirrors the
+    /// gemini convention (`/nonexistent/...-cN`) so the test reliably hits
+    /// `ErrorKind::NotFound` on both macOS and Linux. (Test-engineer P1.)
+    #[tokio::test]
+    async fn run_subcommand_spawn_failure_emits_error_then_done() {
+        let cfg = CodexConfig {
+            binary_path: Some(PathBuf::from("/nonexistent/codex-binary-for-tests-c2a9")),
+            ..Default::default()
+        };
+        let h = CodexHarness::new_with_config(cfg);
+        let mut rx = h
+            .run_subcommand(CodexSubcommand::Sessions, vec![])
+            .await
+            .expect("run_subcommand returns receiver");
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert_eq!(
+            events.len(),
+            2,
+            "expected exactly Error+Done; got {:?}",
+            events
+        );
+        match &events[0] {
+            HarnessEvent::Error(msg) => {
+                assert!(
+                    msg.contains("codex binary not found") || msg.contains("spawn failed"),
+                    "unexpected error message: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Error first, got {:?}", other),
+        }
+        assert!(
+            matches!(events[1], HarnessEvent::Done { .. }),
+            "expected Done last, got {:?}",
+            events[1]
         );
     }
 }

@@ -103,6 +103,15 @@ pub struct App {
     /// `mark_clean_shutdown` so the worker can check between-jobs and break out
     /// of an active drain loop without waiting for the next await point.
     retry_worker_shutdown_flag: Arc<AtomicBool>,
+    /// Claude SDK harness (typed Arc for symmetry with the other three; future
+    /// claude-specific inherent methods can be reached without a type-erased
+    /// downcast). Kept alongside the type-erased entry in `harnesses`.
+    /// Currently unread because `ClaudeHarness` exposes nothing the `Harness`
+    /// trait doesn't already cover; the field exists so a future
+    /// `run_subcommand` / claude-specific inherent method has a typed call
+    /// site without a breaking signature change. (Architect P1.2.)
+    #[allow(dead_code)]
+    pub(crate) claude: Arc<ClaudeHarness>,
     /// Opencode CLI-subprocess harness (kept as a typed Arc for direct access
     /// alongside the type-erased entry in `harnesses`).
     pub(crate) opencode: Arc<OpencodeHarness>,
@@ -110,6 +119,11 @@ pub struct App {
     /// dispatcher can call `run_subcommand` directly — `run_subcommand` is
     /// not on the `Harness` trait).
     pub(crate) gemini: Arc<GeminiHarness>,
+    /// Codex CLI-subprocess harness. Same rationale as `gemini` above:
+    /// `run_subcommand` (chat-safe `sessions` / `apply` / `cloud <sub>`
+    /// passthrough) is an inherent method, not on the `Harness` trait, so we
+    /// keep a typed Arc alongside the type-erased entry in `harnesses`.
+    pub(crate) codex: Arc<CodexHarness>,
 }
 
 impl App {
@@ -136,9 +150,11 @@ impl App {
         let (ambient_tx, _) = broadcast::channel::<AmbientEvent>(512);
 
         let mut harnesses: HashMap<HarnessKind, Box<dyn Harness>> = HashMap::new();
+        let claude =
+            Arc::new(ClaudeHarness::new().with_schema_registry(Arc::clone(&schema_registry)));
         harnesses.insert(
             HarnessKind::Claude,
-            Box::new(ClaudeHarness::new().with_schema_registry(Arc::clone(&schema_registry))),
+            Box::new(Arc::clone(&claude)) as Box<dyn Harness>,
         );
         let opencode_cfg = config.harness.opencode.clone().unwrap_or_default();
         let opencode = Arc::new(OpencodeHarness::new(opencode_cfg, ambient_tx.clone()));
@@ -153,9 +169,14 @@ impl App {
             Box::new(Arc::clone(&gemini)) as Box<dyn Harness>,
         );
         let codex_cfg = config.harness.codex.clone().unwrap_or_default();
-        let codex = CodexHarness::new(codex_cfg, ambient_tx.clone())
-            .with_schema_registry(Arc::clone(&schema_registry));
-        harnesses.insert(HarnessKind::Codex, Box::new(codex));
+        let codex = Arc::new(
+            CodexHarness::new(codex_cfg, ambient_tx.clone())
+                .with_schema_registry(Arc::clone(&schema_registry)),
+        );
+        harnesses.insert(
+            HarnessKind::Codex,
+            Box::new(Arc::clone(&codex)) as Box<dyn Harness>,
+        );
 
         // Hydrate active chat sets from persisted state.
         let snapshot = store.snapshot();
@@ -208,8 +229,10 @@ impl App {
             ambient_tx,
             retry_worker_shutdown: Arc::clone(&retry_worker_shutdown),
             retry_worker_shutdown_flag: Arc::clone(&retry_worker_shutdown_flag),
+            claude,
             opencode,
             gemini,
+            codex,
         };
 
         // Immediately mark state dirty in memory (sets last_clean_shutdown=false)
@@ -1141,6 +1164,9 @@ impl App {
                     }
                     (HarnessKind::Gemini, HarnessSubcommandKind::Gemini(sub)) => {
                         self.gemini.run_subcommand(sub, args).await
+                    }
+                    (HarnessKind::Codex, HarnessSubcommandKind::Codex(sub)) => {
+                        self.codex.run_subcommand(sub, args).await
                     }
                     (h, _) => {
                         self.send_error(
