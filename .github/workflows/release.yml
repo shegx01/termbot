@@ -153,8 +153,8 @@ jobs:
           TAG_TIME="$(date -u +'%H%M')"
 
           echo "RELEASE_CHANNEL=$RELEASE_CHANNEL" >> "$GITHUB_ENV"
-          echo "TAG=${BUILD_DATE}__${TAG_TIME}_${RELEASE_CHANNEL}" >> "$GITHUB_ENV"
-          echo "BUILD_NAME=${BUILD_DATE}__${BUILD_TIME}_${RELEASE_CHANNEL}" >> "$GITHUB_ENV"
+          echo "TAG=${BUILD_DATE}_${TAG_TIME}_${RELEASE_CHANNEL}" >> "$GITHUB_ENV"
+          echo "BUILD_NAME=${BUILD_DATE}_${BUILD_TIME}_${RELEASE_CHANNEL}" >> "$GITHUB_ENV"
 
       - name: Create release
         uses: softprops/action-gh-release@v3
@@ -165,3 +165,23 @@ jobs:
           files: |
             artifacts/terminus-*
           fail_on_unmatched_files: true
+
+      - name: Move latest tag
+        run: |
+          git tag --force latest "$GITHUB_SHA"
+          git push --force origin refs/tags/latest
+
+      - name: Update latest release alias
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          name: Latest
+          body: |
+            Alias for Build ${{ env.BUILD_NAME }}.
+
+            Timestamped release: ${{ env.TAG }}
+          files: |
+            artifacts/terminus-*
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          make_latest: false
