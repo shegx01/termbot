@@ -20,7 +20,6 @@ terminus gives you remote access to terminal sessions and AI harnesses from your
 - [How it works](#how-it-works)
 - [Security](#security)
 - [Configuration reference](#configuration-reference)
-- [Architecture](#architecture)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -139,39 +138,20 @@ TERMINUS_CONFIG=/path/to/config.toml ./terminus
 : screen                         # snapshot the terminal screen
 ```
 
-**Claude Code** -- ask questions, refactor code, explore projects:
+**Claude Code** -- ask questions, refactor code, explore projects, with named sessions, structured output, image input, and real-time tool activity:
 
 ```
 : claude explain this codebase
-: claude find all TODO comments and prioritize them
-```
-
-**Interactive Claude mode** -- multi-turn conversation from chat:
-
-```
-: claude on                      # enter Claude mode
-What does the auth module do?    # just type naturally
-Can you refactor it?             # conversation continues
-Show me the test gaps.           # still the same session
-: claude off                     # back to terminal
-```
-
-**Claude mode with options** -- customize model, effort, context:
-
-```
-: claude on --model sonnet --effort high
-: claude on --add-dir ../shared-lib
-: claude on -m opus -t 10 --add-dir ../api
-```
-
-**Image support** -- send photos to Claude directly from chat:
-
-```
-: claude on
-[send a screenshot with caption] what's wrong with this error?
-[send a diagram]                 # photo-only messages work too
+: claude on --name auth --model sonnet
+What does the auth module do?
+Can you refactor it?
+[send a screenshot] what's wrong with this error?
 : claude off
 ```
+
+Uses your **Claude subscription** (Pro/Max), not API credits. SDK mode (above) gives structured typed output with tool-activity streaming; you can also run Claude Code as a full interactive CLI inside a tmux session for slash commands and skills.
+
+**Full flag + option reference:** [docs/claude.md](docs/claude.md)
 
 **OpenCode** -- prompt a different AI via the `opencode` CLI:
 
@@ -569,128 +549,24 @@ Session names can contain letters, numbers, hyphens, and underscores (max 64 cha
 |---------|-------------|
 | `: claude <prompt>` | One-shot prompt with structured response |
 | `: claude on` | Enter interactive Claude mode |
-| `: claude on [options]` | Enter Claude mode with CLI options (see below) |
+| `: claude on [options]` | Enter Claude mode with CLI options |
 | `: claude off` | Exit Claude mode, back to terminal |
 
-In Claude mode, plain text goes to Claude instead of the terminal. Multi-turn -- each message continues the same conversation.
+In Claude mode, plain text goes to Claude instead of the terminal. Multi-turn — each message continues the same conversation. Uses your **Claude subscription** (Pro/Max), not API credits.
 
-You can also send images (photos, screenshots, diagrams) in Claude mode. Attach a photo with an optional caption and Claude will see it. Photo-only messages default to "What is in this image?".
-
-Uses your **Claude subscription** (Pro/Max), not API credits.
-
-#### Claude mode options
-
-Options passed to `: claude on` persist for the entire session (until `: claude off`):
-
-| Option | Short | What it does |
-|--------|-------|-------------|
-| `--model <name>` | `-m` | Model override (e.g. `sonnet`, `opus`) |
-| `--effort <level>` | `-e` | Thinking effort: `low`, `medium`, `high`, `max` |
-| `--system-prompt <text>` | | Replace the default system prompt |
-| `--append-system-prompt <text>` | | Append to the default system prompt |
-| `--add-dir <path>` | `-d` | Add a directory for context (repeatable) |
-| `--max-turns <n>` | `-t` | Limit agentic turns per prompt |
-| `--name <name>` | `-n` | Name a Claude session for multi-turn resume (create-or-resume) |
-| `--resume <name>` / `--continue <name>` | | Strict resume of a named session (error if not found) |
-| `--settings <path>` | | Path to a Claude Code settings file or inline JSON |
-| `--mcp-config <path>` | | Path to an MCP server config file |
-| `--permission-mode <mode>` | `-p` | Permission mode: `default`, `acceptEdits`, `plan`, `bypassPermissions` (default: `bypassPermissions`) |
-
-Quote values that contain spaces: `--system-prompt "You are a Rust expert"` or `--system-prompt 'Be concise'`. Smart/curly quotes from mobile keyboards are normalized automatically.
-
-Paths (`--add-dir`, `--mcp-config`, `--settings`) are relative to terminus's working directory, not the terminal session's. Use absolute paths when in doubt.
-
-Examples:
-
-```
-: claude on --model sonnet                          # use Sonnet model
-: claude on --effort high --add-dir ../shared-lib   # deeper thinking + extra context
-: claude on -m opus -t 10                           # Opus model, max 10 turns per prompt
-: claude on -n auth                                 # interactive mode with named session "auth"
-: claude --resume auth fix the login bug            # strict resume of session "auth"
-: claude on --system-prompt "Focus on security"     # custom system prompt
-: claude on --mcp-config ./mcp.json --settings ./s.json
-: claude on -p acceptEdits                              # Claude can edit files but not run shell commands
-```
-
-### Two ways to use Claude
-
-**SDK mode** (`: claude`) -- structured output, real-time tool activity, multi-turn, image input. Best for prompts and Q&A:
-
-```
-: claude explain the auth module
-: claude on
-What does the auth module do?
-: claude off
-```
-
-**tmux mode** -- run Claude Code as a full interactive CLI session. Supports slash commands, skills, plugins, and interactive prompts that the SDK can't handle:
-
-```
-: new ai                         # create a tmux session
-: claude                         # launches Claude Code CLI
-```
-
-Now Claude Code is running in the terminal. Use plain text to talk to it:
-
-```
-explore this project
-/commit                          # Claude Code slash commands
-/review-pr 42                    # works because it's a real terminal
-```
-
-Switch between Claude and other sessions:
-
-```
-: bg                             # background Claude session
-: new build
-: cargo test                     # run tests in a different session
-: fg ai                          # back to Claude
-continue where we left off
-```
-
-To check what Claude (or any program) is doing in a tmux session, use `: screen`:
-
-```
-: screen                         # sends a snapshot of the terminal to chat
-```
-
-This captures exactly what you'd see if you were looking at the terminal -- useful when Claude is working on a long task and you want a progress check.
-
-Use tmux mode when you need Claude Code's full interactive features (slash commands, permission prompts, multi-file editing workflows). Use SDK mode when you want quick, clean answers with image support.
+**Full flag + option reference:** [docs/claude.md](docs/claude.md)
 
 ### Named sessions
 
-By default, Claude conversation context is tied to the foreground terminal session name. Named sessions decouple this — you can create, name, and resume Claude conversations independently.
-
-**Create or resume a named session (`--name` / `-n`):**
+Harnesses that support resume (Claude, opencode, gemini, codex) accept `--name <name>` (create-or-resume) and `--resume <name>` / `--continue <name>` (strict resume). Names persist across restarts in `terminus-state.json` under per-harness prefixes (`claude:<name>`, `opencode:<name>`, etc.) and are LRU-evicted at `max_named_sessions` (default 50, shared across harnesses).
 
 ```
-: claude --name auth-refactor explain the auth middleware     # creates "auth-refactor"
-: claude --name auth-refactor now fix the JWT validation      # resumes "auth-refactor" (notifies you)
-: claude on --name auth-refactor                              # interactive mode with "auth-refactor"
-: claude on --name auth-refactor explain the auth middleware  # interactive mode AND send first prompt
+: claude --name auth fix the JWT validation
+: opencode --name review look at the PR
+: codex --resume auth keep going
 ```
 
-If the session already exists, `--name` resumes it and shows a notification. If it doesn't exist, it creates a new one. With `on`, any text after the flags is sent as the first prompt.
-
-**Strict resume (`--resume` / `--continue`):**
-
-```
-: claude --resume auth-refactor add rate limiting             # resumes, errors if not found
-: claude --resume typo                                        # → "No session named 'typo'"
-: claude on --resume review please look at the PR             # enter interactive mode, resume "review", send prompt
-```
-
-Use `--resume` when you know the session exists and want to catch typos. `--continue` is an alias for `--resume`.
-
-**How it works:**
-- Named sessions persist across restarts — the session index (name → session ID + working directory) is saved in `terminus-state.json`
-- The Claude SDK stores conversation history in `.claude/` — terminus only tracks the mapping
-- On resume, the stored working directory is passed to the SDK for context
-- Sessions are LRU-evicted when the index exceeds `max_named_sessions` (default 50, configurable in `[harness]` section)
-- `--name` and `--resume` are mutually exclusive
-- Only works with harnesses that support resume (currently Claude, opencode, and Gemini)
+`--name` and `--resume` are mutually exclusive. Session names: alphanumeric, hyphens, underscores, max 64 chars. Per-harness details: [docs/claude.md](docs/claude.md), [docs/opencode.md](docs/opencode.md#per-prompt-flags), [docs/gemini.md](docs/gemini.md#per-prompt-flags), [docs/codex.md](docs/codex.md#per-prompt-flags).
 
 **Breaking change:** `-n` was previously the short flag for `--max-turns`. It now means `--name`. Use `-t` for `--max-turns`.
 
@@ -976,32 +852,9 @@ terminus uses `tmux capture-pane` to read the rendered terminal screen -- no raw
 
 ### Claude Code integration
 
-The `: claude` command uses the `claude-agent-sdk-rust` crate, which calls the Claude CLI with `--output-format stream-json`. This gives:
+The `: claude` command uses the `claude-agent-sdk-rust` crate, which calls the Claude CLI with `--output-format stream-json`. This gives structured typed output (no terminal scraping), real-time tool-activity streaming, multi-turn sessions, image input, and automatic delivery of files Claude creates back to chat (with an extension allowlist and a 50 MB cap).
 
-- **Structured typed output** -- no terminal scraping
-- **Real-time tool activity** -- see what Claude is doing as it works:
-  ```
-  🧠 Thinking
-  📖 Read src/main.rs
-  🔎 Grep "TODO"
-  ✏️ Edit src/buffer.rs
-  💻 Bash cargo test
-  🤖 Agent "investigate auth module"
-  ```
-- **Multi-turn sessions** -- conversation state preserved via `--resume`
-- **Image input** -- send photos from Telegram/Slack, Claude receives them as `@/path` mentions
-- **File output** -- Claude-created files (images, PDFs, CSVs, etc.) are automatically delivered back to chat
-- **5-minute timeout** -- long-running prompts time out with a clear error
-
-### Output file delivery
-
-When Claude creates or writes files during a prompt, terminus automatically delivers qualifying files back to chat:
-
-- **Images** (png, jpg, gif, webp, svg, bmp) -- sent as native photo previews
-- **Documents** (pdf, csv, xlsx, docx, pptx) -- sent as file attachments
-- **Text/data** (md, txt, json, yaml, toml, xml, html) -- sent as file attachments
-
-Files are detected from Write/Edit tool calls, Bash output redirects (`-o`, `>`, `--output`), and a post-prompt scan of the working directory and `/tmp`. Sensitive files (`terminus.toml`, `.env`, `credentials*`, `secret*`, `token*`, `password*`, `private_key*`) are never delivered. Max file size: 50 MB.
+See [docs/claude.md](docs/claude.md) for the full reference (flags, modes, named sessions, output file delivery, troubleshooting).
 
 ### Session persistence
 
@@ -1180,80 +1033,6 @@ Verify the assertion with:
 
 ---
 
-## Architecture
-
-```
-src/
-  main.rs              Core event loop (tokio::select!, biased priority order)
-  app.rs               Application state, command dispatch, sleep/wake handling,
-                       StateStore owner
-  delivery.rs          Per-platform delivery tasks, gap-banner rendering,
-                       inline-prefix fallback, StreamEvent dispatch
-  config.rs            TOML config with validation
-  command.rs           Command parser + blocklist + evasion normalization
-  session.rs           Session manager (foreground/background state machine)
-  tmux.rs              tmux CLI wrapper (capture-pane, send-keys, smart quotes)
-  buffer.rs            Output diffing via scrollback line tracking; StreamEvent enum
-  state_store.rs       Atomic JSON persistence (Telegram offset, chat bindings,
-                       last_seen_wall, last_clean_shutdown) — owned by App only
-  power/               Cross-platform sleep-inhibit + gap detection
-    mod.rs             PowerManager async-trait + submod registration
-    types.rs           LidState, PowerSource, PowerEvent, PowerSignal
-    policy.rs          Pure desired_inhibit() policy function
-    gap_detector.rs    SystemTime vs Instant divergence → PowerSignal::GapDetected
-    supervisor.rs      Periodic lid/power poller; applies policy, calls set_inhibit
-    macos.rs           caffeinate -i child + ioreg/pmset reads (hybrid ADR)
-    linux.rs           systemd-inhibit child + sysfs/procfs reads
-    fake.rs            Test double for OS-agnostic unit tests
-  harness/
-    mod.rs             Harness trait, event types, streaming driver
-    claude.rs          Claude Code SDK integration (streaming, images, file delivery)
-    opencode.rs        OpenCode CLI subprocess harness (JSON event stream, multi-step)
-    gemini.rs          Gemini CLI subprocess harness (stream-json, shared tool-pairing buffer)
-    codex.rs           Codex CLI subprocess harness (NDJSON --json events, paired
-                       item.started/item.completed via shared ToolPairingBuffer,
-                       --full-auto + --skip-git-repo-check unconditional)
-  chat_adapters/
-    mod.rs             ChatPlatform trait + Attachment type
-    telegram.rs        Telegram adapter (teloxide, long-polling)
-    slack.rs           Slack adapter (Socket Mode, tokio-tungstenite)
-    discord.rs         Discord adapter (serenity, gateway + handler-gate pause/resume; REST catchup on wake)
-  socket/
-    mod.rs             WebSocket server (TcpListener, Bearer auth, per-connection spawn)
-    connection.rs      Per-connection task (select! loop, pipelining, subscriptions)
-    envelope.rs        Wire protocol types (terminus/v1 JSON envelopes)
-    events.rs          Ambient event types for subscription bus
-    rate_limit.rs      Per-client token bucket rate limiter
-    subscription.rs    Subscription registry with facet filter matching
-```
-
-```
-Telegram/Slack/Discord          WebSocket clients
-    |                               |
-    v                               v
-cmd_tx (mpsc) ──────────> tokio::select! core loop (main.rs)
-                            ├── handle_command() (app.rs)
-                            │   ├── tmux send-keys (shell commands)
-                            │   └── harness driver (Claude SDK stream-json)
-                            │       ├── tool events ──> chat / socket
-                            │       ├── text response ──> chat / socket
-                            │       └── output files ──> chat (photos/documents)
-                            ├── health_check (5s) ──> tmux has-session
-                            ├── poll_tick (250ms) ──> tmux capture-pane
-                            └── ctrl_c ──> socket drain ──> cleanup
-                                   |
-                            broadcast::channel (StreamEvent + AmbientEvent)
-                                   |
-                            ├── Telegram delivery task
-                            ├── Slack delivery task
-                            ├── Discord delivery task
-                            └── Socket per-connection tasks (subscription filtering)
-```
-
-The harness system is extensible via the `Harness` trait. Claude, OpenCode, Gemini, and Codex are all fully implemented. Each harness supports streaming events (`ToolUse`, `Text`, `File`, `Done`, `Error`) and optional multi-turn session resume. The gemini and codex harnesses share a `ToolPairingBuffer` (in `harness/mod.rs`) that coalesces paired tool-start + tool-result events keyed by id; the claude SDK and opencode CLI emit atomic tool events and don't need pairing.
-
----
-
 ## Troubleshooting
 
 <details>
@@ -1289,19 +1068,7 @@ Verify Socket Mode is enabled and that the `xapp-` token is correct. Check that 
 <details>
 <summary>Claude commands not working</summary>
 
-The Claude CLI must be installed and authenticated: `npm i -g @anthropic-ai/claude-code && claude login`. Verify with `claude -p "hello"` in your terminal.
-</details>
-
-<details>
-<summary>Smart quotes causing shell errors</summary>
-
-terminus normalizes curly quotes automatically. If you still see issues, check that you're running the latest build.
-</details>
-
-<details>
-<summary>Images not working with Claude</summary>
-
-Images are only supported in harness mode. Enter Claude mode first with `: claude on`, then send a photo. Sending images to the terminal (without an active harness) will show an error.
+The Claude CLI must be installed and authenticated: `npm i -g @anthropic-ai/claude-code && claude login`. Verify with `claude -p "hello"` in your terminal. Full troubleshooting (smart quotes, images, session persistence): [docs/claude.md](docs/claude.md#troubleshooting).
 </details>
 
 <details>
