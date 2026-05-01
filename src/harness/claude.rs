@@ -132,7 +132,8 @@ async fn run_claude_prompt_inner(
 ) {
     let mut options = ClaudeAgentOptions::default();
     let prompt_start = std::time::SystemTime::now();
-    options.permission_mode = Some(match harness_opts.permission_mode.as_deref() {
+    let claude_e = harness_opts.claude_extras();
+    options.permission_mode = Some(match claude_e.and_then(|c| c.permission_mode.as_deref()) {
         Some("default") => PermissionMode::Default,
         Some("acceptEdits") => PermissionMode::AcceptEdits,
         Some("plan") => PermissionMode::Plan,
@@ -161,7 +162,7 @@ async fn run_claude_prompt_inner(
     if let Some(ref model) = harness_opts.model {
         options.model = Some(model.clone());
     }
-    if let Some(ref effort_str) = harness_opts.effort {
+    if let Some(effort_str) = claude_e.and_then(|c| c.effort.as_ref()) {
         options.effort = match effort_str.as_str() {
             "low" => Some(Effort::Low),
             "medium" => Some(Effort::Medium),
@@ -173,9 +174,9 @@ async fn run_claude_prompt_inner(
     // System prompt handling: --system-prompt replaces, --append-system-prompt
     // appends to the default Claude Code preset. If both are set, --system-prompt
     // takes precedence (append is ignored — can't append to a replaced prompt).
-    if let Some(ref sp) = harness_opts.system_prompt {
+    if let Some(sp) = claude_e.and_then(|c| c.system_prompt.as_ref()) {
         options.system_prompt = Some(SystemPrompt::Text(sp.clone()));
-    } else if let Some(ref asp) = harness_opts.append_system_prompt {
+    } else if let Some(asp) = claude_e.and_then(|c| c.append_system_prompt.as_ref()) {
         // Use the SDK's Preset mechanism so the default Claude Code system prompt
         // is preserved and the user's text is appended to it.
         options.system_prompt = Some(SystemPrompt::Preset(SystemPromptPreset {
@@ -187,13 +188,13 @@ async fn run_claude_prompt_inner(
     if !harness_opts.add_dirs.is_empty() {
         options.add_dirs = harness_opts.add_dirs.clone();
     }
-    if let Some(n) = harness_opts.max_turns {
+    if let Some(n) = claude_e.and_then(|c| c.max_turns) {
         options.max_turns = Some(n);
     }
-    if let Some(ref s) = harness_opts.settings {
+    if let Some(s) = claude_e.and_then(|c| c.settings.as_ref()) {
         options.settings = Some(s.clone());
     }
-    if let Some(ref mcp_path) = harness_opts.mcp_config {
+    if let Some(mcp_path) = claude_e.and_then(|c| c.mcp_config.as_ref()) {
         // Load MCP config from the specified file path via extra_args
         options.extra_args.insert(
             "mcp-config".to_string(),

@@ -38,6 +38,40 @@ pub enum GeminiSubcommand {
     Extensions,
 }
 
+/// Chat-safe codex subcommand surfaces. Codex 0.125.0 has only one read-only
+/// top-level surface (`resume --all` exposed as `sessions`), one direct-mutation
+/// surface (`apply <task_id>`), and the experimental `cloud` subgroup (5
+/// single-shot subcommands). Everything else (`login`, `mcp`, `app`, etc.) is
+/// blocked at the parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexSubcommand {
+    /// `codex resume --all` — list saved sessions for this project.
+    /// User-facing keyword: `sessions`.
+    Sessions,
+    /// `codex apply <task_id>` — apply a Codex Cloud task diff to the working
+    /// tree as a `git apply`. Top-level shortcut for `codex cloud apply`.
+    Apply,
+    /// `codex cloud <sub>` — Codex Cloud subgroup.
+    Cloud(CodexCloudSubcommand),
+}
+
+/// Subcommands of the experimental `codex cloud` surface. Each is single-shot
+/// (returns immediately) — the "submit then apply" lifecycle is just two
+/// independent CLI calls from the user's perspective.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexCloudSubcommand {
+    /// `codex cloud list` — list cloud tasks.
+    List,
+    /// `codex cloud status <task_id>` — show task status.
+    Status,
+    /// `codex cloud diff <task_id>` — show task diff.
+    Diff,
+    /// `codex cloud apply <task_id>` — apply task diff locally.
+    Apply,
+    /// `codex cloud exec --env <env_id> <query>` — submit a new cloud task.
+    Exec,
+}
+
 /// Sum type over per-harness subcommand enums. Carried in
 /// [`ParsedCommand::HarnessSubcommand`] so the dispatcher can route to the
 /// right harness without losing per-harness type safety.
@@ -45,28 +79,32 @@ pub enum GeminiSubcommand {
 pub enum HarnessSubcommandKind {
     Opencode(OpencodeSubcommand),
     Gemini(GeminiSubcommand),
+    Codex(CodexSubcommand),
 }
 
-/// CLI-style options that can be passed with `: claude on [options]`.
+/// Per-harness extras for [`HarnessOptions`]. Each variant carries the
+/// harness-specific flags that don't apply to other harnesses.
 ///
-/// These options persist for the duration of the harness session (until
-/// `: claude off`) and are applied to every prompt sent in that session.
-///
-/// Only options that make sense for subscription-based Claude Code are
-/// included — billing options like `--max-budget-usd` are intentionally
-/// omitted.
+/// A `None` value on `HarnessOptions::extras` means no harness-specific
+/// flags were supplied; the harness consumer should fall back to its own
+/// `[harness.<name>]` config for defaults.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HarnessExtras {
+    Claude(ClaudeExtras),
+    Codex(CodexExtras),
+    Gemini(GeminiExtras),
+    Opencode(OpencodeExtras),
+}
+
+/// Claude-only flags (thinking, custom system prompts, settings, MCP, permissions, max-turns).
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct HarnessOptions {
-    /// Model override (e.g. "sonnet", "opus").
-    pub model: Option<String>,
+pub struct ClaudeExtras {
     /// Thinking effort level: low, medium, high, max.
     pub effort: Option<String>,
     /// Custom system prompt (replaces default).
     pub system_prompt: Option<String>,
     /// Text appended to the default system prompt.
     pub append_system_prompt: Option<String>,
-    /// Additional directories for context.
-    pub add_dirs: Vec<PathBuf>,
     /// Maximum agentic turns per prompt.
     pub max_turns: Option<u32>,
     /// Path to a Claude Code settings file or inline JSON.
@@ -75,15 +113,33 @@ pub struct HarnessOptions {
     pub mcp_config: Option<PathBuf>,
     /// Permission mode: default, acceptEdits, plan, bypassPermissions.
     pub permission_mode: Option<String>,
-    /// Schema name for structured output (registered in terminus.toml).
-    pub schema: Option<String>,
-    /// Named session for multi-turn resume (--name / -n).
-    pub name: Option<String>,
-    /// Strict resume of a named session (--resume / --continue).
-    pub resume: Option<String>,
-    /// Opencode-only: override the agent (`--agent <name>`). e.g., "build" to enable tool-use.
+}
+
+/// Codex-only flags (`--sandbox`, `--profile`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CodexExtras {
+    /// `--sandbox <read-only|workspace-write|danger-full-access>`. Overrides
+    /// `[harness.codex].sandbox` when set.
+    pub sandbox: Option<String>,
+    /// `--profile <name>`. Selects a named profile from `~/.codex/config.toml`.
+    /// Overrides `[harness.codex].profile`.
+    pub profile: Option<String>,
+}
+
+/// Gemini-only flags (`--approval-mode`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GeminiExtras {
+    /// `--approval-mode <default|auto_edit|yolo|plan>`. Overrides
+    /// `[harness.gemini].approval_mode` when set.
+    pub approval_mode: Option<String>,
+}
+
+/// Opencode-only flags (`--agent`, `--title`, `--share`, `--pure`, `--fork`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OpencodeExtras {
+    /// Override the agent (`--agent <name>`). e.g., "build" to enable tool-use.
     pub agent: Option<String>,
-    /// Human-readable session title (opencode `--title`).
+    /// Human-readable session title (`--title`).
     pub title: Option<String>,
     /// Share flag — opencode generates a share URL for the session.
     pub share: bool,
@@ -91,46 +147,85 @@ pub struct HarnessOptions {
     pub pure: bool,
     /// Fork the session before continuing (requires --continue or --resume).
     pub fork: bool,
-    /// "Continue last session" — opencode `-c` without a specific name.
-    /// Distinguished from `resume: Option<String>` (name-based resume).
+}
+
+/// CLI-style options that can be passed with `: <harness> [options] [prompt]`
+/// or `: <harness> on [options]`.
+///
+/// Shared fields are flat on this struct; per-harness fields live inside
+/// [`HarnessExtras`] so a flag that only makes sense for one harness can't
+/// silently leak into a prompt for another. The parser routes flags into the
+/// right extras variant based on the harness kind, and rejects cross-harness
+/// flag misuse with a chat-safe error.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HarnessOptions {
+    /// Model override (e.g. "sonnet", "opus").
+    pub model: Option<String>,
+    /// Additional directories for context (claude `--add-dir`, codex `--add-dir`).
+    pub add_dirs: Vec<PathBuf>,
+    /// Schema name for structured output (registered in terminus.toml).
+    /// Used by claude (full webhook delivery) and codex (registered names also
+    /// trigger webhook delivery; inline-JSON / file-path forms render to chat
+    /// only). Other harnesses reject `--schema` at run time with a redirect
+    /// error.
+    pub schema: Option<String>,
+    /// Named session for multi-turn resume (`--name` / `-n`).
+    pub name: Option<String>,
+    /// Strict resume of a named session (`--resume` / `--continue <name>`).
+    pub resume: Option<String>,
+    /// Bare `--continue`: continue the most recent session for harnesses that
+    /// support it (opencode, gemini, codex). Distinguished from `resume`
+    /// (name-based resume).
     pub continue_last: bool,
-    /// Gemini-only: `--approval-mode <default|auto_edit|yolo|plan>`. Overrides
-    /// the `[harness.gemini].approval_mode` config when set. (Codex 0.125.0
-    /// removed `--ask-for-approval`; codex always passes `--full-auto` and
-    /// does not consume this field.)
-    pub approval_mode: Option<String>,
-    /// Codex-only: `--sandbox <read-only|workspace-write|danger-full-access>`.
-    /// Overrides `[harness.codex].sandbox` when set.
-    pub sandbox: Option<String>,
-    /// Codex-only: `--profile <name>` / `-p <name>`. Selects a named profile
-    /// from `~/.codex/config.toml`. Overrides `[harness.codex].profile`.
-    pub profile: Option<String>,
+    /// Per-harness flags. `None` when no harness-specific flags were set;
+    /// otherwise one of [`ClaudeExtras`], [`CodexExtras`], [`GeminiExtras`],
+    /// [`OpencodeExtras`].
+    pub extras: Option<HarnessExtras>,
 }
 
 impl HarnessOptions {
     /// Returns true if no options were set.
     pub fn is_empty(&self) -> bool {
         self.model.is_none()
-            && self.effort.is_none()
-            && self.system_prompt.is_none()
-            && self.append_system_prompt.is_none()
             && self.add_dirs.is_empty()
-            && self.max_turns.is_none()
-            && self.settings.is_none()
-            && self.mcp_config.is_none()
-            && self.permission_mode.is_none()
             && self.schema.is_none()
             && self.name.is_none()
             && self.resume.is_none()
-            && self.agent.is_none()
-            && self.title.is_none()
-            && !self.share
-            && !self.pure
-            && !self.fork
             && !self.continue_last
-            && self.approval_mode.is_none()
-            && self.sandbox.is_none()
-            && self.profile.is_none()
+            && self.extras.is_none()
+    }
+
+    /// View into per-harness Claude flags. Returns `None` for any other extras
+    /// variant — harness consumers should fall back to their own config defaults.
+    pub fn claude_extras(&self) -> Option<&ClaudeExtras> {
+        match &self.extras {
+            Some(HarnessExtras::Claude(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// View into per-harness Codex flags.
+    pub fn codex_extras(&self) -> Option<&CodexExtras> {
+        match &self.extras {
+            Some(HarnessExtras::Codex(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// View into per-harness Gemini flags.
+    pub fn gemini_extras(&self) -> Option<&GeminiExtras> {
+        match &self.extras {
+            Some(HarnessExtras::Gemini(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// View into per-harness Opencode flags.
+    pub fn opencode_extras(&self) -> Option<&OpencodeExtras> {
+        match &self.extras {
+            Some(HarnessExtras::Opencode(e)) => Some(e),
+            _ => None,
+        }
     }
 
     /// Build a human-readable summary of active options for the ON confirmation message.
@@ -139,33 +234,36 @@ impl HarnessOptions {
         if let Some(ref m) = self.model {
             parts.push(format!("model={}", m));
         }
-        if let Some(ref e) = self.effort {
-            parts.push(format!("effort={}", e));
-        }
-        if let Some(ref sp) = self.system_prompt {
-            let preview: String = sp.chars().take(30).collect();
-            let suffix = if sp.chars().count() > 30 { "..." } else { "" };
-            parts.push(format!("system-prompt=\"{}{}\"", preview, suffix));
-        }
-        if let Some(ref asp) = self.append_system_prompt {
-            let preview: String = asp.chars().take(30).collect();
-            let suffix = if asp.chars().count() > 30 { "..." } else { "" };
-            parts.push(format!("append-system-prompt=\"{}{}\"", preview, suffix));
+        // Claude extras
+        if let Some(c) = self.claude_extras() {
+            if let Some(ref e) = c.effort {
+                parts.push(format!("effort={}", e));
+            }
+            if let Some(ref sp) = c.system_prompt {
+                let preview: String = sp.chars().take(30).collect();
+                let suffix = if sp.chars().count() > 30 { "..." } else { "" };
+                parts.push(format!("system-prompt=\"{}{}\"", preview, suffix));
+            }
+            if let Some(ref asp) = c.append_system_prompt {
+                let preview: String = asp.chars().take(30).collect();
+                let suffix = if asp.chars().count() > 30 { "..." } else { "" };
+                parts.push(format!("append-system-prompt=\"{}{}\"", preview, suffix));
+            }
+            if let Some(n) = c.max_turns {
+                parts.push(format!("max-turns={}", n));
+            }
+            if let Some(ref s) = c.settings {
+                parts.push(format!("settings={}", s));
+            }
+            if let Some(ref m) = c.mcp_config {
+                parts.push(format!("mcp-config={}", m.display()));
+            }
+            if let Some(ref pm) = c.permission_mode {
+                parts.push(format!("permission-mode={}", pm));
+            }
         }
         for d in &self.add_dirs {
             parts.push(format!("add-dir={}", d.display()));
-        }
-        if let Some(n) = self.max_turns {
-            parts.push(format!("max-turns={}", n));
-        }
-        if let Some(ref s) = self.settings {
-            parts.push(format!("settings={}", s));
-        }
-        if let Some(ref m) = self.mcp_config {
-            parts.push(format!("mcp-config={}", m.display()));
-        }
-        if let Some(ref pm) = self.permission_mode {
-            parts.push(format!("permission-mode={}", pm));
         }
         if let Some(ref s) = self.schema {
             parts.push(format!("schema={}", s));
@@ -176,32 +274,41 @@ impl HarnessOptions {
         if let Some(ref r) = self.resume {
             parts.push(format!("resume={}", r));
         }
-        if let Some(ref a) = self.agent {
-            parts.push(format!("agent={}", a));
-        }
-        if let Some(ref t) = self.title {
-            parts.push(format!("title={}", t));
-        }
-        if self.share {
-            parts.push("share".to_string());
-        }
-        if self.pure {
-            parts.push("pure".to_string());
-        }
-        if self.fork {
-            parts.push("fork".to_string());
+        // Opencode extras
+        if let Some(o) = self.opencode_extras() {
+            if let Some(ref a) = o.agent {
+                parts.push(format!("agent={}", a));
+            }
+            if let Some(ref t) = o.title {
+                parts.push(format!("title={}", t));
+            }
+            if o.share {
+                parts.push("share".to_string());
+            }
+            if o.pure {
+                parts.push("pure".to_string());
+            }
+            if o.fork {
+                parts.push("fork".to_string());
+            }
         }
         if self.continue_last {
             parts.push("continue-last".to_string());
         }
-        if let Some(ref am) = self.approval_mode {
-            parts.push(format!("approval-mode={}", am));
+        // Gemini extras
+        if let Some(g) = self.gemini_extras() {
+            if let Some(ref am) = g.approval_mode {
+                parts.push(format!("approval-mode={}", am));
+            }
         }
-        if let Some(ref s) = self.sandbox {
-            parts.push(format!("sandbox={}", s));
-        }
-        if let Some(ref p) = self.profile {
-            parts.push(format!("profile={}", p));
+        // Codex extras
+        if let Some(c) = self.codex_extras() {
+            if let Some(ref s) = c.sandbox {
+                parts.push(format!("sandbox={}", s));
+            }
+            if let Some(ref p) = c.profile {
+                parts.push(format!("profile={}", p));
+            }
         }
         parts.join(", ")
     }
@@ -382,7 +489,7 @@ impl ParsedCommand {
                 // a Claude call on a stray word.
                 if let Some(on_args) = after_harness.strip_prefix("on ") {
                     let trimmed = on_args.trim();
-                    let (options, prompt) = split_prompt_options(trimmed)?;
+                    let (options, prompt) = split_prompt_options(trimmed, kind)?;
                     if options.is_empty() {
                         return Err(ParseError::InvalidHarnessOption(format!(
                             "`on` expects flags (e.g. `--name foo`, `--resume bar`). \
@@ -391,18 +498,8 @@ impl ParsedCommand {
                             trimmed
                         )));
                     }
-                    if kind == HarnessKind::Gemini && options.fork {
-                        return Err(ParseError::InvalidHarnessOption(
-                            "gemini does not support --fork — remove the flag".into(),
-                        ));
-                    }
-                    if kind == HarnessKind::Codex && options.fork {
-                        return Err(ParseError::InvalidHarnessOption(
-                            "codex does not support --fork in non-interactive mode \
-                             (use `codex fork` from your terminal). Remove the flag."
-                                .into(),
-                        ));
-                    }
+                    // `--fork` is rejected at parse time per-harness; no further
+                    // post-parse check needed here.
                     let initial_prompt = if prompt.is_empty() {
                         None
                     } else {
@@ -543,14 +640,90 @@ impl ParsedCommand {
                     }
                 }
 
-                // Codex-only: block codex 0.125.0's native subcommands so `: codex login`,
-                // `: codex cloud`, `: codex resume`, etc. return a chat-safe error rather
-                // than getting forwarded as prompt text. Named-session resume still works
-                // via `: codex --resume <name>` (the long flag), independent of the
-                // codex CLI's `resume` subcommand. v1 ships no chat-safe subcommand
-                // passthrough; revisit in v1.1 once cloud lifecycle is designed.
+                // Codex chat-safe subcommands (F6 + F7): route `sessions`,
+                // `apply <task_id>`, and the `cloud {list,status,diff,apply,exec}`
+                // subgroup. Each is single-shot — the "submit then apply" cloud
+                // lifecycle is just two independent CLI calls from the user's
+                // perspective, which fits terminus's short-lived-subprocess model.
+                // Other native subcommands (`login`, `mcp`, `app`, etc.) still
+                // return a chat-safe error. Named-session resume continues via
+                // the `--resume <name>` flag, independent of codex's `resume`
+                // subcommand.
                 if kind == HarnessKind::Codex && !after_harness.is_empty() {
-                    let first = after_harness.split_whitespace().next().unwrap_or("");
+                    let mut subword_iter = after_harness.split_whitespace().peekable();
+                    let first = subword_iter.next().unwrap_or("");
+                    let second = subword_iter.peek().copied().unwrap_or("");
+
+                    // Route the chat-safe forms first, before the blocked-list check.
+                    // 1-word: `sessions`, `apply` (if followed by a task id arg).
+                    // 2-word: `cloud {list|status|diff|apply|exec}`.
+                    let (sub, consumed_two) = match (first, second) {
+                        ("sessions", _) => (Some(CodexSubcommand::Sessions), false),
+                        ("apply", _) => (Some(CodexSubcommand::Apply), false),
+                        ("cloud", "list") => (
+                            Some(CodexSubcommand::Cloud(CodexCloudSubcommand::List)),
+                            true,
+                        ),
+                        ("cloud", "status") => (
+                            Some(CodexSubcommand::Cloud(CodexCloudSubcommand::Status)),
+                            true,
+                        ),
+                        ("cloud", "diff") => (
+                            Some(CodexSubcommand::Cloud(CodexCloudSubcommand::Diff)),
+                            true,
+                        ),
+                        ("cloud", "apply") => (
+                            Some(CodexSubcommand::Cloud(CodexCloudSubcommand::Apply)),
+                            true,
+                        ),
+                        ("cloud", "exec") => (
+                            Some(CodexSubcommand::Cloud(CodexCloudSubcommand::Exec)),
+                            true,
+                        ),
+                        _ => (None, false),
+                    };
+
+                    if let Some(subcommand) = sub {
+                        if consumed_two {
+                            let _ = subword_iter.next();
+                        }
+                        let rest_args: Vec<String> = subword_iter.map(String::from).collect();
+
+                        // Subcommands that REQUIRE a task_id arg — reject early.
+                        let needs_task_id = matches!(
+                            subcommand,
+                            CodexSubcommand::Apply
+                                | CodexSubcommand::Cloud(CodexCloudSubcommand::Status)
+                                | CodexSubcommand::Cloud(CodexCloudSubcommand::Diff)
+                                | CodexSubcommand::Cloud(CodexCloudSubcommand::Apply)
+                        );
+                        if needs_task_id && rest_args.is_empty() {
+                            let label = match &subcommand {
+                                CodexSubcommand::Apply => "apply",
+                                CodexSubcommand::Cloud(CodexCloudSubcommand::Status) => {
+                                    "cloud status"
+                                }
+                                CodexSubcommand::Cloud(CodexCloudSubcommand::Diff) => "cloud diff",
+                                CodexSubcommand::Cloud(CodexCloudSubcommand::Apply) => {
+                                    "cloud apply"
+                                }
+                                _ => unreachable!(),
+                            };
+                            return Err(ParseError::InvalidHarnessOption(format!(
+                                "`: codex {}` requires a task id (e.g. `: codex {} task_abc123`)",
+                                label, label
+                            )));
+                        }
+                        // `cloud exec` requires `--env <env_id>` upstream; let codex
+                        // surface its own usage error rather than gatekeeping here.
+
+                        return Ok(ParsedCommand::HarnessSubcommand {
+                            harness: kind,
+                            subcommand: HarnessSubcommandKind::Codex(subcommand),
+                            args: rest_args,
+                        });
+                    }
+
                     const CODEX_BLOCKED: &[&str] = &[
                         // auth / TTY-bound
                         "login",
@@ -567,14 +740,12 @@ impl ParsedCommand {
                         "features",
                         "debug",
                         "sandbox", // the subcommand form, NOT --sandbox flag
-                        // separate-lifecycle subcommands deferred to v1.1
-                        "cloud",
-                        "apply",
+                        // interactive-only or out of v1.1 scope
                         "review",
                         "resume", // bare subcommand; `: codex --resume <name>` still works
                         "fork",
-                        // session-listing subcommands not exposed in v1; revisit in v1.1
-                        "sessions",
+                        // bare `cloud` (no sub) — must be a recognized 2-word form
+                        "cloud",
                     ];
                     if CODEX_BLOCKED.contains(&first) {
                         // Tailor the chat-safe error message per category for clearer guidance.
@@ -586,16 +757,13 @@ impl ParsedCommand {
                             "app" | "app-server" | "exec-server" => {
                                 "codex desktop/server modes are not exposed to chat"
                             }
-                            "cloud" | "apply" => {
-                                "cloud surface deferred to v1.1; run from terminal"
+                            "cloud" => {
+                                "use one of: `cloud list`, `cloud status <id>`, `cloud diff <id>`, \
+                                 `cloud apply <id>`, `cloud exec --env <env_id> <query>`"
                             }
                             "resume" => {
                                 "use `: codex --resume <name>` for named-session resume; \
                                          the bare `resume` subcommand is not exposed to chat in v1"
-                            }
-                            "sessions" => {
-                                "session listing is not exposed to chat in v1; \
-                                          run `codex exec resume --all` from your terminal"
                             }
                             "fork" => "session forking is not exposed to chat in v1",
                             _ => "not exposed to chat in v1; run from terminal",
@@ -610,21 +778,9 @@ impl ParsedCommand {
                 if !after_harness.is_empty() {
                     // Extract any leading --flags before the actual prompt text.
                     // e.g. `: claude --schema=foo my prompt` → options={schema: "foo"}, prompt="my prompt"
-                    let (options, prompt) = split_prompt_options(after_harness)?;
-                    // Gemini CLI has no `--fork` analog — reject rather than
-                    // parse-accept-then-silently-drop at build_argv.
-                    if kind == HarnessKind::Gemini && options.fork {
-                        return Err(ParseError::InvalidHarnessOption(
-                            "gemini does not support --fork — remove the flag".into(),
-                        ));
-                    }
-                    if kind == HarnessKind::Codex && options.fork {
-                        return Err(ParseError::InvalidHarnessOption(
-                            "codex does not support --fork in non-interactive mode \
-                             (use `codex fork` from your terminal). Remove the flag."
-                                .into(),
-                        ));
-                    }
+                    // `--fork` mismatch and other cross-harness flag misuse is
+                    // rejected at parse time inside `split_prompt_options`.
+                    let (options, prompt) = split_prompt_options(after_harness, kind)?;
                     return Ok(ParsedCommand::HarnessPrompt {
                         harness: kind,
                         prompt,
@@ -667,11 +823,16 @@ impl ParsedCommand {
 /// Split leading flag tokens from a prompt string.
 ///
 /// Tokens starting with `--` (or `-` short flags) are consumed as options
-/// until a non-flag token is encountered.  The remainder is returned as the
-/// prompt text.
+/// until a non-flag token is encountered. The remainder is returned as the
+/// prompt text. The `kind` parameter routes per-harness flags into the right
+/// [`HarnessExtras`] variant and rejects cross-harness misuse (e.g.
+/// `: claude --sandbox=foo` fails fast rather than silently dropping).
 ///
 /// Example: `"--schema=foo my prompt"` → `(HarnessOptions { schema: Some("foo"), .. }, "my prompt")`
-fn split_prompt_options(input: &str) -> std::result::Result<(HarnessOptions, String), ParseError> {
+fn split_prompt_options(
+    input: &str,
+    kind: HarnessKind,
+) -> std::result::Result<(HarnessOptions, String), ParseError> {
     let normalized = normalize_quotes(input);
     let tokens = shell_tokenize(&normalized);
 
@@ -725,7 +886,7 @@ fn split_prompt_options(input: &str) -> std::result::Result<(HarnessOptions, Str
     // Parse directly from tokens — re-joining with spaces would lose the
     // quote context on multi-word values (e.g. `--system-prompt "a b c"`
     // would become `--system-prompt a b c`).
-    let options = parse_harness_options_tokens(flag_tokens)?;
+    let options = parse_harness_options_tokens(flag_tokens, kind)?;
 
     Ok((options, prompt))
 }
@@ -775,8 +936,26 @@ fn validate_harness_session_name(name: &str, flag: &str) -> std::result::Result<
 /// values like `--system-prompt "You are a Rust expert"` survive intact.
 fn parse_harness_options_tokens(
     tokens: &[String],
+    kind: HarnessKind,
 ) -> std::result::Result<HarnessOptions, ParseError> {
     let mut opts = HarnessOptions::default();
+    // Pre-allocate the right extras variant so we always have a place to
+    // route per-harness flags. Trimmed back to `None` at the end if nothing
+    // was set, so `is_empty()` and the dispatcher don't see a noisy default.
+    let mut claude_e = ClaudeExtras::default();
+    let mut codex_e = CodexExtras::default();
+    let mut gemini_e = GeminiExtras::default();
+    let mut opencode_e = OpencodeExtras::default();
+
+    fn reject_for(kind: HarnessKind, flag: &str, allowed: &str) -> ParseError {
+        ParseError::InvalidHarnessOption(format!(
+            "{} is only supported by {} (you used `: {}`)",
+            flag,
+            allowed,
+            kind.name().to_lowercase()
+        ))
+    }
+
     let mut i = 0;
 
     while i < tokens.len() {
@@ -811,10 +990,13 @@ fn parse_harness_options_tokens(
                 opts.model = Some(val);
             }
             "--effort" | "-e" => {
+                if kind != HarnessKind::Claude {
+                    return Err(reject_for(kind, "--effort", "claude"));
+                }
                 let val = get_value!();
                 match val.to_lowercase().as_str() {
                     "low" | "medium" | "high" | "max" => {
-                        opts.effort = Some(val.to_lowercase());
+                        claude_e.effort = Some(val.to_lowercase());
                     }
                     _ => {
                         return Err(ParseError::InvalidHarnessOption(format!(
@@ -825,18 +1007,32 @@ fn parse_harness_options_tokens(
                 }
             }
             "--system-prompt" => {
+                if kind != HarnessKind::Claude {
+                    return Err(reject_for(kind, "--system-prompt", "claude"));
+                }
                 let val = get_value!();
-                opts.system_prompt = Some(val);
+                claude_e.system_prompt = Some(val);
             }
             "--append-system-prompt" => {
+                if kind != HarnessKind::Claude {
+                    return Err(reject_for(kind, "--append-system-prompt", "claude"));
+                }
                 let val = get_value!();
-                opts.append_system_prompt = Some(val);
+                claude_e.append_system_prompt = Some(val);
             }
             "--add-dir" | "-d" => {
+                // Shared between claude and codex; opencode/gemini ignore unknown
+                // CLI flags but rejecting here gives clearer feedback.
+                if !matches!(kind, HarnessKind::Claude | HarnessKind::Codex) {
+                    return Err(reject_for(kind, "--add-dir", "claude and codex"));
+                }
                 let val = get_value!();
                 opts.add_dirs.push(PathBuf::from(val));
             }
             "--max-turns" | "-t" => {
+                if kind != HarnessKind::Claude {
+                    return Err(reject_for(kind, "--max-turns", "claude"));
+                }
                 let val = get_value!();
                 let n: u32 = val.parse().map_err(|_| {
                     ParseError::InvalidHarnessOption(format!(
@@ -849,21 +1045,30 @@ fn parse_harness_options_tokens(
                         "--max-turns must be at least 1".to_string(),
                     ));
                 }
-                opts.max_turns = Some(n);
+                claude_e.max_turns = Some(n);
             }
             "--settings" => {
+                if kind != HarnessKind::Claude {
+                    return Err(reject_for(kind, "--settings", "claude"));
+                }
                 let val = get_value!();
-                opts.settings = Some(val);
+                claude_e.settings = Some(val);
             }
             "--mcp-config" => {
+                if kind != HarnessKind::Claude {
+                    return Err(reject_for(kind, "--mcp-config", "claude"));
+                }
                 let val = get_value!();
-                opts.mcp_config = Some(PathBuf::from(val));
+                claude_e.mcp_config = Some(PathBuf::from(val));
             }
             "--permission-mode" | "-p" => {
+                if kind != HarnessKind::Claude {
+                    return Err(reject_for(kind, "--permission-mode", "claude"));
+                }
                 let val = get_value!();
                 match val.as_str() {
                     "default" | "acceptEdits" | "plan" | "bypassPermissions" => {
-                        opts.permission_mode = Some(val);
+                        claude_e.permission_mode = Some(val);
                     }
                     _ => {
                         return Err(ParseError::InvalidHarnessOption(format!(
@@ -907,32 +1112,69 @@ fn parse_harness_options_tokens(
                 }
             }
             "--title" => {
+                if kind != HarnessKind::Opencode {
+                    return Err(reject_for(kind, "--title", "opencode"));
+                }
                 let val = get_value!();
-                opts.title = Some(val);
+                opencode_e.title = Some(val);
             }
             "--agent" => {
+                if kind != HarnessKind::Opencode {
+                    return Err(reject_for(kind, "--agent", "opencode"));
+                }
                 let val = get_value!();
-                opts.agent = Some(val);
+                opencode_e.agent = Some(val);
             }
             "--share" => {
-                opts.share = true;
+                if kind != HarnessKind::Opencode {
+                    return Err(reject_for(kind, "--share", "opencode"));
+                }
+                opencode_e.share = true;
             }
             "--pure" => {
-                opts.pure = true;
+                if kind != HarnessKind::Opencode {
+                    return Err(reject_for(kind, "--pure", "opencode"));
+                }
+                opencode_e.pure = true;
             }
             "--fork" => {
-                opts.fork = true;
+                // Reject at parse time for non-opencode harnesses with the
+                // existing harness-specific messages (preserves user-facing
+                // wording from the pre-F10 call-site check).
+                match kind {
+                    HarnessKind::Opencode => {
+                        opencode_e.fork = true;
+                    }
+                    HarnessKind::Gemini => {
+                        return Err(ParseError::InvalidHarnessOption(
+                            "gemini does not support --fork — remove the flag".into(),
+                        ));
+                    }
+                    HarnessKind::Codex => {
+                        return Err(ParseError::InvalidHarnessOption(
+                            "codex does not support --fork in non-interactive mode \
+                             (use `codex fork` from your terminal). Remove the flag."
+                                .into(),
+                        ));
+                    }
+                    HarnessKind::Claude => {
+                        return Err(reject_for(kind, "--fork", "opencode"));
+                    }
+                }
             }
             "--approval-mode" => {
+                if kind != HarnessKind::Gemini {
+                    return Err(reject_for(kind, "--approval-mode", "gemini"));
+                }
                 let val = get_value!();
                 // Gemini accepts: default | auto_edit | yolo | plan.
                 // Codex 0.125.0 has no `--ask-for-approval` CLI flag at all
-                // (terminus passes `--full-auto` unconditionally). We still
-                // accept the flag for forward compatibility but reject any
-                // value that would re-introduce interactive approval prompts.
+                // (terminus passes `--full-auto` unconditionally). The
+                // `on-request` value is rejected outright because it would
+                // deadlock the harness with no TTY for prompts.
                 match val.as_str() {
                     "default" | "auto_edit" | "yolo" | "plan" => {
-                        opts.approval_mode = Some(val);
+                        gemini_e.approval_mode = Some(val);
                     }
                     "on-request" => {
                         return Err(ParseError::InvalidHarnessOption(
@@ -951,10 +1193,13 @@ fn parse_harness_options_tokens(
                 }
             }
             "--sandbox" => {
+                if kind != HarnessKind::Codex {
+                    return Err(reject_for(kind, "--sandbox", "codex"));
+                }
                 let val = get_value!();
                 match val.as_str() {
                     "read-only" | "workspace-write" | "danger-full-access" => {
-                        opts.sandbox = Some(val);
+                        codex_e.sandbox = Some(val);
                     }
                     _ => {
                         return Err(ParseError::InvalidHarnessOption(format!(
@@ -965,10 +1210,13 @@ fn parse_harness_options_tokens(
                 }
             }
             "--profile" => {
+                if kind != HarnessKind::Codex {
+                    return Err(reject_for(kind, "--profile", "codex"));
+                }
                 // No `-p` short alias: `-p` is already taken by --permission-mode
                 // for the Claude harness. Codex users use the long form.
                 let val = get_value!();
-                opts.profile = Some(val);
+                codex_e.profile = Some(val);
             }
             other => {
                 // Better error for short-flag=value syntax (e.g. `-m=opus`)
@@ -989,7 +1237,7 @@ fn parse_harness_options_tokens(
     }
 
     // Reject mutually exclusive options
-    if opts.system_prompt.is_some() && opts.append_system_prompt.is_some() {
+    if claude_e.system_prompt.is_some() && claude_e.append_system_prompt.is_some() {
         return Err(ParseError::InvalidHarnessOption(
             "Cannot use both --system-prompt and --append-system-prompt".to_string(),
         ));
@@ -1004,11 +1252,46 @@ fn parse_harness_options_tokens(
             "Cannot use bare --continue with --name or --resume".to_string(),
         ));
     }
-    if opts.fork && !opts.continue_last && opts.resume.is_none() {
+    if opencode_e.fork && !opts.continue_last && opts.resume.is_none() {
         return Err(ParseError::InvalidHarnessOption(
             "--fork requires --continue or --resume to be set".to_string(),
         ));
     }
+
+    // Materialize the right extras variant. Skip if no per-harness flags were
+    // set (so `is_empty()` stays meaningful and `summary()` doesn't render a
+    // bunch of no-op default fields).
+    let extras = match kind {
+        HarnessKind::Claude => {
+            if claude_e == ClaudeExtras::default() {
+                None
+            } else {
+                Some(HarnessExtras::Claude(claude_e))
+            }
+        }
+        HarnessKind::Codex => {
+            if codex_e == CodexExtras::default() {
+                None
+            } else {
+                Some(HarnessExtras::Codex(codex_e))
+            }
+        }
+        HarnessKind::Gemini => {
+            if gemini_e == GeminiExtras::default() {
+                None
+            } else {
+                Some(HarnessExtras::Gemini(gemini_e))
+            }
+        }
+        HarnessKind::Opencode => {
+            if opencode_e == OpencodeExtras::default() {
+                None
+            } else {
+                Some(HarnessExtras::Opencode(opencode_e))
+            }
+        }
+    };
+    opts.extras = extras;
 
     Ok(opts)
 }
@@ -1676,7 +1959,10 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
-                    effort: Some("high".into()),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        effort: Some("high".into()),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -1732,7 +2018,10 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
-                    max_turns: Some(5),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        max_turns: Some(5),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -1756,7 +2045,10 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
-                    system_prompt: Some("You are a Rust expert".into()),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        system_prompt: Some("You are a Rust expert".into()),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -1777,9 +2069,12 @@ mod tests {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
                     model: Some("sonnet".into()),
-                    effort: Some("high".into()),
                     add_dirs: vec![PathBuf::from("../lib")],
-                    max_turns: Some(10),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        effort: Some("high".into()),
+                        max_turns: Some(10),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -1809,7 +2104,10 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
-                    settings: Some("./settings.json".into()),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        settings: Some("./settings.json".into()),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -1825,7 +2123,10 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
-                    mcp_config: Some(PathBuf::from("./mcp.json")),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        mcp_config: Some(PathBuf::from("./mcp.json")),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -1845,7 +2146,10 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
-                    append_system_prompt: Some("Always use TypeScript".into()),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        append_system_prompt: Some("Always use TypeScript".into()),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -1861,7 +2165,10 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
-                    permission_mode: Some("acceptEdits".into()),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        permission_mode: Some("acceptEdits".into()),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -1877,7 +2184,10 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
-                    permission_mode: Some("bypassPermissions".into()),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        permission_mode: Some("bypassPermissions".into()),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -1947,7 +2257,10 @@ mod tests {
     fn harness_options_summary_model_and_effort() {
         let opts = HarnessOptions {
             model: Some("sonnet".into()),
-            effort: Some("high".into()),
+            extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                effort: Some("high".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         assert_eq!(opts.summary(), "model=sonnet, effort=high");
@@ -1994,7 +2307,10 @@ mod tests {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
                     model: Some("opus".into()),
-                    effort: Some("high".into()),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        effort: Some("high".into()),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -2022,7 +2338,10 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
-                    system_prompt: Some("Be concise".into()),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        system_prompt: Some("Be concise".into()),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -2043,7 +2362,10 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
-                    system_prompt: Some("Be concise".into()),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        system_prompt: Some("Be concise".into()),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -2055,7 +2377,10 @@ mod tests {
     fn harness_options_summary_truncates_long_system_prompt() {
         let long_prompt = "a".repeat(50);
         let opts = HarnessOptions {
-            system_prompt: Some(long_prompt),
+            extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                system_prompt: Some(long_prompt),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let summary = opts.summary();
@@ -2479,7 +2804,11 @@ mod tests {
                 ..
             } => {
                 assert_eq!(
-                    options.system_prompt.as_deref(),
+                    options
+                        .claude_extras()
+                        .expect("claude extras")
+                        .system_prompt
+                        .as_deref(),
                     Some("You are a Rust expert")
                 );
                 assert_eq!(initial_prompt.as_deref(), Some("review this"));
@@ -2565,7 +2894,10 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions {
-                    max_turns: Some(5),
+                    extras: Some(HarnessExtras::Claude(ClaudeExtras {
+                        max_turns: Some(5),
+                        ..Default::default()
+                    })),
                     ..Default::default()
                 },
                 initial_prompt: None,
@@ -3018,7 +3350,14 @@ mod tests {
             ParsedCommand::HarnessPrompt {
                 options, prompt, ..
             } => {
-                assert_eq!(options.approval_mode.as_deref(), Some("yolo"));
+                assert_eq!(
+                    options
+                        .gemini_extras()
+                        .expect("gemini extras")
+                        .approval_mode
+                        .as_deref(),
+                    Some("yolo")
+                );
                 assert_eq!(prompt, "fix a bug");
             }
             other => panic!("expected HarnessPrompt, got {:?}", other),
@@ -3042,7 +3381,14 @@ mod tests {
         let cmd = ParsedCommand::parse(": gemini --approval-mode=plan hi", ':').unwrap();
         match cmd {
             ParsedCommand::HarnessPrompt { options, .. } => {
-                assert_eq!(options.approval_mode.as_deref(), Some("plan"));
+                assert_eq!(
+                    options
+                        .gemini_extras()
+                        .expect("gemini extras")
+                        .approval_mode
+                        .as_deref(),
+                    Some("plan")
+                );
             }
             other => panic!("expected HarnessPrompt, got {:?}", other),
         }
@@ -3087,7 +3433,10 @@ mod tests {
             ParsedCommand::parse(": opencode --fork --resume review keep going", ':').unwrap();
         match cmd {
             ParsedCommand::HarnessPrompt { options, .. } => {
-                assert!(options.fork, "opencode --fork must still parse");
+                assert!(
+                    options.opencode_extras().expect("opencode extras").fork,
+                    "opencode --fork must still parse"
+                );
                 assert_eq!(options.resume.as_deref(), Some("review"));
             }
             other => panic!("expected HarnessPrompt, got {:?}", other),
@@ -3097,8 +3446,10 @@ mod tests {
     #[test]
     fn harness_options_summary_includes_approval_mode() {
         let opts = HarnessOptions {
-            approval_mode: Some("yolo".into()),
             name: Some("auth".into()),
+            extras: Some(HarnessExtras::Gemini(GeminiExtras {
+                approval_mode: Some("yolo".into()),
+            })),
             ..Default::default()
         };
         let summary = opts.summary();
@@ -3119,7 +3470,14 @@ mod tests {
             ParsedCommand::HarnessPrompt {
                 options, prompt, ..
             } => {
-                assert_eq!(options.title.as_deref(), Some("mywork"));
+                assert_eq!(
+                    options
+                        .opencode_extras()
+                        .expect("opencode extras")
+                        .title
+                        .as_deref(),
+                    Some("mywork")
+                );
                 assert_eq!(prompt, "fix the bug");
             }
             other => panic!("Expected HarnessPrompt, got {:?}", other),
@@ -3133,7 +3491,7 @@ mod tests {
             ParsedCommand::HarnessPrompt {
                 options, prompt, ..
             } => {
-                assert!(options.share);
+                assert!(options.opencode_extras().expect("opencode extras").share);
                 assert_eq!(prompt, "fix the bug");
             }
             other => panic!("Expected HarnessPrompt, got {:?}", other),
@@ -3147,7 +3505,7 @@ mod tests {
             ParsedCommand::HarnessPrompt {
                 options, prompt, ..
             } => {
-                assert!(options.pure);
+                assert!(options.opencode_extras().expect("opencode extras").pure);
                 assert_eq!(prompt, "fix the bug");
             }
             other => panic!("Expected HarnessPrompt, got {:?}", other),
@@ -3162,7 +3520,7 @@ mod tests {
             ParsedCommand::HarnessPrompt {
                 options, prompt, ..
             } => {
-                assert!(options.fork);
+                assert!(options.opencode_extras().expect("opencode extras").fork);
                 assert_eq!(options.resume.as_deref(), Some("auth"));
                 assert_eq!(prompt, "continue the work");
             }
@@ -3229,7 +3587,7 @@ mod tests {
                 options, prompt, ..
             } => {
                 assert!(options.continue_last);
-                assert!(options.fork);
+                assert!(options.opencode_extras().expect("opencode extras").fork);
                 assert_eq!(prompt, "fix the bug");
             }
             other => panic!("Expected HarnessPrompt, got {:?}", other),
@@ -3369,7 +3727,14 @@ mod tests {
                 options,
             } => {
                 assert_eq!(harness, HarnessKind::Opencode);
-                assert_eq!(options.agent.as_deref(), Some("build"));
+                assert_eq!(
+                    options
+                        .opencode_extras()
+                        .expect("opencode extras")
+                        .agent
+                        .as_deref(),
+                    Some("build")
+                );
                 assert_eq!(prompt, "run bash ls");
             }
             other => panic!("expected HarnessPrompt, got {:?}", other),
@@ -3401,7 +3766,14 @@ mod tests {
                 harness, options, ..
             } => {
                 assert_eq!(harness, HarnessKind::Opencode);
-                assert_eq!(options.agent.as_deref(), Some("build"));
+                assert_eq!(
+                    options
+                        .opencode_extras()
+                        .expect("opencode extras")
+                        .agent
+                        .as_deref(),
+                    Some("build")
+                );
             }
             other => panic!("expected HarnessOn, got {:?}", other),
         }
@@ -3415,7 +3787,14 @@ mod tests {
                 options, prompt, ..
             } => {
                 assert_eq!(options.model.as_deref(), Some("foo"));
-                assert_eq!(options.agent.as_deref(), Some("bar"));
+                assert_eq!(
+                    options
+                        .opencode_extras()
+                        .expect("opencode extras")
+                        .agent
+                        .as_deref(),
+                    Some("bar")
+                );
                 assert_eq!(prompt, "do it");
             }
             other => panic!("expected HarnessPrompt, got {:?}", other),
@@ -3425,7 +3804,10 @@ mod tests {
     #[test]
     fn harness_options_is_empty_false_when_agent_set() {
         let opts = HarnessOptions {
-            agent: Some("build".into()),
+            extras: Some(HarnessExtras::Opencode(OpencodeExtras {
+                agent: Some("build".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         assert!(!opts.is_empty());
@@ -3434,7 +3816,10 @@ mod tests {
     #[test]
     fn harness_options_summary_includes_agent() {
         let opts = HarnessOptions {
-            agent: Some("build".into()),
+            extras: Some(HarnessExtras::Opencode(OpencodeExtras {
+                agent: Some("build".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         assert_eq!(opts.summary(), "agent=build");
@@ -3502,7 +3887,14 @@ mod tests {
                     options.continue_last,
                     "bare --continue followed by another flag should set continue_last"
                 );
-                assert_eq!(options.sandbox.as_deref(), Some("read-only"));
+                assert_eq!(
+                    options
+                        .codex_extras()
+                        .expect("codex extras")
+                        .sandbox
+                        .as_deref(),
+                    Some("read-only")
+                );
                 assert_eq!(prompt, "keep going");
             }
             other => panic!("expected HarnessPrompt, got {:?}", other),
@@ -3516,7 +3908,11 @@ mod tests {
             match ParsedCommand::parse(&input, ':').unwrap() {
                 ParsedCommand::HarnessPrompt { options, .. } => {
                     assert_eq!(
-                        options.sandbox.as_deref(),
+                        options
+                            .codex_extras()
+                            .expect("codex extras")
+                            .sandbox
+                            .as_deref(),
                         Some(val),
                         "expected sandbox={}",
                         val
@@ -3544,15 +3940,44 @@ mod tests {
         let cmd = ParsedCommand::parse(": codex --profile teamsmall hi", ':').unwrap();
         match cmd {
             ParsedCommand::HarnessPrompt { options, .. } => {
-                assert_eq!(options.profile.as_deref(), Some("teamsmall"));
+                assert_eq!(
+                    options
+                        .codex_extras()
+                        .expect("codex extras")
+                        .profile
+                        .as_deref(),
+                    Some("teamsmall")
+                );
             }
             other => panic!("expected HarnessPrompt, got {:?}", other),
         }
     }
 
     #[test]
-    fn parse_codex_approval_mode_on_request_rejected_with_deadlock_message() {
+    fn parse_codex_approval_mode_rejected_cross_harness_redirect() {
+        // F10: `--approval-mode` is codex-rejected at parse time (codex
+        // 0.125.0 has no approval system). The chat-safe error redirects to
+        // gemini; the deadlock-explanation wording lives on the gemini path
+        // now (verified by `parse_gemini_approval_mode_on_request_rejected_with_deadlock_message`).
         let err = ParsedCommand::parse(": codex --approval-mode on-request hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("--approval-mode") && msg.contains("gemini"),
+                    "expected --approval-mode rejection pointing at gemini; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_gemini_approval_mode_on_request_rejected_with_deadlock_message() {
+        // The deadlock-explanation path is now gemini-specific. This test
+        // pins the helpful wording that was previously asserted on the codex
+        // path before F10 routed `--approval-mode` to gemini-only.
+        let err = ParsedCommand::parse(": gemini --approval-mode on-request hi", ':').unwrap_err();
         match err {
             ParseError::InvalidHarnessOption(msg) => {
                 assert!(
@@ -3565,8 +3990,134 @@ mod tests {
         }
     }
 
+    // ── F10: cross-harness flag rejection ──────────────────────────────────
+    //
+    // The parser now rejects per-harness flags when used with the wrong
+    // harness, instead of silently dropping them. These tests pin the new
+    // behavior so a regression to silent-drop is caught.
+
+    #[test]
+    fn parse_claude_sandbox_rejected() {
+        let err = ParsedCommand::parse(": claude --sandbox read-only hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("--sandbox") && msg.contains("codex"),
+                    "expected --sandbox rejection pointing at codex; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_claude_approval_mode_rejected() {
+        let err = ParsedCommand::parse(": claude --approval-mode plan hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("--approval-mode") && msg.contains("gemini"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_effort_rejected() {
+        let err = ParsedCommand::parse(": codex --effort high hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("--effort") && msg.contains("claude"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_agent_rejected() {
+        let err = ParsedCommand::parse(": codex --agent build hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("--agent") && msg.contains("opencode"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_sandbox_rejected() {
+        let err = ParsedCommand::parse(": opencode --sandbox read-only hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("--sandbox") && msg.contains("codex"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_gemini_max_turns_rejected() {
+        let err = ParsedCommand::parse(": gemini --max-turns 5 hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("--max-turns") && msg.contains("claude"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_add_dir_accepted() {
+        // --add-dir is shared between claude and codex; both must accept.
+        let cmd = ParsedCommand::parse(": codex --add-dir /tmp/a hi", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt { options, .. } => {
+                assert_eq!(options.add_dirs.len(), 1);
+                assert_eq!(options.add_dirs[0], PathBuf::from("/tmp/a"));
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_gemini_add_dir_rejected() {
+        // gemini does not accept --add-dir.
+        let err = ParsedCommand::parse(": gemini --add-dir /tmp/a hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(msg.contains("--add-dir"), "got: {}", msg);
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
     #[test]
     fn parse_codex_blocked_subcommands_all_rejected() {
+        // F6+F7 update: `cloud`, `apply`, and `sessions` are NO LONGER on the
+        // blocked list — `cloud <sub>` (with a recognized sub), `apply <id>`,
+        // and bare `sessions` are now routed to HarnessSubcommand. Bare
+        // `cloud` (with no recognized sub) still returns a chat-safe error
+        // pointing at the valid forms; verified separately below.
         let blocked = [
             "login",
             "logout",
@@ -3580,12 +4131,9 @@ mod tests {
             "features",
             "debug",
             "sandbox",
-            "cloud",
-            "apply",
             "review",
             "resume",
             "fork",
-            "sessions",
         ];
         for kw in &blocked {
             let input = format!(": codex {}", kw);
@@ -3637,17 +4185,259 @@ mod tests {
     }
 
     #[test]
-    fn parse_codex_cloud_returns_v1_1_deferral_message() {
-        let err = ParsedCommand::parse(": codex cloud something", ':').unwrap_err();
+    fn parse_codex_bare_cloud_lists_safe_forms() {
+        // Bare `: codex cloud` (no recognized sub) returns the form listing —
+        // it's a discoverable error rather than a v1.1 deferral now.
+        let err = ParsedCommand::parse(": codex cloud", ':').unwrap_err();
         match err {
             ParseError::InvalidHarnessOption(msg) => {
                 assert!(
-                    msg.contains("v1.1"),
-                    "expected v1.1-deferral message; got: {}",
+                    msg.contains("cloud list")
+                        && msg.contains("cloud status")
+                        && msg.contains("cloud exec"),
+                    "expected listing of safe cloud forms; got: {}",
                     msg
                 );
             }
             other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_unknown_cloud_sub_returns_listing() {
+        // Unknown second word under `cloud` falls through to bare-cloud guidance.
+        let err = ParsedCommand::parse(": codex cloud bananas", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("cloud list") && msg.contains("cloud exec"),
+                    "expected cloud-form listing; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_sessions_routes_to_subcommand() {
+        match ParsedCommand::parse(": codex sessions", ':').unwrap() {
+            ParsedCommand::HarnessSubcommand {
+                harness,
+                subcommand,
+                args,
+            } => {
+                assert_eq!(harness, HarnessKind::Codex);
+                assert_eq!(
+                    subcommand,
+                    HarnessSubcommandKind::Codex(CodexSubcommand::Sessions)
+                );
+                assert!(args.is_empty());
+            }
+            other => panic!("expected HarnessSubcommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_apply_with_task_id_routes_to_subcommand() {
+        match ParsedCommand::parse(": codex apply task_abc123", ':').unwrap() {
+            ParsedCommand::HarnessSubcommand {
+                harness,
+                subcommand,
+                args,
+            } => {
+                assert_eq!(harness, HarnessKind::Codex);
+                assert_eq!(
+                    subcommand,
+                    HarnessSubcommandKind::Codex(CodexSubcommand::Apply)
+                );
+                assert_eq!(args, vec!["task_abc123".to_string()]);
+            }
+            other => panic!("expected HarnessSubcommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_apply_without_task_id_rejected() {
+        let err = ParsedCommand::parse(": codex apply", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("requires a task id") && msg.contains("codex apply"),
+                    "expected task-id-required error; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_cloud_list_routes_with_no_args() {
+        match ParsedCommand::parse(": codex cloud list", ':').unwrap() {
+            ParsedCommand::HarnessSubcommand {
+                harness,
+                subcommand,
+                args,
+            } => {
+                assert_eq!(harness, HarnessKind::Codex);
+                assert_eq!(
+                    subcommand,
+                    HarnessSubcommandKind::Codex(CodexSubcommand::Cloud(
+                        CodexCloudSubcommand::List
+                    ))
+                );
+                assert!(args.is_empty());
+            }
+            other => panic!("expected HarnessSubcommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_cloud_list_with_limit_passes_args() {
+        match ParsedCommand::parse(": codex cloud list --limit 5", ':').unwrap() {
+            ParsedCommand::HarnessSubcommand {
+                subcommand, args, ..
+            } => {
+                assert_eq!(
+                    subcommand,
+                    HarnessSubcommandKind::Codex(CodexSubcommand::Cloud(
+                        CodexCloudSubcommand::List
+                    ))
+                );
+                assert_eq!(args, vec!["--limit".to_string(), "5".to_string()]);
+            }
+            other => panic!("expected HarnessSubcommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_cloud_status_with_id() {
+        match ParsedCommand::parse(": codex cloud status task_xyz", ':').unwrap() {
+            ParsedCommand::HarnessSubcommand {
+                subcommand, args, ..
+            } => {
+                assert_eq!(
+                    subcommand,
+                    HarnessSubcommandKind::Codex(CodexSubcommand::Cloud(
+                        CodexCloudSubcommand::Status
+                    ))
+                );
+                assert_eq!(args, vec!["task_xyz".to_string()]);
+            }
+            other => panic!("expected HarnessSubcommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_cloud_status_without_id_rejected() {
+        let err = ParsedCommand::parse(": codex cloud status", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("requires a task id") && msg.contains("cloud status"),
+                    "expected task-id-required error; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_cloud_diff_without_id_rejected() {
+        let err = ParsedCommand::parse(": codex cloud diff", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("requires a task id") && msg.contains("cloud diff"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_cloud_apply_routes_with_id() {
+        match ParsedCommand::parse(": codex cloud apply task_qq", ':').unwrap() {
+            ParsedCommand::HarnessSubcommand {
+                subcommand, args, ..
+            } => {
+                assert_eq!(
+                    subcommand,
+                    HarnessSubcommandKind::Codex(CodexSubcommand::Cloud(
+                        CodexCloudSubcommand::Apply
+                    ))
+                );
+                assert_eq!(args, vec!["task_qq".to_string()]);
+            }
+            other => panic!("expected HarnessSubcommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_cloud_exec_passes_full_args() {
+        // `cloud exec` requires --env upstream; we let codex surface the usage error
+        // rather than gatekeeping. Multi-word query is preserved as separate tokens.
+        match ParsedCommand::parse(": codex cloud exec --env env_main fix the auth bug", ':')
+            .unwrap()
+        {
+            ParsedCommand::HarnessSubcommand {
+                subcommand, args, ..
+            } => {
+                assert_eq!(
+                    subcommand,
+                    HarnessSubcommandKind::Codex(CodexSubcommand::Cloud(
+                        CodexCloudSubcommand::Exec
+                    ))
+                );
+                assert_eq!(
+                    args,
+                    vec![
+                        "--env".to_string(),
+                        "env_main".to_string(),
+                        "fix".to_string(),
+                        "the".to_string(),
+                        "auth".to_string(),
+                        "bug".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected HarnessSubcommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_codex_cloud_exec_without_env_routes_to_codex() {
+        // Intentional design: `--env` validation is delegated to the codex CLI
+        // (which knows the valid set of environment IDs). Terminus routes the
+        // call through and lets codex surface the missing-flag usage error so
+        // the user sees codex's authoritative wording. This test pins that
+        // permissive behavior so a future "tighten parser" pass doesn't
+        // regress it without acknowledging the design call.
+        match ParsedCommand::parse(": codex cloud exec fix the auth bug", ':').unwrap() {
+            ParsedCommand::HarnessSubcommand {
+                subcommand, args, ..
+            } => {
+                assert_eq!(
+                    subcommand,
+                    HarnessSubcommandKind::Codex(CodexSubcommand::Cloud(
+                        CodexCloudSubcommand::Exec
+                    ))
+                );
+                assert_eq!(
+                    args,
+                    vec![
+                        "fix".to_string(),
+                        "the".to_string(),
+                        "auth".to_string(),
+                        "bug".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected HarnessSubcommand, got {:?}", other),
         }
     }
 
@@ -3707,7 +4497,14 @@ mod tests {
                 harness, options, ..
             } => {
                 assert_eq!(harness, HarnessKind::Codex);
-                assert_eq!(options.sandbox.as_deref(), Some("read-only"));
+                assert_eq!(
+                    options
+                        .codex_extras()
+                        .expect("codex extras")
+                        .sandbox
+                        .as_deref(),
+                    Some("read-only")
+                );
                 assert_eq!(options.name.as_deref(), Some("review"));
             }
             other => panic!("expected HarnessOn, got {:?}", other),
@@ -3725,8 +4522,10 @@ mod tests {
     #[test]
     fn harness_options_summary_includes_sandbox_and_profile() {
         let opts = HarnessOptions {
-            sandbox: Some("workspace-write".into()),
-            profile: Some("dev".into()),
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                sandbox: Some("workspace-write".into()),
+                profile: Some("dev".into()),
+            })),
             ..Default::default()
         };
         let summary = opts.summary();
@@ -3741,7 +4540,10 @@ mod tests {
     #[test]
     fn harness_options_is_empty_false_when_sandbox_set() {
         let opts = HarnessOptions {
-            sandbox: Some("read-only".into()),
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                sandbox: Some("read-only".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         assert!(!opts.is_empty());
@@ -3750,7 +4552,10 @@ mod tests {
     #[test]
     fn harness_options_is_empty_false_when_profile_set() {
         let opts = HarnessOptions {
-            profile: Some("dev".into()),
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                profile: Some("dev".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         assert!(!opts.is_empty());
@@ -3773,8 +4578,22 @@ mod tests {
                 prompt,
             } => {
                 assert_eq!(harness, HarnessKind::Codex);
-                assert_eq!(options.sandbox.as_deref(), Some("read-only"));
-                assert_eq!(options.profile.as_deref(), Some("dev"));
+                assert_eq!(
+                    options
+                        .codex_extras()
+                        .expect("codex extras")
+                        .sandbox
+                        .as_deref(),
+                    Some("read-only")
+                );
+                assert_eq!(
+                    options
+                        .codex_extras()
+                        .expect("codex extras")
+                        .profile
+                        .as_deref(),
+                    Some("dev")
+                );
                 assert_eq!(options.model.as_deref(), Some("gpt-5.4"));
                 assert_eq!(prompt, "fix the bug");
             }
@@ -3787,7 +4606,14 @@ mod tests {
         let cmd = ParsedCommand::parse(": codex --sandbox=workspace-write hi", ':').unwrap();
         match cmd {
             ParsedCommand::HarnessPrompt { options, .. } => {
-                assert_eq!(options.sandbox.as_deref(), Some("workspace-write"));
+                assert_eq!(
+                    options
+                        .codex_extras()
+                        .expect("codex extras")
+                        .sandbox
+                        .as_deref(),
+                    Some("workspace-write")
+                );
             }
             other => panic!("expected HarnessPrompt, got {:?}", other),
         }
@@ -3798,7 +4624,14 @@ mod tests {
         let cmd = ParsedCommand::parse(": codex --profile=mydev hi", ':').unwrap();
         match cmd {
             ParsedCommand::HarnessPrompt { options, .. } => {
-                assert_eq!(options.profile.as_deref(), Some("mydev"));
+                assert_eq!(
+                    options
+                        .codex_extras()
+                        .expect("codex extras")
+                        .profile
+                        .as_deref(),
+                    Some("mydev")
+                );
             }
             other => panic!("expected HarnessPrompt, got {:?}", other),
         }

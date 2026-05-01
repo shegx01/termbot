@@ -37,6 +37,8 @@
 
 use super::{Harness, HarnessEvent, HarnessKind, ToolPairingBuffer};
 use crate::chat_adapters::Attachment;
+#[cfg(test)]
+use crate::command::{GeminiExtras, HarnessExtras};
 use crate::command::{GeminiSubcommand, HarnessOptions};
 use crate::config::GeminiConfig;
 use crate::socket::events::AmbientEvent;
@@ -428,9 +430,9 @@ fn build_argv(
     }
 
     // Approval mode: per-prompt options take precedence over static config.
-    let effective_approval = options
-        .approval_mode
-        .as_ref()
+    let gemini_e = options.gemini_extras();
+    let effective_approval = gemini_e
+        .and_then(|g| g.approval_mode.as_ref())
         .or(config.approval_mode.as_ref());
     if let Some(a) = effective_approval {
         args.push("--approval-mode".into());
@@ -1722,7 +1724,9 @@ mod tests {
     #[test]
     fn argv_approval_mode_option_overrides_config() {
         let opts = HarnessOptions {
-            approval_mode: Some("plan".into()),
+            extras: Some(HarnessExtras::Gemini(GeminiExtras {
+                approval_mode: Some("plan".into()),
+            })),
             ..Default::default()
         };
         let cfg = GeminiConfig {

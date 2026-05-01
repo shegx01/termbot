@@ -42,7 +42,9 @@
 
 use super::{Harness, HarnessEvent, HarnessKind, ToolPairingBuffer};
 use crate::chat_adapters::Attachment;
-use crate::command::HarnessOptions;
+use crate::command::{CodexCloudSubcommand, CodexSubcommand, HarnessOptions};
+#[cfg(test)]
+use crate::command::{CodexExtras, HarnessExtras};
 use crate::config::CodexConfig;
 use crate::socket::events::AmbientEvent;
 use anyhow::Result;
@@ -106,6 +108,229 @@ impl CodexHarness {
         self.schema_registry = registry;
         self
     }
+
+    /// Spawn a chat-safe codex subcommand (`sessions` / `apply <id>` /
+    /// `cloud <sub>`) and stream the captured stdout back as a single
+    /// fenced-code Text event followed by Done. Mirrors
+    /// [`OpencodeHarness::run_subcommand`] / [`GeminiHarness::run_subcommand`]:
+    /// emits exactly one of `Text(fenced_stdout) + Done` or `Error(msg) + Done`.
+    /// No ambient events; subcommands are not AI runs and don't carry session
+    /// state. Bounded by a 30s timeout; output is truncated at 3000 chars
+    /// inside the fenced block to keep chat responses bounded.
+    pub async fn run_subcommand(
+        &self,
+        sub: CodexSubcommand,
+        args: Vec<String>,
+    ) -> Result<mpsc::Receiver<HarnessEvent>> {
+        let (event_tx, event_rx) = mpsc::channel::<HarnessEvent>(32);
+        let binary = self
+            .config
+            .binary_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("codex"));
+
+        let argv = build_subcommand_argv(&sub, &args);
+        tokio::spawn(async move {
+            let body = run_subcommand_inner(binary, argv, sub, args, event_tx.clone());
+            let result = AssertUnwindSafe(body).catch_unwind().await;
+            if let Err(panic_info) = result {
+                let msg = format_panic_message(&*panic_info);
+                let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
+            }
+        });
+        Ok(event_rx)
+    }
+}
+
+/// Pure function: build the argv for a chat-safe codex subcommand.
+///
+/// - `sessions` → `resume --all` (read-only listing of saved sessions)
+/// - `apply` / `cloud apply` → `apply <task_id>` / `cloud apply <task_id>`
+/// - `cloud {list|status|diff|exec}` → `cloud <sub> …`
+fn build_subcommand_argv(sub: &CodexSubcommand, extra_args: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = match sub {
+        CodexSubcommand::Sessions => vec!["resume".into(), "--all".into()],
+        CodexSubcommand::Apply => vec!["apply".into()],
+        CodexSubcommand::Cloud(c) => match c {
+            CodexCloudSubcommand::List => vec!["cloud".into(), "list".into()],
+            CodexCloudSubcommand::Status => vec!["cloud".into(), "status".into()],
+            CodexCloudSubcommand::Diff => vec!["cloud".into(), "diff".into()],
+            CodexCloudSubcommand::Apply => vec!["cloud".into(), "apply".into()],
+            CodexCloudSubcommand::Exec => vec!["cloud".into(), "exec".into()],
+        },
+    };
+    argv.extend(extra_args.iter().cloned());
+    argv
+}
+
+fn sub_display_name(sub: &CodexSubcommand) -> &'static str {
+    match sub {
+        CodexSubcommand::Sessions => "sessions",
+        CodexSubcommand::Apply => "apply",
+        CodexSubcommand::Cloud(c) => match c {
+            CodexCloudSubcommand::List => "cloud list",
+            CodexCloudSubcommand::Status => "cloud status",
+            CodexCloudSubcommand::Diff => "cloud diff",
+            CodexCloudSubcommand::Apply => "cloud apply",
+            CodexCloudSubcommand::Exec => "cloud exec",
+        },
+    }
+}
+
+/// Async inner body: spawn child, wait for output, emit Text + Done (or
+/// Error + Done). Bounded by a 30s timeout. Stdout is truncated at 3000
+/// chars inside the fenced block to keep chat responses bounded. Emits
+/// Done unconditionally before returning so receivers don't hang.
+async fn run_subcommand_inner(
+    binary: PathBuf,
+    argv: Vec<String>,
+    sub: CodexSubcommand,
+    extra_args: Vec<String>,
+    event_tx: mpsc::Sender<HarnessEvent>,
+) {
+    let sub_label = sub_display_name(&sub);
+
+    let mut cmd = Command::new(&binary);
+    cmd.args(&argv)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "codex binary not found: {} (set [harness.codex] binary_path or install codex on PATH)",
+                    binary.display()
+                )
+            } else {
+                format!("codex {} spawn failed: {}", sub_label, e)
+            };
+            let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let out =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+            .await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                let _ = event_tx
+                    .send(HarnessEvent::Error(format!(
+                        "codex {} wait failed: {}",
+                        sub_label, e
+                    )))
+                    .await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
+                return;
+            }
+            Err(_) => {
+                let _ = event_tx
+                    .send(HarnessEvent::Error(format!(
+                        "codex {} timed out after 30s",
+                        sub_label
+                    )))
+                    .await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    if !out.status.success() {
+        let raw_stderr = if out.stderr.len() > 64 * 1024 {
+            &out.stderr[..64 * 1024]
+        } else {
+            &out.stderr
+        };
+        let stderr_trim = String::from_utf8_lossy(raw_stderr).trim().to_string();
+        let code = out
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into());
+        let sanitized = sanitize_stderr(&stderr_trim);
+        // Log the sanitized stderr (env-vars and absolute user paths redacted)
+        // rather than the raw form so `RUST_LOG=debug` captures don't leak
+        // secrets into shared log aggregators. (Security review LOW-1.)
+        tracing::debug!(
+            "codex {} non-zero exit; sanitized stderr: {}",
+            sub_label,
+            sanitized
+        );
+        let detail = if sanitized.is_empty() {
+            format!(
+                "codex {} exited with status {} (no stderr)",
+                sub_label, code
+            )
+        } else {
+            format!(
+                "codex {} exited with status {}: {}",
+                sub_label, code, sanitized
+            )
+        };
+        let _ = event_tx.send(HarnessEvent::Error(detail)).await;
+        let _ = event_tx
+            .send(HarnessEvent::Done {
+                session_id: String::new(),
+            })
+            .await;
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stripped = stdout.trim();
+
+    let message = if stripped.is_empty() {
+        let arg_summary = if extra_args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", extra_args.join(" "))
+        };
+        format!("codex {}{}: no output", sub_label, arg_summary)
+    } else {
+        // Truncate at 3000 chars for chat-friendliness, mirroring opencode.
+        const MAX_CHARS: usize = 3000;
+        let body = if stripped.chars().count() > MAX_CHARS {
+            let truncated: String = stripped.chars().take(MAX_CHARS).collect();
+            format!(
+                "{}\n…[truncated; run from terminal for full output]",
+                truncated
+            )
+        } else {
+            stripped.to_string()
+        };
+        format!("```\n{}\n```", body)
+    };
+
+    let _ = event_tx.send(HarnessEvent::Text(message)).await;
+    let _ = event_tx
+        .send(HarnessEvent::Done {
+            session_id: String::new(),
+        })
+        .await;
 }
 
 #[async_trait]
@@ -323,7 +548,10 @@ fn build_argv(
     // log on invalid values so codex gets a clean argv (and falls back to its
     // own default).
     const VALID_SANDBOX: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
-    let effective_sandbox = options.sandbox.as_ref().or(config.sandbox.as_ref());
+    let codex_e = options.codex_extras();
+    let effective_sandbox = codex_e
+        .and_then(|c| c.sandbox.as_ref())
+        .or(config.sandbox.as_ref());
     if let Some(s) = effective_sandbox {
         if VALID_SANDBOX.contains(&s.as_str()) {
             args.push("-s".into());
@@ -344,7 +572,9 @@ fn build_argv(
     }
 
     // Profile: per-prompt > config > codex default.
-    let effective_profile = options.profile.as_ref().or(config.profile.as_ref());
+    let effective_profile = codex_e
+        .and_then(|c| c.profile.as_ref())
+        .or(config.profile.as_ref());
     if let Some(p) = effective_profile {
         args.push("-p".into());
         args.push(p.clone());
@@ -1292,7 +1522,10 @@ mod tests {
     #[test]
     fn argv_sandbox_flag_when_set() {
         let opts = HarnessOptions {
-            sandbox: Some("read-only".into()),
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                sandbox: Some("read-only".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let args = build_argv("hi", None, &opts, &CodexConfig::default(), &[], None);
@@ -1303,7 +1536,10 @@ mod tests {
     #[test]
     fn argv_sandbox_per_prompt_overrides_config() {
         let opts = HarnessOptions {
-            sandbox: Some("danger-full-access".into()),
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                sandbox: Some("danger-full-access".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let cfg = CodexConfig {
@@ -1329,7 +1565,10 @@ mod tests {
     #[test]
     fn argv_profile_flag_when_set() {
         let opts = HarnessOptions {
-            profile: Some("dev".into()),
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                profile: Some("dev".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let args = build_argv("hi", None, &opts, &CodexConfig::default(), &[], None);
@@ -1972,10 +2211,12 @@ mod tests {
         let p1 = PathBuf::from("/tmp/a.png");
         let p2 = PathBuf::from("/tmp/schema.json");
         let opts = HarnessOptions {
-            sandbox: Some("read-only".into()),
-            profile: Some("dev".into()),
             model: Some("gpt-5.4".into()),
             add_dirs: vec![PathBuf::from("/tmp/lib")],
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                sandbox: Some("read-only".into()),
+                profile: Some("dev".into()),
+            })),
             ..Default::default()
         };
         let cfg = CodexConfig {
@@ -2081,7 +2322,10 @@ mod tests {
         // somehow an invalid value reaches build_argv via options (bypassing
         // the parser), it should also be dropped — defense in depth.
         let opts = HarnessOptions {
-            sandbox: Some("not-a-real-policy".into()),
+            extras: Some(HarnessExtras::Codex(CodexExtras {
+                sandbox: Some("not-a-real-policy".into()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let args = build_argv("hi", None, &opts, &CodexConfig::default(), &[], None);
@@ -2499,6 +2743,153 @@ mod tests {
             out.is_empty(),
             "agent_message item.started must be dropped; got {:?}",
             out
+        );
+    }
+
+    // ── chat-safe subcommand passthrough (F6 + F7) ──────────────────────────
+
+    #[test]
+    fn build_subcommand_argv_sessions_uses_resume_all() {
+        let argv = build_subcommand_argv(&CodexSubcommand::Sessions, &[]);
+        assert_eq!(argv, vec!["resume".to_string(), "--all".to_string()]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_apply_threads_task_id() {
+        let argv = build_subcommand_argv(&CodexSubcommand::Apply, &["task_abc123".to_string()]);
+        assert_eq!(argv, vec!["apply".to_string(), "task_abc123".to_string()]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_cloud_list_no_args() {
+        let argv = build_subcommand_argv(&CodexSubcommand::Cloud(CodexCloudSubcommand::List), &[]);
+        assert_eq!(argv, vec!["cloud".to_string(), "list".to_string()]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_cloud_status_with_id() {
+        let argv = build_subcommand_argv(
+            &CodexSubcommand::Cloud(CodexCloudSubcommand::Status),
+            &["task_xyz".to_string()],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "cloud".to_string(),
+                "status".to_string(),
+                "task_xyz".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn build_subcommand_argv_cloud_diff_with_id() {
+        let argv = build_subcommand_argv(
+            &CodexSubcommand::Cloud(CodexCloudSubcommand::Diff),
+            &["task_qq".to_string()],
+        );
+        assert_eq!(argv[0], "cloud");
+        assert_eq!(argv[1], "diff");
+        assert_eq!(argv[2], "task_qq");
+    }
+
+    #[test]
+    fn build_subcommand_argv_cloud_apply_with_id() {
+        let argv = build_subcommand_argv(
+            &CodexSubcommand::Cloud(CodexCloudSubcommand::Apply),
+            &["task_q".to_string()],
+        );
+        assert_eq!(argv, vec!["cloud", "apply", "task_q"]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_cloud_exec_threads_full_args() {
+        let argv = build_subcommand_argv(
+            &CodexSubcommand::Cloud(CodexCloudSubcommand::Exec),
+            &[
+                "--env".into(),
+                "env_main".into(),
+                "fix".into(),
+                "auth".into(),
+            ],
+        );
+        assert_eq!(argv[0], "cloud");
+        assert_eq!(argv[1], "exec");
+        assert_eq!(argv[2], "--env");
+        assert_eq!(argv[3], "env_main");
+        assert_eq!(argv[4], "fix");
+        assert_eq!(argv[5], "auth");
+    }
+
+    #[test]
+    fn sub_display_name_covers_all_variants() {
+        // Defends against a future enum-variant addition that forgets to
+        // extend sub_display_name. Uses string equality (not the enum) so
+        // that the chat-facing labels are pinned.
+        assert_eq!(sub_display_name(&CodexSubcommand::Sessions), "sessions");
+        assert_eq!(sub_display_name(&CodexSubcommand::Apply), "apply");
+        assert_eq!(
+            sub_display_name(&CodexSubcommand::Cloud(CodexCloudSubcommand::List)),
+            "cloud list"
+        );
+        assert_eq!(
+            sub_display_name(&CodexSubcommand::Cloud(CodexCloudSubcommand::Status)),
+            "cloud status"
+        );
+        assert_eq!(
+            sub_display_name(&CodexSubcommand::Cloud(CodexCloudSubcommand::Diff)),
+            "cloud diff"
+        );
+        assert_eq!(
+            sub_display_name(&CodexSubcommand::Cloud(CodexCloudSubcommand::Apply)),
+            "cloud apply"
+        );
+        assert_eq!(
+            sub_display_name(&CodexSubcommand::Cloud(CodexCloudSubcommand::Exec)),
+            "cloud exec"
+        );
+    }
+
+    /// Mirror of `gemini.rs::run_subcommand_emits_done_after_panic`: when the
+    /// subprocess body panics the spawned task must still emit a terminal Done
+    /// after the Error so the receiver doesn't hang. We force a panic by
+    /// pointing the binary at a missing path: that itself doesn't panic, but it
+    /// does exercise the spawn-failure path which also produces Error+Done.
+    #[tokio::test]
+    async fn run_subcommand_spawn_failure_emits_error_then_done() {
+        let cfg = CodexConfig {
+            binary_path: Some(PathBuf::from("/var/empty/definitely-not-codex-binary")),
+            ..Default::default()
+        };
+        let h = CodexHarness::new_with_config(cfg);
+        let mut rx = h
+            .run_subcommand(CodexSubcommand::Sessions, vec![])
+            .await
+            .expect("run_subcommand returns receiver");
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert_eq!(
+            events.len(),
+            2,
+            "expected exactly Error+Done; got {:?}",
+            events
+        );
+        match &events[0] {
+            HarnessEvent::Error(msg) => {
+                assert!(
+                    msg.contains("codex binary not found") || msg.contains("spawn failed"),
+                    "unexpected error message: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Error first, got {:?}", other),
+        }
+        assert!(
+            matches!(events[1], HarnessEvent::Done { .. }),
+            "expected Done last, got {:?}",
+            events[1]
         );
     }
 }

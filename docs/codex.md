@@ -27,7 +27,7 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 | **Invocation** |||
 | One-shot (`: codex <prompt>`) | Working | Non-interactive; each prompt spawns a fresh `codex exec --json` subprocess |
 | Interactive toggle (`: codex on` / `: codex off`) | Working | Plain text routes to codex between the two toggles |
-| Codex subcommand passthrough (`: codex sessions` / `resume` / `cloud` etc.) | Not shipped | All codex 0.125.0 native subcommands are blocked at the parser; revisit in v1.1 once `cloud`/`apply` lifecycle is designed |
+| Codex subcommand passthrough (`: codex sessions` / `apply` / `cloud {list,status,diff,apply,exec}`) | Working | F6+F7: chat-safe single-shot subprocess; 30s timeout, 3000-char truncated. See [Chat-safe subcommands](#chat-safe-subcommands). Other native subcommands (`login`, `mcp`, `resume`, `fork`, `app`, …) remain blocked |
 | **Per-prompt flags** |||
 | `--name <x>` (create-or-resume) | Working | Upsert; internally prefixed `codex:<x>` in the session index |
 | `--resume <x>` / `--continue <x>` (strict resume) | Working | Errors if the named session isn't in the index |
@@ -143,18 +143,32 @@ All flags work in both one-shot (`: codex --name foo <prompt>`) and on-toggle (`
 
 ---
 
+## Chat-safe subcommands
+
+The following codex 0.125.0 subcommands are exposed in chat. Each is a single-shot subprocess (30s timeout, output truncated at 3000 chars inside a fenced code block):
+
+| Chat invocation | Codex CLI mapping | Notes |
+|---|---|---|
+| `: codex sessions` | `codex resume --all` | Read-only listing of saved sessions for this project. |
+| `: codex apply <task_id>` | `codex apply <task_id>` | Top-level shortcut: applies a Codex Cloud task diff to the working tree as `git apply`. |
+| `: codex cloud list` | `codex cloud list` | List Codex Cloud tasks. Extra args (`--limit N`, `--cursor X`, `--env <id>`) are forwarded. |
+| `: codex cloud status <task_id>` | `codex cloud status <task_id>` | Show task status. |
+| `: codex cloud diff <task_id>` | `codex cloud diff <task_id>` | Show the unified diff for a task. |
+| `: codex cloud apply <task_id>` | `codex cloud apply <task_id>` | Apply task diff locally. |
+| `: codex cloud exec --env <env_id> <query>` | `codex cloud exec --env <env_id> <query>` | Submit a new cloud task. `--env` is required upstream; codex surfaces the usage error if omitted. |
+
+Bare `: codex cloud` (no recognized sub-word) returns a help message listing the valid forms above.
+
 ## Blocked subcommands
 
-Codex 0.125.0 ships many top-level subcommands. Only `exec` (the prompt entrypoint) is wired into terminus. Every other subcommand returns a chat-safe error so users can't accidentally invoke an interactive surface from chat.
+Every other codex 0.125.0 subcommand returns a chat-safe error so users can't accidentally invoke an interactive surface from chat:
 
 | Subcommand | Chat-safe error |
 |---|---|
 | `login` / `logout` | "codex auth must be run from your terminal" |
 | `mcp` / `mcp-server` | "MCP management is not exposed to chat; run from terminal" |
 | `app` / `app-server` / `exec-server` | "codex desktop/server modes are not exposed to chat" |
-| `cloud` / `apply` | "cloud surface deferred to v1.1; run from terminal" |
 | `resume` (bare subcommand) | "use `: codex --resume <name>` for named-session resume; the bare `resume` subcommand is not exposed to chat in v1" |
-| `sessions` | "session listing is not exposed to chat in v1; run `codex exec resume --all` from your terminal" |
 | `fork` | "session forking is not exposed to chat in v1" |
 | `plugin` / `completion` / `features` / `debug` / `sandbox` / `review` | "not exposed to chat in v1; run from terminal" |
 
@@ -312,8 +326,9 @@ The codex harness has 44 deterministic unit tests + 20 command-parser tests, non
 
 ## Known limitations
 
-- **Cloud surface deferred to v1.1.** `codex cloud` and `codex apply` are blocked at the parser; the long-running, two-step submit-then-apply lifecycle doesn't fit terminus's short-lived-subprocess pattern. Revisit once a cloud lifecycle design is spec'd.
-- **No subcommand passthrough in v1.** `: codex sessions` (list), `: codex resume` (interactive picker), `: codex models` (list) are all blocked. Named-session resume still works via the `--resume <name>` flag, which is independent of codex's `resume` subcommand.
+- **Cloud surface is single-shot only.** `: codex cloud {list,status,diff,apply,exec}` and `: codex apply <task_id>` are wired (F7) — each maps to one short-lived subprocess. The submit-then-apply lifecycle is two independent CLI calls; terminus does not retain task state between them. Use `: codex cloud list` / `cloud status <task_id>` to track tasks.
+- **`cloud exec` timeout caveat.** All chat-safe codex subcommands share a 30s wall-clock timeout. `cloud exec` submits a task to a remote environment and the network round-trip can occasionally approach that bound. If `cloud exec` returns "timed out after 30s", the task's submission status is **unknown** — the request may have reached the cloud successfully even though terminus didn't see the task ID. Confirm with `: codex cloud list` before re-submitting; rerunning a successful submission will create a duplicate task.
+- **Interactive subcommands stay blocked.** `: codex resume` (picker UI), `: codex fork` (picker UI), `: codex review` (interactive review flow), `: codex models` (no top-level surface in 0.125.0) — all blocked at the parser. Named-session resume still works via the `--resume <name>` flag, independent of codex's `resume` subcommand.
 - **`reasoning` items dropped silently.** When codex emits `item.completed { type: "reasoning" }`, terminus drops it without surfacing to chat. Surfacing reasoning would create noisy chat output; revisit if users ask.
 - **Token usage from `turn.completed.usage` not surfaced to chat.** Parity with gemini, where `result` event stats are also unsurfaced today.
 - **Image-only attachment whitelist.** `image/png`, `image/jpeg`, `image/jpg`, `image/webp` only. HEIC, PDF, video, etc. are rejected with chat-safe errors. Multimodal expansion deferred.

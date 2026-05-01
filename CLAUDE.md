@@ -290,11 +290,16 @@ Optional `[harness.codex]` overrides (see `terminus.example.toml`):
   it skips `~/.codex/config.toml` entirely (defense-in-depth against future
   profile fields re-introducing approval prompts)
 
-**Subcommands blocked from chat** (chat-safe errors returned; run in terminal):
+**Supported subcommands from chat:** `sessions` (→ `codex resume --all`),
+`apply <task_id>` (→ `codex apply <task_id>`), `cloud {list,status,diff,apply,exec}`
+(→ `codex cloud <sub>`). Each is a single-shot subprocess (30s timeout, output
+truncated at 3000 chars inside a fenced code block). Full reference:
+[docs/codex.md](docs/codex.md).
+
+**Blocked from chat** (chat-safe errors returned; run in terminal):
 `login`, `logout`, `mcp`, `mcp-server`, `app`, `app-server`, `exec-server`,
 `plugin`, `completion`, `features`, `debug`, `sandbox` (the subcommand form),
-`cloud`, `apply`, `resume` (use `--resume <name>` flag instead), `fork`,
-`sessions`, `review`. Full reference: [docs/codex.md](docs/codex.md).
+`resume` (use `--resume <name>` flag instead), `fork`, `review`.
 
 **Per-prompt flags** (`: codex [flags] <prompt>`):
 - `--name <x>` / `--resume <x>` / `--continue <x>` — named session
@@ -310,12 +315,13 @@ Full flag semantics, event schema, error table, and functionality matrix:
 [docs/codex.md](docs/codex.md).
 
 **Known limitations (codex-specific):**
-- Cloud surface (`codex cloud` / `codex apply`) deferred to v1.1; blocked at
-  the parser. Long-running, two-step submit-then-apply lifecycle doesn't fit
-  terminus's short-lived-subprocess pattern.
-- No chat-safe subcommand passthrough in v1 (`sessions`, `resume`, `models`
-  all blocked). Named-session resume still works via the `--resume <name>`
-  flag, independent of codex's `resume` subcommand.
+- Cloud surface is single-shot only. The submit-then-apply lifecycle is two
+  independent CLI calls; terminus does not retain task state between them
+  (use `: codex cloud list` / `cloud status <task_id>` to track tasks).
+- Interactive subcommands stay blocked: `: codex resume` / `fork` / `review`
+  all use a picker UI that can't be driven from chat. `: codex models` has no
+  top-level surface in 0.125.0. Named-session resume still works via the
+  `--resume <name>` flag, independent of codex's `resume` subcommand.
 - `reasoning` items are dropped silently.
 - Token usage from `turn.completed.usage` not surfaced to chat (parity with
   gemini).
