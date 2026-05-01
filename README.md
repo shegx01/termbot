@@ -1069,28 +1069,37 @@ Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. termin
 
 ## Configuration reference
 
+Override the config file path with `TERMINUS_CONFIG=/path/to/file.toml`.
+
+### Telegram
+
 | Key | Type | Description |
 |-----|------|-------------|
 | `auth.telegram_user_id` | integer | Your Telegram numeric user ID |
-| `auth.slack_user_id` | string | Your Slack member ID |
-| `auth.discord_user_id` | integer | Your Discord user snowflake |
 | `telegram.bot_token` | string | Telegram Bot API token |
+
+### Slack
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `auth.slack_user_id` | string | Your Slack member ID |
 | `slack.bot_token` | string | Slack bot token (`xoxb-`) |
 | `slack.app_token` | string | Slack app token for Socket Mode (`xapp-`) |
 | `slack.channel_id` | string | Slack channel to operate in |
+
+### Discord
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `auth.discord_user_id` | integer | Your Discord user snowflake |
 | `discord.bot_token` | string | Discord bot token |
 | `discord.guild_id` | integer | Discord server snowflake (optional; omit for DM-only) |
 | `discord.channel_id` | integer | Discord channel snowflake (optional; requires `guild_id`) |
-| `blocklist.patterns` | string[] | Regex patterns to block |
-| `streaming.edit_throttle_ms` | integer | Min ms between message edits (default: 2000) |
-| `streaming.poll_interval_ms` | integer | Terminal output poll interval (default: 250) |
-| `streaming.chunk_size` | integer | Max chars per message (default: 4000) |
-| `streaming.offline_buffer_max_bytes` | integer | Max offline buffer (default: 1048576) |
-| `streaming.max_sessions` | integer | Max concurrent terminal sessions (default: 10) |
-| `commands.trigger` | char | Command prefix character (default: `:`). Must be one of `: ! > ; . , @ ~ ^ - + = \| % ?` |
-| `power.enabled` | bool | Enable the power-management subsystem (default: true). Set false for CI / headless |
-| `power.stayawake_on_battery` | bool | Prevent idle sleep on battery power too (default: false; AC-only) |
-| `power.state_file` | string | Override for the persisted-state JSON file (default: adjacent to `terminus.toml`) |
+
+### Socket API
+
+| Key | Type | Description |
+|-----|------|-------------|
 | `socket.enabled` | bool | Enable WebSocket API (default: false) |
 | `socket.bind` | string | Bind address (default: `127.0.0.1`; use `0.0.0.0` for containers) |
 | `socket.port` | integer | Listener port (default: 7645) |
@@ -1107,7 +1116,20 @@ Mobile keyboards often replace `"straight quotes"` with `"curly quotes"`. termin
 | `socket.client[].name` | string | Client display name (unique) |
 | `socket.client[].token` | string | Bearer token (min 32 characters) |
 
-Override the config file path with `TERMINUS_CONFIG=/path/to/file.toml`.
+### Shared (all platforms)
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `blocklist.patterns` | string[] | Regex patterns to block |
+| `streaming.edit_throttle_ms` | integer | Min ms between message edits (default: 2000) |
+| `streaming.poll_interval_ms` | integer | Terminal output poll interval (default: 250) |
+| `streaming.chunk_size` | integer | Max chars per message (default: 4000) |
+| `streaming.offline_buffer_max_bytes` | integer | Max offline buffer (default: 1048576) |
+| `streaming.max_sessions` | integer | Max concurrent terminal sessions (default: 10) |
+| `commands.trigger` | char | Command prefix character (default: `:`). Must be one of `: ! > ; . , @ ~ ^ - + = \| % ?` |
+| `power.enabled` | bool | Enable the power-management subsystem (default: true). Set false for CI / headless |
+| `power.stayawake_on_battery` | bool | Prevent idle sleep on battery power too (default: false; AC-only) |
+| `power.state_file` | string | Override for the persisted-state JSON file (default: adjacent to `terminus.toml`) |
 
 ### Sleep/wake behavior
 
