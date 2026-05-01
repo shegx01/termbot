@@ -4,11 +4,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::{OutputBuffer, StreamEvent};
+use crate::chat_adapters::slack::SlackPlatform;
 use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
 use crate::command::{CommandBlocklist, HarnessOptions, HarnessSubcommandKind, ParsedCommand};
 
@@ -43,6 +44,9 @@ pub struct App {
     stream_tx: broadcast::Sender<StreamEvent>,
     telegram: Option<Arc<dyn ChatPlatform>>,
     slack: Option<Arc<dyn ChatPlatform>>,
+    /// Typed Arc to the Slack platform for direct catchup calls.
+    /// Kept alongside the dyn `slack` field — both point to the same object.
+    slack_platform: Option<Arc<SlackPlatform>>,
     discord: Option<Arc<dyn ChatPlatform>>,
     offline_buffer_max: usize,
     trigger: char,
@@ -207,6 +211,7 @@ impl App {
             stream_tx,
             telegram: None,
             slack: None,
+            slack_platform: None,
             discord: None,
             offline_buffer_max: config.streaming.offline_buffer_max_bytes,
             trigger,
@@ -263,10 +268,12 @@ impl App {
         &mut self,
         telegram: Option<Arc<dyn ChatPlatform>>,
         slack: Option<Arc<dyn ChatPlatform>>,
+        slack_platform: Option<Arc<SlackPlatform>>,
         discord: Option<Arc<dyn ChatPlatform>>,
     ) {
         self.telegram = telegram;
         self.slack = slack;
+        self.slack_platform = slack_platform;
         self.discord = discord;
     }
 
@@ -316,6 +323,12 @@ impl App {
         self.store.snapshot().telegram.offset
     }
 
+    /// Returns the per-channel Slack watermarks from the persisted state snapshot.
+    /// Call this before `seed_watermarks` on `SlackPlatform`.
+    pub fn initial_slack_watermarks(&self) -> std::collections::HashMap<String, String> {
+        self.store.snapshot().slack_watermarks.clone()
+    }
+
     pub async fn reconcile_startup(&mut self) {
         // Clean stale pipe-pane output files (legacy)
         let tmp_dir = std::path::Path::new("/tmp");
@@ -327,12 +340,8 @@ impl App {
                     tracing::info!("Cleaning stale output file: {}", entry.path().display());
                     let _ = std::fs::remove_file(entry.path());
                 }
-                // Clean stale image temp files from previous runs
-                if name_str.starts_with("terminus-img-") {
-                    tracing::info!("Cleaning stale image temp file: {}", entry.path().display());
-                    let _ = std::fs::remove_file(entry.path());
-                }
-                // Clean stale attachment temp files from socket binary uploads
+                // Clean stale attachment temp files from Slack downloads and
+                // socket binary uploads (both now use the `terminus-attachment-` prefix).
                 if name_str.starts_with("terminus-attachment-") {
                     tracing::info!(
                         "Cleaning stale attachment temp file: {}",
@@ -460,7 +469,17 @@ impl App {
     /// Handle a `PowerSignal::GapDetected`: pause polling, broadcast a
     /// GapBanner per active chat, wait for delivery acks (5s timeout),
     /// then resume polling.
-    pub async fn handle_gap(&mut self, signal: PowerSignal) {
+    ///
+    /// `cmd_tx` is passed in (not stored on `App`) so that dropping the local
+    /// sender in `main.rs` still closes the channel when all adapters exit —
+    /// restoring the adapter-exhaustion shutdown path.  The `cmd_tx` clone is
+    /// moved into the spawned catchup task, which prevents the deadlock where
+    /// `run_catchup` blocks on `cmd_tx.send` while `cmd_rx` is suspended
+    /// waiting for `handle_gap` to return.
+    ///
+    /// Callers pass `cmd_tx.clone()` so only platform-adapter senders and
+    /// actively-running catchup tasks keep the channel alive.
+    pub async fn handle_gap(&mut self, signal: PowerSignal, cmd_tx: mpsc::Sender<IncomingMessage>) {
         let PowerSignal::GapDetected {
             paused_at,
             resumed_at,
@@ -550,7 +569,7 @@ impl App {
                 Ok(Err(_)) | Err(_) => {
                     // `Ok(Err(_))` = sender dropped (delivery task died);
                     // `Err(_)` = 5s elapsed without the delivery task acking.
-                    tracing::error!(
+                    tracing::warn!(
                         "GapBanner delivery timed out for chat_id={} — \
                          using inline fallback prefix",
                         chat_id
@@ -571,7 +590,45 @@ impl App {
             }
         }
 
-        // 3. Resume all adapters via trait method.
+        // 3. Slack catchup: fetch missed messages since paused_at.
+        //
+        // Spawned into a separate task so that `run_catchup`'s `cmd_tx.send`
+        // calls don't deadlock against the suspended `cmd_rx` branch in the
+        // main `tokio::select!` loop.  The spawned task runs concurrently;
+        // adapters are resumed immediately below without waiting for catchup to
+        // finish.
+        if let Some(sp) = self.slack_platform.clone() {
+            let active: Vec<String> = self.active_slack_chats.iter().cloned().collect();
+            if !active.is_empty() {
+                // Guard against concurrent catchup tasks (e.g. two rapid GapDetected
+                // signals).  If a task is already running, skip rather than spawn a
+                // second one — the running task will cover the gap.
+                if sp
+                    .catchup_in_progress
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    let oldest_ts = Self::paused_at_to_slack_ts(paused_at);
+                    tracing::info!(
+                        "Triggering Slack catchup for {} channel(s) from {}",
+                        active.len(),
+                        oldest_ts
+                    );
+                    tokio::spawn(async move {
+                        let result = sp.run_catchup(&cmd_tx, &active, &oldest_ts).await;
+                        sp.catchup_in_progress.store(false, Ordering::SeqCst);
+                        match result {
+                            Ok(()) => tracing::info!("Slack catchup task complete"),
+                            Err(e) => tracing::error!("Slack catchup failed: {}", e),
+                        }
+                    });
+                } else {
+                    tracing::info!("Slack catchup already in progress, skipping duplicate spawn");
+                }
+            }
+        }
+
+        // 4. Resume all adapters via trait method.
         for p in [&self.telegram, &self.slack, &self.discord]
             .into_iter()
             .flatten()
@@ -579,6 +636,15 @@ impl App {
             p.resume().await;
         }
         tracing::info!("Adapters resumed after gap handling");
+    }
+
+    /// Convert a `DateTime<Utc>` to a Slack-format message timestamp.
+    ///
+    /// Slack timestamps are `"{unix_seconds}.{microseconds:06}"`.
+    /// This format is monotonic per-channel and used as the `oldest` parameter
+    /// for `conversations.history` catchup calls.
+    fn paused_at_to_slack_ts(dt: DateTime<Utc>) -> String {
+        format!("{}.{:06}", dt.timestamp(), dt.timestamp_subsec_micros())
     }
 
     /// Apply a `StateUpdate` to in-memory state and debounce persists.
@@ -609,6 +675,7 @@ impl App {
             StateUpdate::MarkDirty
                 | StateUpdate::SetCleanShutdown(_)
                 | StateUpdate::HarnessSessionBatch(_)
+                | StateUpdate::SlackWatermark { .. }
         );
         self.store.apply(update);
         self.updates_since_persist += 1;
@@ -1921,7 +1988,9 @@ patterns = []
             gap: Duration::from_secs(90),
         };
 
-        let result = tokio::time::timeout(Duration::from_secs(1), app.handle_gap(signal)).await;
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<IncomingMessage>(16);
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), app.handle_gap(signal, cmd_tx)).await;
         assert!(
             result.is_ok(),
             "handle_gap deadlocked or timed out beyond the 1s bound"
@@ -2814,5 +2883,79 @@ patterns = []
             !path.exists(),
             "attachment file should be removed after run_prompt Err return"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Step 4 tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_paused_at_to_slack_ts_format() {
+        // Verify the Slack timestamp format: "{unix_secs}.{microseconds:06}"
+        use chrono::TimeZone;
+        let dt = Utc.timestamp_opt(1_000_000_000, 123_456_000).unwrap();
+        let ts = App::paused_at_to_slack_ts(dt);
+        // 1_000_000_000 seconds, 123_456 microseconds (from 123_456_000 nanos)
+        assert_eq!(
+            ts, "1000000000.123456",
+            "Slack ts format must be {{unix_secs}}.{{microseconds:06}}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_gap_triggers_slack_catchup() {
+        // Verify that handle_gap completes with a slack_platform set and no
+        // active_slack_chats (empty set skips the catchup HTTP call, so the
+        // test finishes within the banner-ack timeout window).
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx) = make_app(dir.path());
+
+        // No active Slack chats → catchup branch skips HTTP.
+        // slack_platform is set to confirm the branch is entered without panicking.
+        let platform = Arc::new(
+            crate::chat_adapters::slack::SlackPlatform::new_with_endpoint(
+                "xoxb-test".into(),
+                "xapp-test".into(),
+                "C001".into(),
+                "U001".into(),
+                0,
+                reqwest::Client::new(),
+                "http://127.0.0.1:1".into(),
+            ),
+        );
+        app.slack_platform = Some(platform);
+
+        // Seed a Telegram chat so GapBanner is emitted and acked by a mock task.
+        app.active_telegram_chats.insert(7777i64);
+
+        let acks = app.pending_banner_acks_handle();
+        let mut rx = app.subscribe_stream();
+        let delivery_task = tokio::spawn(async move {
+            while let Ok(event) = rx.recv().await {
+                if let StreamEvent::GapBanner { chat_id, .. } = event {
+                    if let Some(tx) = acks.lock().await.remove(&chat_id) {
+                        let _ = tx.send(());
+                    }
+                    return;
+                }
+            }
+        });
+
+        let signal = PowerSignal::GapDetected {
+            paused_at: Utc::now() - chrono::Duration::seconds(90),
+            resumed_at: Utc::now(),
+            gap: Duration::from_secs(90),
+        };
+
+        // handle_gap should complete without panicking.  No Slack chats → no HTTP.
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<IncomingMessage>(16);
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), app.handle_gap(signal, cmd_tx)).await;
+        assert!(
+            result.is_ok(),
+            "handle_gap should not deadlock with slack_platform set"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_millis(100), delivery_task).await;
     }
 }

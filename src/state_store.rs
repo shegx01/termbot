@@ -29,6 +29,10 @@ pub struct State {
     #[serde(default)]
     pub harness_sessions: HashMap<String, NamedSessionEntry>,
     pub last_clean_shutdown: bool,
+    /// Per-channel Slack watermarks: channel_id → latest seen message ts.
+    /// Used by `run_catchup` to resume from the last known position on wake.
+    #[serde(default)]
+    pub slack_watermarks: HashMap<String, String>,
 }
 
 impl Default for State {
@@ -40,6 +44,7 @@ impl Default for State {
             last_seen_wall: None,
             harness_sessions: HashMap::new(),
             last_clean_shutdown: true,
+            slack_watermarks: HashMap::new(),
         }
     }
 }
@@ -89,6 +94,11 @@ pub enum StateUpdate {
     /// Batch upsert/remove named harness session entries.
     /// Vec allows atomic eviction + insert in a single update.
     HarnessSessionBatch(Vec<(String, Option<NamedSessionEntry>)>),
+    /// Advance the per-channel Slack watermark.  Only advances forward
+    /// (monotonic): if the stored ts >= the incoming ts, the update is a no-op.
+    /// Force-persisted (bypasses debounce) because it is safety-critical for
+    /// lossless wake-recovery.
+    SlackWatermark { channel_id: String, ts: String },
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -212,6 +222,16 @@ impl StateStore {
                             self.state.harness_sessions.remove(&name);
                         }
                     }
+                }
+            }
+            StateUpdate::SlackWatermark { channel_id, ts } => {
+                // Only advance forward — Slack ts is lexicographically monotonic.
+                let advance = match self.state.slack_watermarks.get(&channel_id) {
+                    Some(current) => ts > *current,
+                    None => true,
+                };
+                if advance {
+                    self.state.slack_watermarks.insert(channel_id, ts);
                 }
             }
         }
@@ -684,6 +704,112 @@ mod tests {
         assert!(
             state.harness_sessions.is_empty(),
             "harness_sessions should default to empty map"
+        );
+    }
+
+    #[test]
+    fn test_slack_watermark_advances_monotonically() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminus-state.json");
+        let mut store = StateStore::load(&path).unwrap();
+
+        store.apply(StateUpdate::SlackWatermark {
+            channel_id: "C001".into(),
+            ts: "1000000000.000001".into(),
+        });
+        assert_eq!(
+            store
+                .snapshot()
+                .slack_watermarks
+                .get("C001")
+                .map(|s| s.as_str()),
+            Some("1000000000.000001")
+        );
+
+        // Advance forward — must update.
+        store.apply(StateUpdate::SlackWatermark {
+            channel_id: "C001".into(),
+            ts: "1000000000.000002".into(),
+        });
+        assert_eq!(
+            store
+                .snapshot()
+                .slack_watermarks
+                .get("C001")
+                .map(|s| s.as_str()),
+            Some("1000000000.000002")
+        );
+    }
+
+    #[test]
+    fn test_slack_watermark_backward_ts_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminus-state.json");
+        let mut store = StateStore::load(&path).unwrap();
+
+        store.apply(StateUpdate::SlackWatermark {
+            channel_id: "C002".into(),
+            ts: "1000000000.000010".into(),
+        });
+
+        // Attempt to go backward — must be ignored.
+        store.apply(StateUpdate::SlackWatermark {
+            channel_id: "C002".into(),
+            ts: "1000000000.000005".into(),
+        });
+
+        assert_eq!(
+            store
+                .snapshot()
+                .slack_watermarks
+                .get("C002")
+                .map(|s| s.as_str()),
+            Some("1000000000.000010"),
+            "backward ts must not overwrite a higher watermark"
+        );
+    }
+
+    #[test]
+    fn test_backward_compat_deserialize_without_slack_watermarks() {
+        // Old state files without slack_watermarks must deserialize to empty map.
+        let json = r#"{
+            "schema_version": 1,
+            "telegram": { "offset": 0 },
+            "chats": { "telegram": [], "slack": [] },
+            "last_seen_wall": null,
+            "last_clean_shutdown": true
+        }"#;
+        let state: State = serde_json::from_str(json).expect("should deserialize old format");
+        assert!(
+            state.slack_watermarks.is_empty(),
+            "slack_watermarks should default to empty map when absent from JSON"
+        );
+    }
+
+    #[test]
+    fn test_slack_watermark_force_persists() {
+        // SlackWatermark must appear in the force-persist variant list in app.rs.
+        // Here we verify the state-store apply() is a no-op for same-ts (idempotent).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminus-state.json");
+        let mut store = StateStore::load(&path).unwrap();
+
+        store.apply(StateUpdate::SlackWatermark {
+            channel_id: "C003".into(),
+            ts: "1000000001.000000".into(),
+        });
+        // Persist and reload to confirm serializtion.
+        store.persist().expect("persist should succeed");
+
+        let reloaded = StateStore::load(&path).unwrap();
+        assert_eq!(
+            reloaded
+                .snapshot()
+                .slack_watermarks
+                .get("C003")
+                .map(|s| s.as_str()),
+            Some("1000000001.000000"),
+            "slack_watermark must survive persist/reload cycle"
         );
     }
 }

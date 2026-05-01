@@ -340,6 +340,18 @@ Full flag semantics, event schema, error table, and functionality matrix:
 
 All three implement `ChatPlatform` (async_trait). Auth is single-user: messages from non-authorized user IDs are silently dropped. Telegram uses manual `getUpdates` long-polling (not webhooks). Slack uses Socket Mode WebSocket with auto-reconnect. Discord uses the serenity crate with gateway intents `DIRECT_MESSAGES | GUILD_MESSAGES | MESSAGE_CONTENT` (privileged). Inbound Discord attachments (images/files sent by the user to the bot) are not currently processed -- only `msg.content` text is forwarded to the main loop. Telegram-parity for inbound attachments is a follow-up.
 
+**Slack pause/resume and wake-recovery:**
+Slack's `pause()` and `resume()` trait methods are overridden with a
+`tokio::sync::watch::channel<bool>` (level-triggered) that gates the
+`run_websocket_loop` iteration. On wake, `App::handle_gap` triggers
+`SlackPlatform::run_catchup` (before resuming) which fetches missed messages
+from `conversations.history`. Messages are deduped against the in-flight Socket
+Mode window via a `dedup_window` ring (cap 200). Per-channel `last_seen_ts`
+watermarks are persisted via `StateUpdate::SlackWatermark` (force-persist,
+bypasses debounce) to `terminus-state.json`. Required bot token scopes:
+`channels:history`, `groups:history`, `im:history`. Full details in
+`docs/slack-parity.md`.
+
 ### WebSocket bidirectional API (`src/socket/`)
 
 Optional, opt-in (`[socket] enabled = true`). Exposes an authenticated WebSocket

@@ -104,6 +104,8 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Typed Arc for direct catchup calls from App::handle_gap.
+    let slack_platform_typed: Option<Arc<SlackPlatform>>;
     let slack: Option<Arc<dyn ChatPlatform>> = if config.slack_enabled() {
         let sl_config = config.slack.as_ref().unwrap();
         let sl_user_id = config.auth.slack_user_id.as_ref().unwrap().clone();
@@ -114,13 +116,14 @@ async fn main() -> Result<()> {
             sl_user_id.clone(),
             config.streaming.edit_throttle_ms,
         ));
-        let adapter_clone = Arc::clone(&adapter);
-        let cmd_tx_clone = cmd_tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = adapter_clone.start(cmd_tx_clone).await {
-                tracing::error!("Slack adapter error: {}", e);
-            }
-        });
+        // Seed per-channel watermarks from persisted state before starting.
+        adapter
+            .seed_watermarks(app.initial_slack_watermarks())
+            .await;
+        // Use start_with_state so the reconnect loop can persist watermarks.
+        adapter
+            .start_with_state(cmd_tx.clone(), state_tx.clone())
+            .await?;
         delivery::spawn_delivery_task(
             Arc::clone(&adapter) as Arc<dyn ChatPlatform>,
             app.subscribe_stream(),
@@ -128,9 +131,11 @@ async fn main() -> Result<()> {
             app.gap_prefix_handle(),
         );
         tracing::info!("Slack adapter started (user_id={})", sl_user_id);
+        slack_platform_typed = Some(Arc::clone(&adapter));
         Some(adapter)
     } else {
         tracing::info!("Slack not configured, skipping");
+        slack_platform_typed = None;
         None
     };
 
@@ -169,7 +174,7 @@ async fn main() -> Result<()> {
     .flatten()
     .collect();
 
-    app.set_platforms(telegram, slack, discord);
+    app.set_platforms(telegram, slack, slack_platform_typed, discord);
 
     // Emit startup gap banners AFTER all delivery tasks are spawned and
     // subscribed to the stream channel — otherwise banners are lost.
@@ -233,7 +238,11 @@ async fn main() -> Result<()> {
         None
     };
 
-    drop(cmd_tx); // Drop our copy so channel closes when adapters stop
+    // cmd_tx is kept alive through the loop so handle_gap can pass a clone
+    // into each spawned Slack catchup task (tokio::spawn requires ownership).
+    // App no longer stores cmd_tx (MAJOR fix removed the field), so the only
+    // permanent senders are: this local and the platform-adapter clones.
+    // The primary shutdown path is ctrl_c; cmd_tx drops when main() returns.
 
     // ── Power subsystem ───────────────────────────────────────────────────────
     if config.power.enabled {
@@ -272,7 +281,7 @@ async fn main() -> Result<()> {
             // Power signals are highest priority — handle gap before any
             // queued platform message so we don't process stale messages.
             Some(signal) = power_rx.recv() => {
-                app.handle_gap(signal).await;
+                app.handle_gap(signal, cmd_tx.clone()).await;
             }
 
             // State updates — persist before processing commands so chat

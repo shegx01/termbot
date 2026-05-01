@@ -32,11 +32,9 @@ terminus gives you remote access to terminal sessions and AI harnesses from your
 | Platform  | Text | Inbound attachments | Notes |
 |-----------|:----:|:-------------------:|-------|
 | Telegram  |  ✓   |          ✓          | Long-polling; most complete integration |
-| Slack     |  ✓   |         ✓*          | Socket Mode; *images only, non-image documents not forwarded yet |
+| Slack     |  ✓   |          ✓          | Socket Mode; lossless wake-recovery via `conversations.history` catchup |
 | Discord   |  ✓   |          ✗          | Gateway; inbound attachments deferred |
 | WebSocket |  ✓   |          ✓          | Binary-frame upload; opt-in |
-
-\* Slack image attachments are downloaded and forwarded to AI harnesses; non-image file types (PDFs, documents, etc.) are not yet implemented.
 
 **AI harnesses** (the `: <name>` prefixed commands):
 
@@ -1129,12 +1127,18 @@ a one-time banner per active chat:
 
 Adapter polling/handling is paused until each banner is confirmed delivered
 (per-chat oneshot ack, 5s timeout); then the backlog drains. Telegram queues
-updates server-side and drains them in `update_id` order on resume. Discord
-uses a handler-gate (gateway events during the pause window are discarded --
-the pause is typically <5s and the `: ` command protocol is self-recoverable).
-If a banner fails to deliver within the timeout (e.g., rate-limit or network
-blip), terminus falls back to prepending `[gap: Xm Ys] ` inline to the first
-outbound message for that chat so the gap is never silently hidden.
+updates server-side and drains them in `update_id` order on resume. Slack
+pauses its Socket Mode WebSocket loop and, after the banner is acked, fetches
+every message sent during sleep via `conversations.history` since a per-channel
+`last_seen_ts` watermark; the watermark is force-persisted to
+`terminus-state.json` so even a multi-hour sleep does not lose messages, and a
+ring-buffered dedup window prevents double-delivery against any in-flight
+Socket Mode reconnect. Discord uses a handler-gate (gateway events during the
+pause window are discarded -- the pause is typically <5s and the `: ` command
+protocol is self-recoverable). If a banner fails to deliver within the timeout
+(e.g., rate-limit or network blip), terminus falls back to prepending
+`[gap: Xm Ys] ` inline to the first outbound message for that chat so the gap
+is never silently hidden.
 
 The Telegram offset and chat bindings persist atomically to
 `terminus-state.json` (adjacent to `terminus.toml` by default). A restart
