@@ -2,22 +2,22 @@
 
 **Drive your terminal from Telegram, Slack, Discord, or any WebSocket client.**
 
-terminus is a single-user Rust bot that bridges tmux sessions to chat
+terminus is a single-user Rust programme that bridges tmux sessions to chat
 platforms and a programmatic WebSocket API. Anything you'd do at a
-terminal — deploy a release, tail prod logs, kick off a long build, SSH into
-a box, scroll back through output — you can now do from your phone, from a
-laptop without your dotfiles, or from a script. If you can pipe it through
-tmux, you can drive it from chat.
+terminal — deploy a release, tail prod logs, SSH into a box, scroll back
+through output — now works from your phone, a laptop without your dotfiles,
+or a script. If you can pipe it through tmux, you can drive it from chat.
 
 ```
 : new prod
 : ssh api-1 'docker logs -f web'      # tail prod logs from your phone
+: kubectl rollout status deploy/api   # check a deploy mid-meeting
 : cargo build --release               # kick off a long build, walk away
-: screen                              # snapshot the terminal back to chat
 ```
 
-Layered on top: optional AI harnesses (Claude, Codex, Gemini, opencode) with
-named sessions, image input, structured output, and live tool-use streaming.
+Optional AI harnesses (Claude, Codex, Gemini, opencode) sit on top of the
+same surface — named sessions, image input, schema-validated output, live
+tool-use streaming.
 
 ```
 : claude on --name auth --model sonnet
@@ -130,6 +130,8 @@ sessions:
 : gemini on --name review --approval-mode yolo
 What does the auth module do?
 Can you also run the unit tests?
+: gemini sessions             # list saved sessions
+: gemini extensions           # list installed extensions
 ```
 
 Full reference: [docs/gemini.md](docs/gemini.md)
@@ -166,7 +168,7 @@ Full reference: [docs/socket.md](docs/socket.md)
 | Platform  | Inbound text | Inbound attachments | Notes |
 |-----------|:------------:|:-------------------:|-------|
 | Telegram  |      ✓       |          ✓          | Long-polling |
-| Slack     |      ✓       |          ✓          | Socket Mode + `conversations.history` wake-recovery |
+| Slack     |      ✓       |          ✓          | WebSocket (Slack's Socket Mode) + `conversations.history` wake-recovery |
 | Discord   |      ✓       |          ✓          | Gateway + REST catchup; threads in guilds, replies in DMs |
 | WebSocket |      ✓       |          ✓          | Binary-frame upload; opt-in |
 
@@ -189,7 +191,7 @@ for full event schemas.
 ## Requirements
 
 - **Rust 1.70+** (only for building from source)
-- **tmux** on PATH
+- **tmux** on PATH (any `base-index` / `pane-base-index` setting; sessions are targeted by name, never by index)
 - **Claude Code CLI** for `: claude` (`npm i -g @anthropic-ai/claude-code`)
 - **opencode** / **gemini** / **codex** CLIs on PATH for those harnesses (all optional)
 - At least one of: Telegram bot token, Slack bot + app tokens, Discord bot token, or socket API enabled
@@ -251,7 +253,7 @@ channel_id = "C01ABCDEF"
 
 1. [api.slack.com/apps](https://api.slack.com/apps) → create new app ("From scratch")
 2. **Socket Mode**: enable, generate app-level token with `connections:write` (`xapp-...`)
-3. **OAuth & Permissions**: add bot scopes `chat:write`, `channels:history`, `channels:read` (add `groups:*` for private channels)
+3. **OAuth & Permissions**: add bot OAuth scopes `chat:write`, `channels:history`, `channels:read`, `im:history` (add `groups:history`, `groups:read` for private channels). `im:history` is required for DM wake-recovery — omit it and missed DMs vanish silently after sleep.
 4. Install to workspace, copy bot token (`xoxb-...`)
 5. **Event Subscriptions**: enable, subscribe to `message.channels` (and `message.groups` for private)
 6. Invite the bot: `/invite @botname`
@@ -280,7 +282,7 @@ bot_token = "YOUR_BOT_TOKEN_HERE"
 4. **OAuth2 → URL Generator**: scope `bot`, permissions: View Channels, Send Messages, Attach Files, Read Message History. Open the generated URL to invite the bot.
 5. **DM-only mode**: omit `guild_id` and `channel_id`. **Guild mode**: set both.
 
-**Snowflake IDs**: Settings → Advanced → Developer Mode, then right-click → Copy.
+**Discord IDs** (called "snowflakes" — numeric strings): Settings → Advanced → Developer Mode, then right-click any user/server/channel → Copy ID.
 </details>
 
 ### Socket API
@@ -456,11 +458,19 @@ export TODOS_WEBHOOK_SECRET="$(openssl rand -hex 32)"
 : claude --schema todos list my open tasks
 ```
 
-Webhook requests carry `X-Terminus-Schema`, `X-Terminus-Run-Id` (ULID),
-`X-Terminus-Timestamp`, and `X-Terminus-Signature: v1=<hmac-sha256-hex>`. The
-signature covers `"<timestamp>.<raw_body>"` (Stripe-style). Transient
-failures are retried with exponential backoff up to 60s; jobs survive
-restarts in `<queue_dir>/pending/`. Cap retry duration via
+Webhook requests carry four headers:
+
+| Header                  | Value                                              |
+|-------------------------|----------------------------------------------------|
+| `X-Terminus-Schema`     | Schema name from `[schemas.<name>]`                |
+| `X-Terminus-Run-Id`     | ULID — sortable unique identifier per run          |
+| `X-Terminus-Timestamp`  | Unix epoch seconds at delivery time                |
+| `X-Terminus-Signature`  | `v1=<hmac-sha256-hex>` over `"<timestamp>.<body>"` |
+
+The Stripe-style signature binds the timestamp into the MAC, so neither field
+can be altered without invalidating the signature. Transient failures are
+retried with exponential backoff up to 60s; jobs survive restarts in
+`<queue_dir>/pending/`. Cap retry duration via
 `structured_output.max_retry_age_hours`.
 
 Verification snippets (Python, Node.js) and the full retry table:
@@ -491,14 +501,28 @@ connection).
 
 **Subscriptions** filter on `event_types`, `schemas`, and `sessions` (OR
 within a facet, AND across facets). Available event types:
-`structured_output`, `webhook_status`, `queue_drained`, `session_output`,
-`session_created`, `session_killed`, `session_started`, `session_exited`,
-`session_limit_reached`, `chat_forward`, `harness_started`, `harness_finished`,
-`gap_banner`.
+
+| Event type              | Source                                       |
+|-------------------------|----------------------------------------------|
+| `structured_output`     | `--schema` result (schema, value, run_id)    |
+| `webhook_status`        | Webhook delivery attempt outcome             |
+| `queue_drained`         | Webhook retry queue drain cycle complete     |
+| `session_output`        | tmux capture-pane diff                       |
+| `session_created`       | `: new` succeeded                            |
+| `session_killed`        | `: kill` succeeded                           |
+| `session_started`       | Session foregrounded (`: fg`)                |
+| `session_exited`        | Underlying tmux process exited               |
+| `session_limit_reached` | `streaming.max_sessions` cap hit             |
+| `chat_forward`          | Inbound message from a chat platform         |
+| `harness_started`       | AI-harness turn started                      |
+| `harness_finished`      | AI-harness turn completed                    |
+| `gap_banner`            | Sleep/wake gap detected                      |
 
 **Defaults:** 60-request burst / 20 req/s sustained, 32 pending requests, 16
-concurrent connections, 1 MiB max message, 300s idle timeout. Rate-limited
-requests get an `error` with `code: "rate_limited"` and `retry_after_ms`.
+concurrent connections, 300s idle timeout. Size caps are split: `max_message_bytes`
+defaults to 1 MiB (JSON envelope), `max_binary_bytes` defaults to 10 MiB
+(binary attachment frames). Rate-limited requests get an `error` with
+`code: "rate_limited"` and `retry_after_ms`.
 
 Full wire protocol, all envelope types, error codes, and proxy examples:
 [docs/socket.md](docs/socket.md).
@@ -508,10 +532,11 @@ Full wire protocol, all envelope types, error codes, and proxy examples:
 ## Security
 
 **Authentication.** Single-user only on chat platforms — messages from any
-user ID other than the configured one are silently ignored (the bot does not
-reveal its existence). Socket clients authenticate with per-client Bearer
-tokens (≥32 characters) validated with constant-time comparison; missing or
-invalid tokens get HTTP 401 before a WebSocket is established.
+user ID other than the configured one are silently dropped (terminus does
+not signal its presence to unauthorised senders). Socket clients
+authenticate with per-client Bearer tokens (≥32 characters) validated in
+constant time; missing or invalid tokens get HTTP 401 before the WebSocket
+upgrade.
 
 **Command blocklist.** Both `: ` prefixed commands and plain-text input
 (including text routed to a harness) are checked against regex patterns. The
@@ -537,9 +562,11 @@ Add patterns:
 patterns = ["shutdown", "reboot"]
 ```
 
-**Output file safety.** Files delivered from Claude must have allowlisted
-extensions, be under the working directory or `/tmp` (path traversal
-blocked), and be ≤50 MB. Sensitive filenames are never delivered.
+**Output file safety.** Files delivered from Claude must have an
+allowlisted extension (common images, documents, and text/data formats —
+full list in [docs/claude.md](docs/claude.md)), be under the working
+directory or `/tmp` (path traversal blocked), and be ≤50 MB. Sensitive
+filenames are never delivered.
 
 **Smart quote normalization.** Mobile keyboards' curly quotes are normalized
 to ASCII automatically so shell commands work.
@@ -548,9 +575,9 @@ to ASCII automatically so shell commands work.
 
 ## Sleep/wake recovery
 
-terminus holds a platform-appropriate idle-sleep assertion (`caffeinate -i`
-on macOS, `systemd-inhibit --what=idle:sleep` on Linux). Closed-lid sleep is
-never blocked.
+terminus blocks idle sleep while running: `caffeinate -i` on macOS,
+`systemd-inhibit --what=idle:sleep` on Linux. Closed-lid sleep is never
+blocked.
 
 When the host sleeps anyway (lid close, forced suspend, overnight), terminus
 detects the wake via monotonic/wall-clock divergence (>30s) and emits a
@@ -645,13 +672,6 @@ Default is 10 concurrent sessions. Kill unused with `: kill <name>` or raise
   consuming events too slowly. Events were dropped. Increase
   `socket.send_buffer_size` or process events faster. Non-fatal.
 </details>
-
----
-
-## tmux compatibility
-
-terminus works with any `base-index` or `pane-base-index` setting. Sessions
-are targeted by name (`term-build`), never by numeric index.
 
 ---
 
