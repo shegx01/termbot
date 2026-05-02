@@ -498,6 +498,44 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        // Surface compile-time/runtime feature mismatches early. A binary built
+        // without --features X will silently ignore [X] config sections at
+        // startup; an operator may believe the platform is active when it's
+        // not. Warn (don't bail) so shared-config-across-binaries deployments
+        // still work — the warn is loud enough to catch in logs.
+        #[cfg(not(feature = "telegram"))]
+        if self.telegram_enabled() {
+            tracing::warn!(
+                "[telegram] section is configured but the 'telegram' feature was \
+                 NOT compiled into this binary. Telegram messages will be ignored. \
+                 Rebuild with --features telegram to enable Telegram routing."
+            );
+        }
+        #[cfg(not(feature = "slack"))]
+        if self.slack_enabled() {
+            tracing::warn!(
+                "[slack] section is configured but the 'slack' feature was \
+                 NOT compiled into this binary. Slack messages will be ignored. \
+                 Rebuild with --features slack to enable Slack routing."
+            );
+        }
+        #[cfg(not(feature = "discord"))]
+        if self.discord_enabled() {
+            tracing::warn!(
+                "[discord] section is configured but the 'discord' feature was \
+                 NOT compiled into this binary. Discord messages will be ignored. \
+                 Rebuild with --features discord to enable Discord routing."
+            );
+        }
+        #[cfg(not(feature = "socket"))]
+        if self.socket_enabled() {
+            tracing::warn!(
+                "[socket] section is configured but the 'socket' feature was \
+                 NOT compiled into this binary. The WebSocket API will not be \
+                 available. Rebuild with --features socket to enable it."
+            );
+        }
+
         let has_chat_platform =
             self.telegram_enabled() || self.slack_enabled() || self.discord_enabled();
         if !has_chat_platform && !self.socket_enabled() {

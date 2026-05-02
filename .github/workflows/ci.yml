@@ -56,3 +56,42 @@ jobs:
             --ignore RUSTSEC-2024-0384 \
             --ignore RUSTSEC-2025-0134 \
             --ignore RUSTSEC-2026-0097
+
+  build-matrix:
+    name: Build (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each leg uses `cargo test --no-run` so that #[cfg(test)] code is
+          # compiled too — `cargo build` skips test harnesses, so a test that
+          # fails to compile under, say, --no-default-features --features slack
+          # would otherwise be invisible until someone explicitly ran the
+          # matching `cargo test`. `--no-run` keeps the cost roughly equal to
+          # `cargo build` while catching test-code regressions.
+          - name: telegram-only
+            cmd: cargo test --no-run --no-default-features --features telegram
+          - name: slack-only
+            cmd: cargo test --no-run --no-default-features --features slack
+          - name: discord-only
+            cmd: cargo test --no-run --no-default-features --features discord
+          - name: socket-only
+            cmd: cargo test --no-run --no-default-features --features socket
+          - name: empty
+            # Empty-feature build has no platform tests to compile; bare check
+            # is enough to verify nothing leaked into the always-on path.
+            cmd: cargo build --no-default-features
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Per-matrix-leg cache so different feature combos don't clobber each
+          # other's incremental build artifacts.
+          key: ${{ matrix.name }}
+
+      - name: Build (${{ matrix.name }})
+        run: ${{ matrix.cmd }}

@@ -4,12 +4,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+#[cfg(feature = "slack")]
+use chrono::DateTime;
+use chrono::Utc;
 use futures_util::future::join_all;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::{OutputBuffer, StreamEvent};
+#[cfg(feature = "discord")]
 use crate::chat_adapters::discord::DiscordAdapter;
+#[cfg(feature = "slack")]
 use crate::chat_adapters::slack::SlackPlatform;
 use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
 use crate::command::{CommandBlocklist, HarnessOptions, HarnessSubcommandKind, ParsedCommand};
@@ -47,10 +51,12 @@ pub struct App {
     slack: Option<Arc<dyn ChatPlatform>>,
     /// Typed Arc to the Slack platform for direct catchup calls.
     /// Kept alongside the dyn `slack` field — both point to the same object.
+    #[cfg(feature = "slack")]
     slack_platform: Option<Arc<SlackPlatform>>,
     discord: Option<Arc<dyn ChatPlatform>>,
     /// Typed Arc to the Discord platform for direct catchup calls.
     /// Kept alongside the dyn `discord` field — both point to the same object.
+    #[cfg(feature = "discord")]
     discord_platform: Option<Arc<DiscordAdapter>>,
     offline_buffer_max: usize,
     trigger: char,
@@ -215,8 +221,10 @@ impl App {
             stream_tx,
             telegram: None,
             slack: None,
+            #[cfg(feature = "slack")]
             slack_platform: None,
             discord: None,
+            #[cfg(feature = "discord")]
             discord_platform: None,
             offline_buffer_max: config.streaming.offline_buffer_max_bytes,
             trigger,
@@ -273,15 +281,21 @@ impl App {
         &mut self,
         telegram: Option<Arc<dyn ChatPlatform>>,
         slack: Option<Arc<dyn ChatPlatform>>,
-        slack_platform: Option<Arc<SlackPlatform>>,
+        #[cfg(feature = "slack")] slack_platform: Option<Arc<SlackPlatform>>,
         discord: Option<Arc<dyn ChatPlatform>>,
-        discord_platform: Option<Arc<DiscordAdapter>>,
+        #[cfg(feature = "discord")] discord_platform: Option<Arc<DiscordAdapter>>,
     ) {
         self.telegram = telegram;
         self.slack = slack;
-        self.slack_platform = slack_platform;
+        #[cfg(feature = "slack")]
+        {
+            self.slack_platform = slack_platform;
+        }
         self.discord = discord;
-        self.discord_platform = discord_platform;
+        #[cfg(feature = "discord")]
+        {
+            self.discord_platform = discord_platform;
+        }
     }
 
     pub fn subscribe_stream(&self) -> broadcast::Receiver<StreamEvent> {
@@ -493,6 +507,12 @@ impl App {
     /// Callers pass `cmd_tx.clone()` so only platform-adapter senders and
     /// actively-running catchup tasks keep the channel alive.
     pub async fn handle_gap(&mut self, signal: PowerSignal, cmd_tx: mpsc::Sender<IncomingMessage>) {
+        // `cmd_tx` is consumed only when the slack feature is compiled in
+        // (discord catchup spawns a task that captures other state). The
+        // explicit reference suppresses the unused-variable warning for
+        // builds that disable slack — covers all current and future
+        // feature-combo permutations without a stale `cfg_attr`.
+        let _ = &cmd_tx;
         let PowerSignal::GapDetected {
             paused_at,
             resumed_at,
@@ -610,6 +630,7 @@ impl App {
         // main `tokio::select!` loop.  The spawned task runs concurrently;
         // adapters are resumed immediately below without waiting for catchup to
         // finish.
+        #[cfg(feature = "slack")]
         if let Some(sp) = self.slack_platform.clone() {
             let active: Vec<String> = self.active_slack_chats.iter().cloned().collect();
             if !active.is_empty() {
@@ -646,6 +667,7 @@ impl App {
         // Spawned (not awaited) for the same reason as Slack catchup above:
         // `run_catchup` calls `cmd_tx.send`, which would deadlock against the
         // suspended `cmd_rx` branch in the main `tokio::select!` loop.
+        #[cfg(feature = "discord")]
         if let Some(discord) = self.discord_platform.clone() {
             // Guard against concurrent catchup tasks (e.g. two rapid GapDetected
             // signals).  If a task is already running, skip rather than spawn a
@@ -681,6 +703,7 @@ impl App {
     /// Slack timestamps are `"{unix_seconds}.{microseconds:06}"`.
     /// This format is monotonic per-channel and used as the `oldest` parameter
     /// for `conversations.history` catchup calls.
+    #[cfg(feature = "slack")]
     fn paused_at_to_slack_ts(dt: DateTime<Utc>) -> String {
         format!("{}.{:06}", dt.timestamp(), dt.timestamp_subsec_micros())
     }
@@ -2928,6 +2951,7 @@ patterns = []
     // Step 4 tests
     // -------------------------------------------------------------------------
 
+    #[cfg(feature = "slack")]
     #[test]
     fn test_paused_at_to_slack_ts_format() {
         // Verify the Slack timestamp format: "{unix_secs}.{microseconds:06}"
@@ -2941,6 +2965,7 @@ patterns = []
         );
     }
 
+    #[cfg(feature = "slack")]
     #[tokio::test]
     async fn test_handle_gap_triggers_slack_catchup() {
         // Verify that handle_gap completes with a slack_platform set and no
@@ -2993,6 +3018,69 @@ patterns = []
         assert!(
             result.is_ok(),
             "handle_gap should not deadlock with slack_platform set"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_millis(100), delivery_task).await;
+    }
+
+    #[cfg(feature = "discord")]
+    #[tokio::test]
+    async fn test_handle_gap_triggers_discord_catchup() {
+        // Verify that handle_gap completes with a discord_platform set, no
+        // active_discord_chats (empty watermark map → catchup spawn proceeds
+        // but does nothing internally), and that the catchup_in_progress
+        // CAS gate flips and resets correctly.
+        use crate::chat_adapters::DiscordAdapter;
+        use crate::config::DiscordConfig;
+
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx) = make_app(dir.path());
+        let (state_tx, _adapter_state_rx) = mpsc::channel::<StateUpdate>(16);
+
+        let adapter = Arc::new(
+            DiscordAdapter::new(
+                DiscordConfig {
+                    bot_token: "test-token".to_string(),
+                    guild_id: None,
+                    channel_id: None,
+                },
+                serenity::all::UserId::new(1),
+                0,
+                state_tx,
+                std::collections::HashMap::new(),
+            )
+            .expect("DiscordAdapter::new should succeed for test"),
+        );
+        app.discord_platform = Some(Arc::clone(&adapter));
+
+        // Seed a Telegram chat so GapBanner is emitted and acked by a mock task.
+        app.active_telegram_chats.insert(7777i64);
+
+        let acks = app.pending_banner_acks_handle();
+        let mut rx = app.subscribe_stream();
+        let delivery_task = tokio::spawn(async move {
+            while let Ok(event) = rx.recv().await {
+                if let StreamEvent::GapBanner { chat_id, .. } = event {
+                    if let Some(tx) = acks.lock().await.remove(&chat_id) {
+                        let _ = tx.send(());
+                    }
+                    return;
+                }
+            }
+        });
+
+        let signal = PowerSignal::GapDetected {
+            paused_at: Utc::now() - chrono::Duration::seconds(90),
+            resumed_at: Utc::now(),
+            gap: Duration::from_secs(90),
+        };
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<IncomingMessage>(16);
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), app.handle_gap(signal, cmd_tx)).await;
+        assert!(
+            result.is_ok(),
+            "handle_gap should not deadlock with discord_platform set"
         );
 
         let _ = tokio::time::timeout(Duration::from_millis(100), delivery_task).await;

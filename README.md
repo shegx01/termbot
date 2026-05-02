@@ -76,6 +76,9 @@ cd terminus
 cp terminus.example.toml terminus.toml
 cargo build --release
 ./target/release/terminus
+
+# Single-platform builds (smaller dep graph) — see docs/feature-flags.md
+cargo build --release --no-default-features --features telegram
 ```
 
 Set `TERMINUS_CONFIG=/path/to/config.toml` to use a non-default config location.
@@ -353,7 +356,9 @@ trigger = "!"   # default is `: ` — allowed: `: ! > ; . , @ ~ ^ - + = | % ?`
 ### Multiple platforms
 
 Include any combination of `[telegram]`, `[slack]`, `[discord]`, and
-`[socket]`. terminus starts with whatever is configured.
+`[socket]`. terminus starts with whatever is configured. Each platform is
+also a build-time Cargo feature (default = full set); see
+[docs/feature-flags.md](docs/feature-flags.md) to prune the dependency graph.
 
 ---
 

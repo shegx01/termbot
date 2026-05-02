@@ -11,9 +11,9 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 regex = "1"
-teloxide = { version = "0.13", default-features = false, features = ["macros", "native-tls", "ctrlc_handler"] }
+teloxide = { version = "0.13", default-features = false, features = ["macros", "native-tls", "ctrlc_handler"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1"
@@ -35,7 +35,7 @@ arc-swap = "1"
 wiremock = { version = "0.6", optional = true }
 # native_tls_backend avoids the vulnerable rustls-webpki 0.102.8 (RUSTSEC-2026-0049)
 # that rustls_backend pulls via tokio-tungstenite 0.21 → rustls 0.22.
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "native_tls_backend", "model", "cache"] }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "native_tls_backend", "model", "cache"], optional = true }
 
 [dev-dependencies]
 # Serialize tests that mutate process-global env vars (std::env::set_var is
@@ -44,4 +44,9 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 serial_test = "3"
 
 [features]
+default = ["telegram", "slack", "discord", "socket"]
+telegram = ["dep:teloxide"]
+slack = ["dep:tokio-tungstenite"]
+discord = ["dep:serenity"]
+socket = ["dep:tokio-tungstenite"]
 integration-tests = ["dep:wiremock"]

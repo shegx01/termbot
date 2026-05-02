@@ -6,3 +6,4 @@ terminus-state.json.tmp
 .omc/
 .claude/worktrees/
 .omx/
+/missions/

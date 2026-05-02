@@ -1,7 +1,11 @@
+#[cfg(feature = "discord")]
 pub mod discord;
+#[cfg(feature = "slack")]
 pub mod slack;
+#[cfg(feature = "telegram")]
 pub mod telegram;
 
+#[cfg(feature = "discord")]
 pub use discord::DiscordAdapter;
 
 use std::io::ErrorKind;
