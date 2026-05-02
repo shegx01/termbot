@@ -12,6 +12,7 @@
 //! callers and keeps the binary-target diff minimal.
 
 pub mod app;
+pub mod banner;
 pub mod buffer;
 pub mod chat_adapters;
 pub mod command;

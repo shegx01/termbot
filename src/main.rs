@@ -1,4 +1,5 @@
 mod app;
+mod banner;
 mod buffer;
 mod chat_adapters;
 mod command;

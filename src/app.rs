@@ -7,9 +7,9 @@ use anyhow::Result;
 #[cfg(feature = "slack")]
 use chrono::DateTime;
 use chrono::Utc;
-use futures_util::future::join_all;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc};
 
+use crate::banner::BannerCoordinator;
 use crate::buffer::{OutputBuffer, StreamEvent};
 #[cfg(feature = "discord")]
 use crate::chat_adapters::discord::DiscordAdapter;
@@ -85,16 +85,11 @@ pub struct App {
     active_slack_chats: HashSet<String>,
     /// Active Discord channel IDs (hydrated from persisted state on startup).
     active_discord_chats: HashSet<String>,
-    /// Pending oneshot senders keyed by chat_id.  `handle_gap` inserts;
-    /// the delivery task resolves directly on successful banner send.
-    /// Shared via `Arc<AsyncMutex<_>>` so the map can be locked briefly
-    /// from either side without holding across await boundaries in `handle_gap`.
-    pending_banner_acks: PendingBannerAcks,
-    /// Inline fallback gap prefixes: if banner delivery times out, store here
-    /// and prepend `[gap: Xm Ys]` to the next message for that chat.
-    /// Shared via `Arc<AsyncMutex<_>>` so delivery tasks can consume entries
-    /// without going through the main `tokio::select!` loop.
-    gap_prefix: GapPrefixes,
+    /// Banner-ack and inline-prefix coordinator. Owns the `pending_banner_acks`
+    /// and `gap_prefix` shared maps; runs the install/await/fallback dance
+    /// for `handle_gap`. See `src/banner.rs` for the extracted state machine
+    /// and concurrency contract.
+    banner: BannerCoordinator,
     /// Snapshot of `last_clean_shutdown` from the state file *before* we
     /// applied `MarkDirty` on startup.  Used by `emit_startup_gap_banners`
     /// to check whether the previous run exited cleanly.
@@ -249,8 +244,7 @@ impl App {
             active_telegram_chats,
             active_slack_chats,
             active_discord_chats,
-            pending_banner_acks: Arc::new(AsyncMutex::new(HashMap::new())),
-            gap_prefix: Arc::new(AsyncMutex::new(HashMap::new())),
+            banner: BannerCoordinator::new(),
             startup_was_clean,
             schema_registry: Arc::clone(&schema_registry),
             delivery_queue: Arc::clone(&delivery_queue),
@@ -332,14 +326,14 @@ impl App {
     /// Shared handle to the banner-ack map — passed into `spawn_delivery_task`
     /// so delivery tasks can resolve pending oneshots directly.
     pub fn pending_banner_acks_handle(&self) -> PendingBannerAcks {
-        Arc::clone(&self.pending_banner_acks)
+        self.banner.pending_acks_handle()
     }
 
     /// Shared handle to the gap-prefix map — passed into `spawn_delivery_task`
     /// so delivery tasks can consume inline `[gap: …]` markers set by
     /// `handle_gap` when banner delivery times out.
     pub fn gap_prefix_handle(&self) -> GapPrefixes {
-        Arc::clone(&self.gap_prefix)
+        self.banner.prefixes_handle()
     }
 
     /// Returns the initial Telegram offset from the persisted state snapshot.
@@ -556,25 +550,11 @@ impl App {
             )
             .collect();
 
-        // Register pending acks and broadcast banners.  The lock is held only
-        // for the duration of the inserts — never across `.await`.  The
-        // delivery task resolves each oneshot directly by locking the same
-        // map from its own task, so we can safely `.await` below without
-        // deadlocking the main `select!` loop.
-        let mut ack_futures = Vec::new();
-        {
-            let mut pending = self.pending_banner_acks.lock().await;
-            for (chat_id, _) in &all_chats {
-                let (tx, rx) = oneshot::channel::<()>();
-                // If `handle_gap` is invoked a second time while the first is still
-                // awaiting acks, this insert replaces the first oneshot sender.  The
-                // first `rx.await` then returns `Err(RecvError)` and the inline-prefix
-                // fallback fires for it — acceptable single-user semantics since the user
-                // will still see a banner for the second gap.
-                pending.insert(chat_id.clone(), tx);
-                ack_futures.push((chat_id.clone(), rx));
-            }
-        } // lock released
+        // Two-phase contract: install BEFORE broadcast so a fast delivery
+        // task can't race past the install and lose its ack target. See
+        // `src/banner.rs` for the full ordering invariant.
+        let chat_ids: Vec<String> = all_chats.iter().map(|(id, _)| id.clone()).collect();
+        let ack_futures = self.banner.install_pending(&chat_ids).await;
 
         for (chat_id, platform) in &all_chats {
             let _ = self.stream_tx.send(StreamEvent::GapBanner {
@@ -587,46 +567,12 @@ impl App {
             });
         }
 
-        // Await all banner acks concurrently (5s timeout each) so a slow
-        // delivery task on one platform does not delay others.
-        let results = join_all(ack_futures.into_iter().map(|(chat_id, rx)| async move {
-            let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
-            (chat_id, result)
-        }))
-        .await;
-
-        for (chat_id, result) in results {
-            match result {
-                Ok(Ok(())) => {
-                    tracing::info!(
-                        "GapBanner delivered for chat_id={} (gap={:.0}s)",
-                        chat_id,
-                        gap.as_secs_f64()
-                    );
-                }
-                Ok(Err(_)) | Err(_) => {
-                    // `Ok(Err(_))` = sender dropped (delivery task died);
-                    // `Err(_)` = 5s elapsed without the delivery task acking.
-                    tracing::warn!(
-                        "GapBanner delivery timed out for chat_id={} — \
-                         using inline fallback prefix",
-                        chat_id
-                    );
-                    // Store for inline fallback on next outbound message.
-                    // Lock held only for the insert — never across an await.
-                    self.gap_prefix.lock().await.insert(
-                        chat_id.clone(),
-                        GapInfo {
-                            gap,
-                            paused_at,
-                            resumed_at,
-                        },
-                    );
-                    // Clean up the pending entry if still present (briefly lock).
-                    self.pending_banner_acks.lock().await.remove(&chat_id);
-                }
-            }
-        }
+        // Await acks (5s per chat). On timeout or dropped sender, the
+        // coordinator registers an inline-prefix fallback so the next
+        // outbound message for that chat carries the gap marker.
+        self.banner
+            .await_acks_with_fallback(ack_futures, gap, paused_at, resumed_at)
+            .await;
 
         // 3. Slack catchup: fetch missed messages since paused_at.
         //
@@ -749,10 +695,15 @@ impl App {
 
     /// Consume and return the inline gap prefix for `chat_id` if one is
     /// pending.  The delivery task consumes entries directly via
-    /// `gap_prefix_handle()`, but this method is also used by unit tests.
+    /// `gap_prefix_handle()`. This pass-through is also called from the
+    /// integration test at `tests/sleep_wake_banner.rs` and from the
+    /// in-module test below — the `cfg_attr` keeps the dead-code lint
+    /// quiet in non-test builds (where neither caller is compiled in)
+    /// without weakening the lint elsewhere. Do NOT delete on a "no
+    /// callers" sweep; the integration-test caller is real.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn consume_gap_prefix(&self, chat_id: &str) -> Option<GapInfo> {
-        self.gap_prefix.lock().await.remove(chat_id)
+        self.banner.consume_prefix(chat_id).await
     }
 
     pub async fn handle_command(&mut self, msg: &IncomingMessage) {
@@ -1786,6 +1737,7 @@ mod tests {
     use crate::config::Config;
     use crate::state_store::StateStore;
     use tempfile::tempdir;
+    use tokio::sync::oneshot;
 
     fn make_test_config(dir: &std::path::Path) -> Config {
         // Write a minimal valid terminus.toml to the temp dir.
@@ -1998,20 +1950,25 @@ patterns = []
 
         // No gap_prefix fallback should have been engaged.
         assert!(
-            app.gap_prefix.lock().await.is_empty(),
+            app.gap_prefix_handle().lock().await.is_empty(),
             "gap_prefix should be empty when the ack resolved in time"
         );
 
         let _ = tokio::time::timeout(Duration::from_millis(100), delivery_task).await;
     }
 
+    /// Pins the App-level pass-through to `BannerCoordinator::consume_prefix`.
+    /// The banner mechanics themselves are unit-tested in `src/banner.rs::tests`;
+    /// this case keeps `App::consume_gap_prefix` reachable so dead-code lint
+    /// doesn't trip in the binary's test target (integration tests at
+    /// `tests/sleep_wake_banner.rs` are compiled separately).
     #[tokio::test]
-    async fn consume_gap_prefix_returns_and_clears() {
+    async fn consume_gap_prefix_pass_through_returns_registered_entry() {
         let dir = tempdir().unwrap();
         let (app, _state_rx) = make_app(dir.path());
 
         let now = Utc::now();
-        app.gap_prefix.lock().await.insert(
+        app.gap_prefix_handle().lock().await.insert(
             "chat42".to_string(),
             GapInfo {
                 gap: Duration::from_secs(90),
@@ -2021,9 +1978,8 @@ patterns = []
         );
 
         let prefix = app.consume_gap_prefix("chat42").await;
-        assert!(prefix.is_some(), "should return the gap info");
+        assert!(prefix.is_some());
         assert_eq!(prefix.unwrap().gap, Duration::from_secs(90));
-        // Second call: cleared.
         assert!(app.consume_gap_prefix("chat42").await.is_none());
     }
 
