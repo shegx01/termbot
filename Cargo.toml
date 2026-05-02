@@ -40,8 +40,14 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 [dev-dependencies]
 # Serialize tests that mutate process-global env vars (std::env::set_var is
 # unsafe under parallel test execution in Rust 2024 edition and can race under
-# the 2021 default runner).
+# the 2021 default runner). Also used by the socket lifecycle integration
+# tests to avoid ephemeral-port TOCTOU races between parallel test binaries.
 serial_test = "3"
+# `test-util` enables `tokio::time::pause`/`advance` and the `start_paused`
+# attribute argument used by the sleep/wake banner ack-timeout test. Pulled
+# only into the test profile so the production binary doesn't ship the
+# mock-time machinery.
+tokio = { version = "1", features = ["test-util"] }
 
 [features]
 default = ["telegram", "slack", "discord", "socket"]

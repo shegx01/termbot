@@ -33,7 +33,10 @@ jobs:
         run: cargo clippy -- -D warnings
 
       - name: Test
-        run: cargo test
+        # `--all-targets` runs the new tests/*.rs integration suite (sleep/wake
+        # banner, socket lifecycle, state persistence) in addition to the lib
+        # unit tests. `--all-features` keeps coverage uniform with clippy.
+        run: cargo test --all-targets --all-features
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked

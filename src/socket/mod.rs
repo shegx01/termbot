@@ -1,8 +1,11 @@
 //! WebSocket bidirectional API for terminus.
-// Items in the socket module are used exclusively from the binary target
-// (src/main.rs). The library target (src/lib.rs) compiles this module for
-// `cargo test --lib` but does not use any socket API, so private and
-// pub(crate) items appear dead to the library compiler.
+// Items in the socket module are used by the binary target (src/main.rs)
+// and — since the integration-test PR — by the test crate at
+// tests/socket_lifecycle.rs. The library target (src/lib.rs) compiles
+// this module for `cargo test --lib` but does not call any socket API
+// itself, so private and pub(crate) items still appear dead from the
+// library's perspective. The crate-level allow keeps the compile clean
+// without scattering per-item attributes.
 #![allow(dead_code)]
 //!
 //! Exposes an authenticated, pipelined, subscription-capable WebSocket
@@ -16,11 +19,13 @@
 //!   2. New `broadcast::channel<AmbientEvent>` for genuinely-new events
 //!   3. Existing `mpsc::Sender<IncomingMessage>` for inbound command dispatch
 
-// Socket submodules are used exclusively by the binary (src/main.rs via
-// `mod socket;`). The library target (src/lib.rs) includes them for
-// `cargo test --lib` but does not call any socket API itself, so all
-// pub(crate) items appear dead from the library's perspective.
-// The allow(dead_code) on each submodule suppresses those false positives.
+// Socket submodules. `SocketServer`, `SubscriptionStoreInner`, and the
+// `SharedSubscriptionStore` type alias are intentionally `pub` because
+// `tests/socket_lifecycle.rs` constructs a real server on an ephemeral
+// port — `pub(crate)` would be invisible to that test crate. Every other
+// submodule item stays `pub(crate)` (preserved by the `mod imp` wrap).
+// The library-target dead-code suppression below covers items that look
+// dead from the lib perspective but are reachable from main.rs/tests.
 //
 // `events` stays unconditional because the ambient-event bus (AmbientEvent
 // type) is referenced from `app.rs` and the harnesses regardless of whether
@@ -47,7 +52,7 @@ pub mod subscription;
 // items but not re-export use statements; add the explicit allow here.
 #[cfg(feature = "socket")]
 #[allow(unused_imports)]
-pub(crate) use imp::{SharedSubscriptionStore, SocketServer, SubscriptionStoreInner};
+pub use imp::{SharedSubscriptionStore, SocketServer, SubscriptionStoreInner};
 
 #[cfg(feature = "socket")]
 mod imp {
@@ -124,14 +129,14 @@ mod imp {
     /// store is at capacity and a new (unknown) client is saved, the front entry
     /// (least recently used) is evicted. `map` and `order` are always kept in sync:
     /// a key present in one is present in the other, and vice versa.
-    pub(crate) struct SubscriptionStoreInner {
+    pub struct SubscriptionStoreInner {
         map: HashMap<String, Vec<(String, Filter)>>,
         order: VecDeque<String>,
         cap: usize,
     }
 
     impl SubscriptionStoreInner {
-        pub(crate) fn new(cap: usize) -> Self {
+        pub fn new(cap: usize) -> Self {
             Self {
                 map: HashMap::new(),
                 order: VecDeque::new(),
@@ -200,13 +205,13 @@ mod imp {
 
         /// True when the store contains no entries.
         #[allow(dead_code)]
-        pub(crate) fn is_empty(&self) -> bool {
+        pub fn is_empty(&self) -> bool {
             self.map.is_empty()
         }
     }
 
     /// Shared, thread-safe handle to the LRU subscription store.
-    pub(crate) type SharedSubscriptionStore = Arc<Mutex<SubscriptionStoreInner>>;
+    pub type SharedSubscriptionStore = Arc<Mutex<SubscriptionStoreInner>>;
 
     /// The socket server: binds a TCP listener, accepts connections, authenticates
     /// via Bearer token at HTTP upgrade, and spawns per-connection tasks.
@@ -222,8 +227,26 @@ mod imp {
     }
 
     impl SocketServer {
+        /// Construct a new socket server.
+        ///
+        /// # Preconditions (callers from outside the binary, e.g. tests)
+        ///
+        /// - `cancel` must NOT already be cancelled — `run` would exit
+        ///   immediately on the first poll.
+        /// - `stream_tx` and `ambient_tx` broadcast senders must outlive
+        ///   `run`; otherwise per-request and ambient subscribers receive
+        ///   `RecvError::Closed`.
+        /// - `cmd_tx`'s receiver must remain open; a dropped receiver
+        ///   silently discards every inbound socket command.
+        /// - `shared_clients` may be empty (auth gate rejects all 401);
+        ///   when populated, every `SocketClient.token` should be at
+        ///   least 32 characters — the same minimum `Config::validate`
+        ///   enforces. A `debug_assert!` checks this in test builds.
+        ///
+        /// `run()` consumes `self` and must be called at most once. Concurrent
+        /// invocation is undefined.
         #[allow(clippy::too_many_arguments)]
-        pub(crate) fn new(
+        pub fn new(
             config: SocketConfig,
             cmd_tx: mpsc::Sender<IncomingMessage>,
             stream_tx: broadcast::Sender<StreamEvent>,
@@ -233,6 +256,16 @@ mod imp {
             shared_clients: SharedClientList,
             shared_subs: SharedSubscriptionStore,
         ) -> Self {
+            // Mirror the `Config::validate` 32-char-minimum invariant so a
+            // direct `SocketServer::new` call cannot bypass it. Test-builds
+            // panic immediately; release builds skip this check (the auth
+            // gate's `constant_time_eq` still rejects mismatches at the
+            // request level).
+            debug_assert!(
+                shared_clients.load().iter().all(|c| c.token.len() >= 32),
+                "every SocketClient.token must be at least 32 characters \
+                 (matching Config::validate's minimum)"
+            );
             Self {
                 config,
                 cmd_tx,
@@ -249,7 +282,7 @@ mod imp {
         /// connections, and spawns per-connection tasks via a `JoinSet` so that
         /// shutdown can drain them with a bounded timeout. Returns when cancelled
         /// or on bind failure.
-        pub(crate) async fn run(self) -> Result<()> {
+        pub async fn run(self) -> Result<()> {
             let addr = format!("{}:{}", self.config.bind, self.config.port);
             let bind_addr = &self.config.bind;
             let listener = match TcpListener::bind(&addr).await {
