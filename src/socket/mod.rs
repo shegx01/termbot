@@ -47,7 +47,7 @@ pub mod subscription;
 // items but not re-export use statements; add the explicit allow here.
 #[cfg(feature = "socket")]
 #[allow(unused_imports)]
-pub(crate) use imp::{SharedSubscriptionStore, SocketServer, SubscriptionStoreInner};
+pub use imp::{SharedSubscriptionStore, SocketServer, SubscriptionStoreInner};
 
 #[cfg(feature = "socket")]
 mod imp {
@@ -124,14 +124,14 @@ mod imp {
     /// store is at capacity and a new (unknown) client is saved, the front entry
     /// (least recently used) is evicted. `map` and `order` are always kept in sync:
     /// a key present in one is present in the other, and vice versa.
-    pub(crate) struct SubscriptionStoreInner {
+    pub struct SubscriptionStoreInner {
         map: HashMap<String, Vec<(String, Filter)>>,
         order: VecDeque<String>,
         cap: usize,
     }
 
     impl SubscriptionStoreInner {
-        pub(crate) fn new(cap: usize) -> Self {
+        pub fn new(cap: usize) -> Self {
             Self {
                 map: HashMap::new(),
                 order: VecDeque::new(),
@@ -142,7 +142,7 @@ mod imp {
         /// Upsert subscriptions for `client_name`, bumping to most-recently-used.
         /// If the store is at capacity and `client_name` is new, the LRU entry is
         /// evicted first.
-        pub(crate) fn save(&mut self, client_name: String, subs: Vec<(String, Filter)>) {
+        pub fn save(&mut self, client_name: String, subs: Vec<(String, Filter)>) {
             if self.map.contains_key(&client_name) {
                 // Bump: remove from current position, push to back.
                 self.order.retain(|k| k != &client_name);
@@ -159,7 +159,7 @@ mod imp {
         }
 
         /// Look up subscriptions for `client_name`, bumping to most-recently-used.
-        pub(crate) fn restore(&mut self, client_name: &str) -> Option<&Vec<(String, Filter)>> {
+        pub fn restore(&mut self, client_name: &str) -> Option<&Vec<(String, Filter)>> {
             if self.map.contains_key(client_name) {
                 // Bump to most-recently-used position.
                 self.order.retain(|k| k != client_name);
@@ -171,7 +171,7 @@ mod imp {
         }
 
         /// Remove a client's subscriptions entirely (e.g. on unsubscribe or config removal).
-        pub(crate) fn remove(&mut self, client_name: &str) {
+        pub fn remove(&mut self, client_name: &str) {
             if self.map.remove(client_name).is_some() {
                 self.order.retain(|k| k != client_name);
             }
@@ -179,7 +179,7 @@ mod imp {
 
         /// Purge all clients whose names are not in `retained`. Called after a
         /// config hot-reload that removed one or more `[[socket.client]]` entries.
-        pub(crate) fn purge_clients(&mut self, retained: &std::collections::HashSet<String>) {
+        pub fn purge_clients(&mut self, retained: &std::collections::HashSet<String>) {
             let to_remove: Vec<String> = self
                 .map
                 .keys()
@@ -194,19 +194,19 @@ mod imp {
 
         /// Number of clients currently in the store.
         #[allow(dead_code)]
-        pub(crate) fn len(&self) -> usize {
+        pub fn len(&self) -> usize {
             self.map.len()
         }
 
         /// True when the store contains no entries.
         #[allow(dead_code)]
-        pub(crate) fn is_empty(&self) -> bool {
+        pub fn is_empty(&self) -> bool {
             self.map.is_empty()
         }
     }
 
     /// Shared, thread-safe handle to the LRU subscription store.
-    pub(crate) type SharedSubscriptionStore = Arc<Mutex<SubscriptionStoreInner>>;
+    pub type SharedSubscriptionStore = Arc<Mutex<SubscriptionStoreInner>>;
 
     /// The socket server: binds a TCP listener, accepts connections, authenticates
     /// via Bearer token at HTTP upgrade, and spawns per-connection tasks.
@@ -223,7 +223,7 @@ mod imp {
 
     impl SocketServer {
         #[allow(clippy::too_many_arguments)]
-        pub(crate) fn new(
+        pub fn new(
             config: SocketConfig,
             cmd_tx: mpsc::Sender<IncomingMessage>,
             stream_tx: broadcast::Sender<StreamEvent>,
@@ -249,7 +249,7 @@ mod imp {
         /// connections, and spawns per-connection tasks via a `JoinSet` so that
         /// shutdown can drain them with a bounded timeout. Returns when cancelled
         /// or on bind failure.
-        pub(crate) async fn run(self) -> Result<()> {
+        pub async fn run(self) -> Result<()> {
             let addr = format!("{}:{}", self.config.bind, self.config.port);
             let bind_addr = &self.config.bind;
             let listener = match TcpListener::bind(&addr).await {
