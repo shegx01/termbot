@@ -429,13 +429,6 @@ pub fn format_tool_event_full(
     format!("{} {} {}", icon, tool, body)
 }
 
-/// Legacy two-arg formatter. Kept for call sites that don't have structured
-/// `input` / `output`. Forwards to `format_tool_event_full`.
-#[allow(dead_code)]
-pub fn format_tool_event(tool: &str, description: &str) -> String {
-    format_tool_event_full(tool, description, None, None)
-}
-
 /// Read-only context passed into `drive_harness`.
 ///
 /// Groups the reply context, platform references, and structured-output
@@ -868,11 +861,11 @@ pub(crate) fn split_message(text: &str, max_len: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
-    // ── format_tool_event ────────────────────────────────────────────────────
+    // ── format_tool_event_full ───────────────────────────────────────────────
 
     #[test]
     fn format_tool_event_read_contains_icon_tool_and_description() {
-        let result = format_tool_event("Read", "file.rs");
+        let result = format_tool_event_full("Read", "file.rs", None, None);
         assert!(result.contains("📖"), "expected book icon");
         assert!(result.contains("Read"), "expected tool name");
         assert!(result.contains("file.rs"), "expected description");
@@ -880,20 +873,20 @@ mod tests {
 
     #[test]
     fn format_tool_event_thinking_contains_brain_icon_and_tool_name() {
-        let result = format_tool_event("Thinking", "");
+        let result = format_tool_event_full("Thinking", "", None, None);
         assert!(result.contains("🧠"), "expected brain icon");
         assert!(result.contains("Thinking"), "expected tool name");
     }
 
     #[test]
     fn format_tool_event_write_contains_pencil_icon() {
-        let result = format_tool_event("Write", "some/long/path");
+        let result = format_tool_event_full("Write", "some/long/path", None, None);
         assert!(result.contains("📝"), "expected pencil icon");
     }
 
     #[test]
     fn format_tool_event_unknown_tool_contains_wrench_icon() {
-        let result = format_tool_event("UnknownTool", "arg");
+        let result = format_tool_event_full("UnknownTool", "arg", None, None);
         assert!(
             result.contains("🔧"),
             "expected wrench icon for unknown tool"
@@ -902,7 +895,7 @@ mod tests {
 
     #[test]
     fn format_tool_event_empty_description_has_no_trailing_space() {
-        let result = format_tool_event("Bash", "");
+        let result = format_tool_event_full("Bash", "", None, None);
         assert!(!result.ends_with(' '), "should not have trailing space");
         assert!(result.contains("💻"), "expected computer icon");
         assert!(result.contains("Bash"), "expected tool name");
@@ -911,7 +904,7 @@ mod tests {
     #[test]
     fn format_tool_event_long_description_is_truncated_with_ellipsis() {
         let long_desc = "x".repeat(100);
-        let result = format_tool_event("Read", &long_desc);
+        let result = format_tool_event_full("Read", &long_desc, None, None);
         assert!(result.contains("..."), "expected truncation ellipsis");
         // The description portion should not exceed 80 chars + "..."
         // Full result is icon + space + tool + space + truncated_desc
@@ -930,7 +923,7 @@ mod tests {
     #[test]
     fn format_tool_event_description_exactly_at_80_chars_is_not_truncated() {
         let desc = "y".repeat(80);
-        let result = format_tool_event("Grep", &desc);
+        let result = format_tool_event_full("Grep", &desc, None, None);
         assert!(
             !result.contains("..."),
             "80-char description should not be truncated"

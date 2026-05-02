@@ -79,7 +79,6 @@ pub struct Chats {
 /// Platform adapters send these over an mpsc channel; StateStore is owned
 /// exclusively by App and applies them with debounce before persisting.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum StateUpdate {
     /// Overwrite the Telegram polling offset (monotonic by construction).
     TelegramOffset(i64),
@@ -125,7 +124,6 @@ impl StateStore {
     /// - Missing file → returns default state (fresh install).
     /// - Corrupt / wrong schema_version → renames to `<path>.corrupt-<unix_ts>`,
     ///   logs a WARN, and returns default state.
-    #[allow(dead_code)]
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path: PathBuf = path.into();
 
@@ -191,7 +189,6 @@ impl StateStore {
     }
 
     /// Apply a `StateUpdate` to in-memory state.
-    #[allow(dead_code)]
     pub fn apply(&mut self, update: StateUpdate) {
         match update {
             StateUpdate::TelegramOffset(offset) => {
@@ -264,7 +261,6 @@ impl StateStore {
     ///    atomic on a single filesystem).
     /// 3. `persist()` (atomic rename).
     /// 4. fsync the parent directory so the directory entry is durable.
-    #[allow(dead_code)]
     pub fn persist(&self) -> Result<()> {
         // `Path::parent()` returns `Some("")` for a bare filename like
         // `terminus-state.json`, which propagates into `File::open("")`
@@ -361,14 +357,12 @@ impl StateStore {
     }
 
     /// Returns a reference to the current in-memory state snapshot.
-    #[allow(dead_code)]
     pub fn snapshot(&self) -> &State {
         &self.state
     }
 
     /// Returns the default state file path: `<config_parent>/terminus-state.json`.
     /// Used when `power.state_file` is `None`.
-    #[allow(dead_code)]
     pub fn resolve_default_path(config_path: &Path) -> PathBuf {
         let parent = match config_path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,

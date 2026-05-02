@@ -18,7 +18,6 @@ pub struct Config {
     #[serde(default)]
     pub commands: CommandsConfig,
     #[serde(default)]
-    #[allow(dead_code)]
     pub power: PowerConfig,
     /// Per-schema structured output configuration (`[schemas.<name>]` tables).
     #[serde(default)]
@@ -317,7 +316,6 @@ impl Default for StructuredOutputConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct PowerConfig {
     #[serde(default = "power_enabled_default")]
     pub enabled: bool,

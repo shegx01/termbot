@@ -21,7 +21,6 @@ pub struct FakePowerManager {
     inner: Arc<Mutex<FakeState>>,
 }
 
-#[allow(dead_code)]
 impl FakePowerManager {
     pub fn new(lid: LidState, power: PowerSource) -> Self {
         Self {

@@ -3,6 +3,7 @@
 //! Provides a platform-agnostic `PowerManager` trait and shared types.
 //! Platform implementations (macOS, Linux) are added in Step 3.
 
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
 pub mod fake;
 pub mod gap_detector;
 pub mod policy;
