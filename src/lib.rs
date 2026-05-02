@@ -19,6 +19,7 @@ pub mod command;
 pub mod config;
 pub mod delivery;
 pub mod harness;
+pub mod harness_registry;
 pub mod power;
 pub mod session;
 pub mod socket;

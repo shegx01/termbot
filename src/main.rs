@@ -6,6 +6,7 @@ mod command;
 mod config;
 mod delivery;
 mod harness;
+mod harness_registry;
 mod power;
 mod session;
 mod socket;
