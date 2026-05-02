@@ -16,6 +16,7 @@ pub mod banner;
 pub mod buffer;
 pub mod chat_adapters;
 pub mod command;
+pub mod command_router;
 pub mod config;
 pub mod delivery;
 pub mod harness;

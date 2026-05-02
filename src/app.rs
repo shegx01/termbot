@@ -16,13 +16,13 @@ use crate::chat_adapters::discord::DiscordAdapter;
 #[cfg(feature = "slack")]
 use crate::chat_adapters::slack::SlackPlatform;
 use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
-use crate::command::{CommandBlocklist, HarnessOptions, HarnessSubcommandKind, ParsedCommand};
+use crate::command::{CommandBlocklist, HarnessOptions};
 use crate::config::Config;
-use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
-use crate::harness::{drive_harness, HarnessContext, HarnessKind};
+use crate::delivery::{GapInfo, GapPrefixes, PendingBannerAcks};
+use crate::harness::HarnessKind;
 use crate::harness_registry::{HarnessRegistry, PromptDispatchContext};
 use crate::power::types::PowerSignal;
-use crate::session::{self, SessionManager};
+use crate::session::SessionManager;
 use crate::socket::events::AmbientEvent;
 use crate::state_persistor::StatePersistor;
 #[cfg(test)]
@@ -37,26 +37,32 @@ use crate::wake::{WakeCoordinator, WakeDispatchContext};
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub struct App {
-    blocklist: CommandBlocklist,
-    session_mgr: SessionManager,
-    buffers: HashMap<String, OutputBuffer>,
+    // Fields are `pub(crate)` so the per-arm command handlers in
+    // `src/command_router.rs` can mutate them via `&mut App`. The `App`
+    // struct itself is `pub` but its fields are NOT exposed outside the
+    // crate (no public-API surface change vs. pre-extraction).
+    pub(crate) blocklist: CommandBlocklist,
+    pub(crate) session_mgr: SessionManager,
+    pub(crate) buffers: HashMap<String, OutputBuffer>,
     /// Owns the four harness implementations, the named-session index +
     /// LRU policy, and the prompt-dispatch logic. See `src/harness_registry.rs`.
-    harness_registry: HarnessRegistry,
-    stream_tx: broadcast::Sender<StreamEvent>,
-    telegram: Option<Arc<dyn ChatPlatform>>,
-    slack: Option<Arc<dyn ChatPlatform>>,
+    pub(crate) harness_registry: HarnessRegistry,
+    pub(crate) stream_tx: broadcast::Sender<StreamEvent>,
+    pub(crate) telegram: Option<Arc<dyn ChatPlatform>>,
+    pub(crate) slack: Option<Arc<dyn ChatPlatform>>,
     /// Typed Arc to the Slack platform for direct catchup calls.
     /// Kept alongside the dyn `slack` field — both point to the same object.
+    /// Stays private (only `App::handle_gap` uses it; `command_router` does not).
     #[cfg(feature = "slack")]
     slack_platform: Option<Arc<SlackPlatform>>,
-    discord: Option<Arc<dyn ChatPlatform>>,
+    pub(crate) discord: Option<Arc<dyn ChatPlatform>>,
     /// Typed Arc to the Discord platform for direct catchup calls.
     /// Kept alongside the dyn `discord` field — both point to the same object.
+    /// Stays private (only `App::handle_gap` uses it; `command_router` does not).
     #[cfg(feature = "discord")]
     discord_platform: Option<Arc<DiscordAdapter>>,
-    offline_buffer_max: usize,
-    trigger: char,
+    pub(crate) offline_buffer_max: usize,
+    pub(crate) trigger: char,
 
     // ── Sleep/wake recovery state ─────────────────────────────────────────────
     /// State store + debounce-or-force-persist policy + first-interaction
@@ -64,15 +70,15 @@ pub struct App {
     /// implementation. App owns it; the rest of the system writes through
     /// either `state_tx` (which the main loop drains and forwards to
     /// `apply_state_update`) or via direct method calls on `App`.
-    state_persistor: StatePersistor,
+    pub(crate) state_persistor: StatePersistor,
     /// mpsc sender to push `StateUpdate`s into the App's `state_rx` channel.
     /// Kept here so `App` itself can send updates (e.g. `MarkDirty`, `Tick`).
-    state_tx: mpsc::Sender<StateUpdate>,
+    pub(crate) state_tx: mpsc::Sender<StateUpdate>,
     /// Wake/sleep recovery coordinator. Owns the active-chat sets per
     /// platform and the `startup_was_clean` flag. Runs the gap-banner
     /// and catchup orchestration on `PowerSignal::GapDetected` and at
     /// startup. See `src/wake.rs`.
-    wake: WakeCoordinator,
+    pub(crate) wake: WakeCoordinator,
     /// Banner-ack and inline-prefix coordinator. Owns the `pending_banner_acks`
     /// and `gap_prefix` shared maps; runs the install/await/fallback dance
     /// for `handle_gap`. See `src/banner.rs` for the extracted state machine
@@ -80,14 +86,14 @@ pub struct App {
     banner: BannerCoordinator,
 
     // ── Structured output ─────────────────────────────────────────────────────
-    schema_registry: Arc<SchemaRegistry>,
-    delivery_queue: Arc<DeliveryQueue>,
-    webhook_client: Arc<WebhookClient>,
+    pub(crate) schema_registry: Arc<SchemaRegistry>,
+    pub(crate) delivery_queue: Arc<DeliveryQueue>,
+    pub(crate) webhook_client: Arc<WebhookClient>,
     // ── Socket ambient event bus ───────────────────────────────────────────
     /// Broadcast sender for genuinely-new ambient events consumed by socket
     /// subscribers.  Capacity 512.  Fire-and-forget: send errors are ignored
     /// (expected when no socket connections are active or socket is disabled).
-    ambient_tx: broadcast::Sender<AmbientEvent>,
+    pub(crate) ambient_tx: broadcast::Sender<AmbientEvent>,
 
     /// Shutdown notify (async wakeup) for the retry worker.  Notified by
     /// `mark_clean_shutdown` for immediate wakeup during idle/backoff sleeps.
@@ -260,7 +266,7 @@ impl App {
 
     /// Fire-and-forget emit of an ambient event.  Ignores closed-channel
     /// errors (expected when socket is disabled / no subscribers).
-    fn emit_ambient(&self, event: AmbientEvent) {
+    pub(crate) fn emit_ambient(&self, event: AmbientEvent) {
         let _ = self.ambient_tx.send(event);
     }
 
@@ -441,647 +447,12 @@ impl App {
         self.banner.consume_prefix(chat_id).await
     }
 
+    /// Drive a single inbound message through the command pipeline. Thin
+    /// pass-through to [`crate::command_router::route_command`] — see that
+    /// module for the per-arm dispatch and the rationale for the
+    /// `&mut App`-based extraction shape.
     pub async fn handle_command(&mut self, msg: &IncomingMessage) {
-        // Ensure MarkDirty is sent on the first real user interaction.
-        if self.state_persistor.claim_dirty_send() {
-            if let Err(e) = self.state_tx.try_send(StateUpdate::MarkDirty) {
-                tracing::warn!("state_tx full, update dropped: {}", e);
-            }
-        }
-
-        // Emit ChatForward ambient event for chat-origin messages (not socket).
-        if msg.socket_request_id.is_none() {
-            self.emit_ambient(AmbientEvent::ChatForward {
-                platform: format!("{:?}", msg.platform),
-                user_id: msg.user_id.clone(),
-                text: msg.text.clone(),
-            });
-        }
-
-        // Skip chat binding for socket-origin messages — they use
-        // PlatformType::Telegram as a wire-compat placeholder but should NOT
-        // pollute active_telegram_chats or trigger gap banners.
-        if msg.reply_context.socket_reply_tx.is_none() {
-            // Bind chat IDs for active platform (so we know which chats to banner).
-            // Each `wake.insert_*_chat` returns true iff the chat was newly
-            // added — only then do we send the corresponding StateUpdate.
-            match msg.reply_context.platform {
-                PlatformType::Telegram => {
-                    if let Ok(id) = msg.reply_context.chat_id.parse::<i64>() {
-                        if self.wake.insert_telegram_chat(id) {
-                            if let Err(e) =
-                                self.state_tx.try_send(StateUpdate::BindTelegramChat(id))
-                            {
-                                tracing::warn!("state_tx full, update dropped: {}", e);
-                            }
-                        }
-                    }
-                }
-                PlatformType::Slack => {
-                    let id = msg.reply_context.chat_id.clone();
-                    if self.wake.insert_slack_chat(id.clone()) {
-                        if let Err(e) = self.state_tx.try_send(StateUpdate::BindSlackChat(id)) {
-                            tracing::warn!("state_tx full, update dropped: {}", e);
-                        }
-                    }
-                }
-                PlatformType::Discord => {
-                    let id = msg.reply_context.chat_id.clone();
-                    if self.wake.insert_discord_chat(id.clone()) {
-                        if let Err(e) = self.state_tx.try_send(StateUpdate::BindDiscordChat(id)) {
-                            tracing::warn!("state_tx full, update dropped: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        let cmd = match ParsedCommand::parse(&msg.text, self.trigger) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                self.send_error(&msg.reply_context, &format!("{:#}", e))
-                    .await;
-                return;
-            }
-        };
-
-        // Multi-line StdinInput guard: the parser allows multi-line StdinInput,
-        // but the dispatcher must check harness state before routing to tmux.
-        if let ParsedCommand::StdinInput { ref text } = cmd {
-            if (text.contains('\n') || text.contains('\r'))
-                && self.session_mgr.foreground_harness().is_none()
-            {
-                self.send_error(
-                    &msg.reply_context,
-                    &format!(
-                        "Multi-line input requires harness mode. \
-                         Use `{} claude on` to enable, or prefix with `{} claude <prompt>` for one-off.",
-                        self.trigger, self.trigger
-                    ),
-                )
-                .await;
-                return;
-            }
-        }
-
-        tracing::info!(
-            "handle_command: {:?} (fg={:?})",
-            cmd,
-            self.session_mgr.foreground_session()
-        );
-
-        // Always bind the foreground session to the current chat context.
-        // This ensures delivery tasks know where to send output — critical after
-        // restart (reconnected sessions have no chat binding) and for cross-platform use.
-        if let Some(fg) = self.session_mgr.foreground_session() {
-            let _ = self.stream_tx.send(StreamEvent::SessionStarted {
-                session: fg.to_string(),
-                chat_id: msg.reply_context.chat_id.clone(),
-                thread_ts: msg.reply_context.thread_ts.clone(),
-            });
-        }
-
-        match cmd {
-            ParsedCommand::ShellCommand { ref cmd } if self.blocklist.is_blocked(cmd) => {
-                self.send_error(&msg.reply_context, "Command blocked by security policy")
-                    .await;
-            }
-            ParsedCommand::NewSession { name } => match self.session_mgr.new_session(&name).await {
-                Ok(()) => {
-                    let mut buf = OutputBuffer::new(&name, self.offline_buffer_max);
-                    buf.sync_offset(self.session_mgr.tmux()).await;
-                    self.buffers.insert(name.clone(), buf);
-                    let _ = self.stream_tx.send(StreamEvent::SessionStarted {
-                        session: name.clone(),
-                        chat_id: msg.reply_context.chat_id.clone(),
-                        thread_ts: msg.reply_context.thread_ts.clone(),
-                    });
-                    self.emit_ambient(AmbientEvent::SessionCreated {
-                        session: name.clone(),
-                        origin_chat: Some(msg.reply_context.chat_id.clone()),
-                        created_at: chrono::Utc::now(),
-                    });
-                    self.send_reply(&msg.reply_context, &format!("Session '{}' created", name))
-                        .await;
-                }
-                Err(e) => {
-                    // Check if the error is a session-limit error and emit ambient.
-                    let err_str = format!("{:#}", e);
-                    if err_str.contains("Maximum session limit") {
-                        self.emit_ambient(AmbientEvent::SessionLimitReached {
-                            attempted: name.clone(),
-                            current: self.session_mgr.session_count(),
-                            max: self.session_mgr.max_sessions(),
-                        });
-                    }
-                    self.send_error(&msg.reply_context, &err_str).await;
-                }
-            },
-            ParsedCommand::Foreground { name } => match self.session_mgr.fg(&name) {
-                Ok(()) => {
-                    let _ = self.stream_tx.send(StreamEvent::SessionStarted {
-                        session: name.clone(),
-                        chat_id: msg.reply_context.chat_id.clone(),
-                        thread_ts: msg.reply_context.thread_ts.clone(),
-                    });
-                    self.send_reply(
-                        &msg.reply_context,
-                        &format!("Session '{}' foregrounded", name),
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    self.send_error(&msg.reply_context, &format!("{:#}", e))
-                        .await;
-                }
-            },
-            ParsedCommand::Background => match self.session_mgr.bg() {
-                Ok(Some(name)) => {
-                    self.send_reply(
-                        &msg.reply_context,
-                        &format!("Session '{}' backgrounded", name),
-                    )
-                    .await;
-                }
-                Ok(None) => {
-                    self.send_error(&msg.reply_context, "No foreground session to background")
-                        .await;
-                }
-                Err(e) => {
-                    self.send_error(&msg.reply_context, &format!("{:#}", e))
-                        .await;
-                }
-            },
-            ParsedCommand::ListSessions => {
-                let sessions = self.session_mgr.list();
-                if sessions.is_empty() {
-                    self.send_reply(&msg.reply_context, "No active sessions")
-                        .await;
-                } else {
-                    let mut lines = Vec::new();
-                    for (name, status, created) in &sessions {
-                        let status_str = match status {
-                            session::SessionStatus::Foreground => "[foreground]",
-                            session::SessionStatus::Background => "[background]",
-                        };
-                        let elapsed = created.elapsed();
-                        lines.push(format!(
-                            "  {} {} (uptime: {}s)",
-                            name,
-                            status_str,
-                            elapsed.as_secs()
-                        ));
-                    }
-                    self.send_reply(&msg.reply_context, &lines.join("\n")).await;
-                }
-            }
-            ParsedCommand::Screen => match self.session_mgr.foreground_session() {
-                Some(fg) => match self.session_mgr.tmux().capture_pane(fg).await {
-                    Ok(screen) => {
-                        let trimmed = screen
-                            .lines()
-                            .map(|l| l.trim_end())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                            .trim()
-                            .to_string();
-                        if trimmed.is_empty() {
-                            self.send_reply(&msg.reply_context, "(empty screen)").await;
-                        } else {
-                            for chunk in split_message(&trimmed, 4000) {
-                                self.send_reply(&msg.reply_context, &chunk).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.send_error(&msg.reply_context, &format!("{:#}", e))
-                            .await;
-                    }
-                },
-                None => {
-                    self.send_error(&msg.reply_context, "No active session")
-                        .await;
-                }
-            },
-            ParsedCommand::KillSession { name } => match self.session_mgr.kill(&name).await {
-                Ok(()) => {
-                    self.buffers.remove(&name);
-                    self.emit_ambient(AmbientEvent::SessionKilled {
-                        session: name.clone(),
-                        reason: "user_request".to_string(),
-                        killed_at: chrono::Utc::now(),
-                    });
-                    self.send_reply(&msg.reply_context, &format!("Session '{}' killed", name))
-                        .await;
-                }
-                Err(e) => {
-                    self.send_error(&msg.reply_context, &format!("{:#}", e))
-                        .await;
-                }
-            },
-            ParsedCommand::HarnessOn {
-                harness: kind,
-                options,
-                initial_prompt,
-            } => {
-                // Verify the harness is actually registered (stubs are not)
-                if !self.harness_registry.contains_kind(&kind) {
-                    self.send_error(
-                        &msg.reply_context,
-                        &format!("{} harness is not available", kind.name()),
-                    )
-                    .await;
-                    return;
-                }
-                let fg = match self.session_mgr.foreground_session() {
-                    Some(fg) => fg.to_string(),
-                    None => {
-                        self.send_error(&msg.reply_context, "No active session")
-                            .await;
-                        return;
-                    }
-                };
-                // Validate --name/--resume on non-resumable harnesses.
-                // Dispatch context built inline so its field-level borrows
-                // end after the reject call, freeing `&mut self.session_mgr`
-                // for the `set_harness` calls further down.
-                {
-                    let dispatch = PromptDispatchContext {
-                        session_mgr: &self.session_mgr,
-                        telegram: self.telegram.as_deref(),
-                        slack: self.slack.as_deref(),
-                        discord: self.discord.as_deref(),
-                        schema_registry: &self.schema_registry,
-                        delivery_queue: &self.delivery_queue,
-                        webhook_client: &self.webhook_client,
-                        stream_tx: &self.stream_tx,
-                        ambient_tx: &self.ambient_tx,
-                    };
-                    if self
-                        .harness_registry
-                        .reject_if_not_resumable(&msg.reply_context, &kind, &options, &dispatch)
-                        .await
-                    {
-                        return;
-                    }
-                }
-
-                // Resolve named session for --name/--resume. We do NOT pre-create
-                // an empty-session_id entry here — persistence happens only after
-                // the first prompt returns a real session_id. This keeps the
-                // state file free of "zombie" entries when the user runs
-                // `claude on --name foo` then exits without prompting, and
-                // avoids the "exists but has no conversation yet" dead-end on
-                // a subsequent `--resume foo`.
-                let mut named_notification: Option<String> = None;
-                if let Some(ref resume_name) = options.resume {
-                    match self
-                        .harness_registry
-                        .lookup_named_session(kind, resume_name)
-                    {
-                        Some(entry) if !entry.session_id.is_empty() => {
-                            named_notification =
-                                Some(format!("Resuming session '{}'", resume_name));
-                        }
-                        _ => {
-                            self.send_error(
-                                &msg.reply_context,
-                                &format!(
-                                    "No session named '{}'. Use --name to create one.",
-                                    resume_name
-                                ),
-                            )
-                            .await;
-                            return;
-                        }
-                    }
-                } else if let Some(ref name) = options.name {
-                    let is_resumable = self
-                        .harness_registry
-                        .lookup_named_session(kind, name)
-                        .is_some_and(|e| !e.session_id.is_empty());
-                    let primary = if is_resumable {
-                        format!("Resuming existing session '{}'", name)
-                    } else {
-                        format!("Created new session '{}'", name)
-                    };
-                    // Only hint on creation, not on resume — if the user is
-                    // resuming a numeric name, they clearly know it exists.
-                    let hint = (!is_resumable).then(|| numeric_name_hint(name)).flatten();
-                    named_notification = Some(match hint {
-                        Some(h) => format!("{}\n{}", primary, h),
-                        None => primary,
-                    });
-                }
-
-                // Check if switching from another harness or updating options
-                if let Some(current) = self.session_mgr.foreground_harness() {
-                    if current == kind {
-                        // Same harness re-activated — check if named session changed
-                        let new_session_name =
-                            options.name.as_deref().or(options.resume.as_deref());
-                        let prev_resolved = self
-                            .session_mgr
-                            .foreground_named_session_resolved()
-                            .map(|s| s.to_string());
-
-                        self.session_mgr
-                            .set_harness(&fg, Some(kind), options.clone());
-
-                        // Update named_session_resolved if session name changed
-                        if new_session_name.map(|s| s.to_string()) != prev_resolved {
-                            self.session_mgr.set_named_session_resolved(
-                                new_session_name.map(|s| s.to_string()),
-                            );
-                            if let Some(note) = named_notification {
-                                self.send_reply(&msg.reply_context, &note).await;
-                            }
-                        }
-
-                        let opts_msg = if options.is_empty() {
-                            format!("{} mode: options reset to defaults.", kind.name())
-                        } else {
-                            format!(
-                                "{} mode: options updated.\nOptions: {}",
-                                kind.name(),
-                                options.summary()
-                            )
-                        };
-                        self.send_reply(&msg.reply_context, &opts_msg).await;
-                        // Fire the initial prompt, if provided (e.g.
-                        // `: claude on --resume review please look at the bag`).
-                        if let Some(ref prompt) = initial_prompt {
-                            self.send_harness_prompt(
-                                &msg.reply_context,
-                                &kind,
-                                prompt,
-                                &msg.attachments,
-                                &options,
-                            )
-                            .await;
-                        }
-                        return;
-                    }
-                    // Check resume support of the CURRENT harness before switching away
-                    if let Some(h) = self.harness_registry.harness_for(&current) {
-                        if !h.supports_resume() {
-                            self.send_error(
-                                &msg.reply_context,
-                                &format!(
-                                    "{} is active but doesn't support resume. Run `{} {} off` first to avoid losing context.",
-                                    current.name(),
-                                    self.trigger,
-                                    current.name().to_lowercase()
-                                ),
-                            )
-                            .await;
-                            return;
-                        }
-                    }
-                    self.send_reply(
-                        &msg.reply_context,
-                        &format!(
-                            "Switching from {} to {} ({} session preserved)",
-                            current.name(),
-                            kind.name(),
-                            current.name()
-                        ),
-                    )
-                    .await;
-                }
-                // Send named session notification before the ON message
-                if let Some(note) = named_notification {
-                    self.send_reply(&msg.reply_context, &note).await;
-                }
-
-                let opts_summary = if options.is_empty() {
-                    String::new()
-                } else {
-                    format!("\nOptions: {}", options.summary())
-                };
-                // Track the resolved named session name for notification suppression
-                let resolved_name = options
-                    .name
-                    .as_deref()
-                    .or(options.resume.as_deref())
-                    .map(|s| s.to_string());
-                // Keep a copy for the optional initial prompt, since
-                // `set_harness` moves `options` into session state.
-                let options_for_prompt = initial_prompt.as_ref().map(|_| options.clone());
-                self.session_mgr.set_harness(&fg, Some(kind), options);
-                self.session_mgr.set_named_session_resolved(resolved_name);
-                self.send_reply(
-                    &msg.reply_context,
-                    &format!(
-                        "{} mode ON. Plain text now goes to {}. Use `{} {} off` to switch back.{}",
-                        kind.name(),
-                        kind.name(),
-                        self.trigger,
-                        kind.name().to_lowercase(),
-                        opts_summary
-                    ),
-                )
-                .await;
-                // Fire the initial prompt, if provided.
-                if let (Some(prompt), Some(opts)) = (initial_prompt, options_for_prompt) {
-                    self.send_harness_prompt(
-                        &msg.reply_context,
-                        &kind,
-                        &prompt,
-                        &msg.attachments,
-                        &opts,
-                    )
-                    .await;
-                }
-            }
-            ParsedCommand::HarnessOff { harness: kind } => {
-                let fg = match self.session_mgr.foreground_session() {
-                    Some(fg) => fg.to_string(),
-                    None => {
-                        self.send_error(&msg.reply_context, "No active session")
-                            .await;
-                        return;
-                    }
-                };
-                // Verify the specified harness is actually the active one
-                let current = self.session_mgr.foreground_harness();
-                if current != Some(kind) {
-                    self.send_error(
-                        &msg.reply_context,
-                        &format!(
-                            "{} is not active{}",
-                            kind.name(),
-                            current
-                                .map(|c| format!(" (current: {})", c.name()))
-                                .unwrap_or_default()
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-                self.session_mgr
-                    .set_harness(&fg, None, HarnessOptions::default());
-                self.send_reply(
-                    &msg.reply_context,
-                    &format!(
-                        "{} mode OFF. Plain text now goes to the terminal session.",
-                        kind.name()
-                    ),
-                )
-                .await;
-            }
-            ParsedCommand::HarnessPrompt {
-                harness: kind,
-                ref prompt,
-                ref options,
-            } => {
-                if self.blocklist.is_blocked(prompt) {
-                    self.send_error(
-                        &msg.reply_context,
-                        &format!("{} prompt blocked by security policy", kind.name()),
-                    )
-                    .await;
-                } else {
-                    // One-shot prompt (`: claude --schema=foo <prompt>`): use parsed options.
-                    self.send_harness_prompt(
-                        &msg.reply_context,
-                        &kind,
-                        prompt,
-                        &msg.attachments,
-                        options,
-                    )
-                    .await;
-                }
-            }
-            ParsedCommand::HarnessSubcommand {
-                harness,
-                subcommand,
-                args,
-            } => {
-                let hctx = HarnessContext {
-                    ctx: &msg.reply_context,
-                    telegram: self.telegram.as_deref(),
-                    slack: self.slack.as_deref(),
-                    discord: self.discord.as_deref(),
-                    schema_registry: &self.schema_registry,
-                    delivery_queue: &self.delivery_queue,
-                    webhook_client: &self.webhook_client,
-                    stream_tx: &self.stream_tx,
-                };
-                // Route to the per-harness subcommand runner. Both runners
-                // emit the same Text+Done / Error+Done shape that
-                // drive_harness consumes — subcommands don't create sessions
-                // and don't fire ambient HarnessStarted/Finished events.
-                let setup = match (harness, subcommand) {
-                    (HarnessKind::Opencode, HarnessSubcommandKind::Opencode(sub)) => {
-                        self.harness_registry
-                            .opencode()
-                            .run_subcommand(sub, args)
-                            .await
-                    }
-                    (HarnessKind::Gemini, HarnessSubcommandKind::Gemini(sub)) => {
-                        self.harness_registry
-                            .gemini()
-                            .run_subcommand(sub, args)
-                            .await
-                    }
-                    (HarnessKind::Codex, HarnessSubcommandKind::Codex(sub)) => {
-                        self.harness_registry
-                            .codex()
-                            .run_subcommand(sub, args)
-                            .await
-                    }
-                    (h, _) => {
-                        self.send_error(
-                            &msg.reply_context,
-                            &format!(
-                                "HarnessSubcommand kind mismatch for {} — internal bug",
-                                h.name()
-                            ),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                match setup {
-                    Ok(event_rx) => {
-                        let _ = drive_harness(event_rx, &hctx).await;
-                    }
-                    Err(e) => {
-                        self.send_error(
-                            &msg.reply_context,
-                            &format!("{} subcommand setup failed: {}", harness.name(), e),
-                        )
-                        .await;
-                    }
-                }
-            }
-            ParsedCommand::ShellCommand { cmd } => {
-                // Snapshot pane before command so we can diff afterward
-                match self.session_mgr.foreground_session() {
-                    None => {
-                        tracing::warn!("ShellCommand '{}': no foreground session", cmd);
-                    }
-                    Some(fg) => {
-                        if let Some(buf) = self.buffers.get_mut(fg) {
-                            buf.snapshot_before_command(self.session_mgr.tmux(), Some(&cmd))
-                                .await;
-                            tracing::debug!("ShellCommand '{}': snapshot taken", cmd);
-                        } else {
-                            tracing::warn!(
-                                "ShellCommand '{}': no buffer for session '{}', output won't be captured",
-                                cmd, fg
-                            );
-                        }
-                    }
-                }
-                if let Err(e) = self.session_mgr.execute_in_foreground(&cmd).await {
-                    self.send_error(&msg.reply_context, &format!("{:#}", e))
-                        .await;
-                }
-            }
-            ParsedCommand::StdinInput { text } => {
-                // Single blocklist check regardless of routing
-                if self.blocklist.is_blocked(&text) {
-                    self.send_error(&msg.reply_context, "Command blocked by security policy")
-                        .await;
-                    return;
-                }
-                if let Some(kind) = self.session_mgr.foreground_harness() {
-                    // Route to active harness with stored session options
-                    let opts = self.session_mgr.foreground_harness_options();
-                    self.send_harness_prompt(
-                        &msg.reply_context,
-                        &kind,
-                        &text,
-                        &msg.attachments,
-                        &opts,
-                    )
-                    .await;
-                } else {
-                    // Images are only supported in harness mode
-                    if !msg.attachments.is_empty() {
-                        self.send_error(
-                            &msg.reply_context,
-                            &format!("Images are only supported in harness mode. Use `{} claude on` first.", self.trigger),
-                        )
-                        .await;
-                        return;
-                    }
-                    // Route to terminal
-                    if let Some(fg) = self.session_mgr.foreground_session() {
-                        if let Some(buf) = self.buffers.get_mut(fg) {
-                            buf.snapshot_before_command(self.session_mgr.tmux(), Some(&text))
-                                .await;
-                        }
-                    }
-                    if let Err(e) = self.session_mgr.send_stdin_to_foreground(&text).await {
-                        self.send_error(&msg.reply_context, &format!("{:#}", e))
-                            .await;
-                    }
-                }
-            }
-        }
+        crate::command_router::route_command(self, msg).await;
     }
 
     pub async fn health_check(&mut self) {
@@ -1131,7 +502,7 @@ impl App {
     /// dispatch context immutably borrows `session_mgr/telegram/slack/.../ambient_tx`,
     /// and the registry call mutably borrows `harness_registry` — disjoint
     /// fields, no conflict.
-    async fn send_harness_prompt(
+    pub(crate) async fn send_harness_prompt(
         &mut self,
         ctx: &ReplyContext,
         kind: &HarnessKind,
@@ -1155,7 +526,13 @@ impl App {
             .await;
     }
 
-    async fn send_reply(&self, ctx: &ReplyContext, text: &str) {
+    /// Send a chat-safe reply through the appropriate channel for `ctx`.
+    /// Socket-origin messages (`ctx.socket_reply_tx.is_some()`) route to the
+    /// per-request mpsc channel; chat-origin messages route through the
+    /// matching platform adapter (`telegram` / `slack` / `discord`).
+    /// Visibility is `pub(crate)` so the per-arm handlers in
+    /// `src/command_router.rs` can call this directly via `app.send_reply(...)`.
+    pub(crate) async fn send_reply(&self, ctx: &ReplyContext, text: &str) {
         // Socket-origin: route to the per-request response channel.
         if let Some(ref tx) = ctx.socket_reply_tx {
             let _ = tx.send(text.to_string());
@@ -1177,7 +554,9 @@ impl App {
         }
     }
 
-    async fn send_error(&self, ctx: &ReplyContext, error: &str) {
+    /// Wrap `error` with `"Error: "` and forward to [`Self::send_reply`].
+    /// `pub(crate)` for the same reason as `send_reply`.
+    pub(crate) async fn send_error(&self, ctx: &ReplyContext, error: &str) {
         self.send_reply(ctx, &format!("Error: {}", error)).await;
     }
 }
@@ -1188,10 +567,10 @@ impl App {
 ///
 /// Fires only on session *creation*, so resuming an existing numeric name
 /// stays silent. Mirrors `harness_registry::numeric_name_hint` (SYNC: keep
-/// both copies in lock-step — `App::handle_command`'s HarnessOn branch and
+/// both copies in lock-step — `command_router`'s HarnessOn branch and
 /// `HarnessRegistry::send_harness_prompt` each emit this hint, and a behavior
 /// change to one must propagate to the other).
-fn numeric_name_hint(name: &str) -> Option<String> {
+pub(crate) fn numeric_name_hint(name: &str) -> Option<String> {
     name.parse::<u32>().ok().map(|_| {
         format!(
             "Hint: '{name}' is a valid session name, but if you meant --max-turns use `-t {name}` (the `-n` short flag is now --name).",
@@ -1767,11 +1146,12 @@ patterns = []
     }
 
     #[tokio::test]
-    async fn zombie_entry_in_state_resumes_to_error() {
+    async fn zombie_entry_in_state_loads_but_does_not_round_trip() {
         // G5: an old-format state file with an empty-session_id entry is
-        // loaded into the App but `--resume` on it errors cleanly (not a
-        // panic, not a successful "resume" with no conversation). The
-        // guard is `!entry.session_id.is_empty()` at the resume resolver.
+        // loaded into the registry on startup. This test pins the load
+        // behavior: zombies survive (no scrub on load) but with empty ids.
+        // The companion test `zombie_entry_resume_through_handle_command_errors`
+        // below pins the actual `--resume` failure behavior.
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("terminus-state.json");
 
@@ -1807,6 +1187,149 @@ patterns = []
         assert!(
             entry.session_id.is_empty(),
             "zombie should have empty session_id as seeded"
+        );
+    }
+
+    /// Build a socket-origin `IncomingMessage` so the test can read the
+    /// chat reply directly via the mpsc channel without a mock platform.
+    /// `send_reply`'s socket short-circuit (`socket_reply_tx.is_some()`)
+    /// forwards the text to `reply_tx`, identical to the production
+    /// socket-origin path.
+    fn fake_socket_msg(text: &str) -> (IncomingMessage, mpsc::UnboundedReceiver<String>) {
+        let (reply_tx, reply_rx) = mpsc::unbounded_channel::<String>();
+        let msg = IncomingMessage {
+            user_id: "12345".into(),
+            text: text.into(),
+            platform: PlatformType::Telegram,
+            reply_context: ReplyContext {
+                platform: PlatformType::Telegram,
+                chat_id: "socket-chat".into(),
+                thread_ts: None,
+                socket_reply_tx: Some(reply_tx),
+            },
+            attachments: vec![],
+            socket_request_id: Some("req-1".into()),
+            socket_client_name: Some("test".into()),
+        };
+        (msg, reply_rx)
+    }
+
+    fn drain_replies(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(reply) = rx.try_recv() {
+            out.push(reply);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn zombie_entry_resume_through_handle_command_errors() {
+        // Companion to the load-only test above: drive `--resume ghost`
+        // through `handle_command` and assert the empty-session_id guard
+        // fires (the chat receives "No session named '...'" error).
+        // Pins `command_router.rs::handle_harness_on`'s strict-resume path
+        // for the zombie case. Routes via socket-origin reply to avoid
+        // needing a chat-platform mock in this in-module test.
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("terminus-state.json");
+
+        // Pre-seed a zombie entry under the prefixed key so the post-extraction
+        // lookup finds it (but with empty session_id).
+        {
+            let mut store = StateStore::load(&state_path).unwrap();
+            let zombie = NamedSessionEntry {
+                session_id: String::new(),
+                cwd: std::path::PathBuf::from("/tmp"),
+                last_used: Utc::now(),
+            };
+            store.apply(StateUpdate::HarnessSessionBatch(vec![(
+                "claude:ghost".into(),
+                Some(zombie),
+            )]));
+            store.persist().unwrap();
+        }
+
+        let config = make_test_config(dir.path());
+        let store = StateStore::load(&state_path).unwrap();
+        let (state_tx, _rx) = mpsc::channel::<StateUpdate>(64);
+        let mut app = App::new(&config, store, state_tx).unwrap();
+        bootstrap_foreground_session(&mut app);
+
+        let (msg, mut reply_rx) = fake_socket_msg(": claude on --resume ghost");
+        app.handle_command(&msg).await;
+
+        let replies = drain_replies(&mut reply_rx);
+        let joined = replies.join("\n");
+        assert!(
+            joined.contains("No session named 'ghost'"),
+            "zombie --resume must trip the empty-session_id guard. Got: {:?}",
+            replies
+        );
+    }
+
+    #[tokio::test]
+    async fn multiline_stdin_without_harness_errors_through_router() {
+        // Pins `command_router.rs::route_command`'s multi-line StdinInput
+        // guard. With no foreground harness active, raw multi-line text
+        // must be rejected with the harness-mode hint instead of being
+        // routed to tmux.
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx) = make_app(dir.path());
+        bootstrap_foreground_session(&mut app);
+        // No `: claude on` here — `foreground_harness()` is None.
+
+        // Multi-line plain text → StdinInput → guard should fire.
+        let (msg, mut reply_rx) = fake_socket_msg("line one\nline two");
+        app.handle_command(&msg).await;
+
+        let replies = drain_replies(&mut reply_rx);
+        let joined = replies.join("\n");
+        assert!(
+            joined.contains("Multi-line input requires harness mode"),
+            "multi-line stdin without harness must hit the guard. Got: {:?}",
+            replies
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_shell_command_through_router_is_rejected() {
+        // Pins `command_router.rs::route_command`'s blocked-shell guard
+        // arm: `ParsedCommand::ShellCommand { ref cmd } if blocklist.is_blocked(cmd)`.
+        // Build an App with a non-default blocklist, send a blocked
+        // command, and assert the security-policy reply fires.
+        let dir = tempdir().unwrap();
+        let toml_path = dir.path().join("terminus.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+[auth]
+telegram_user_id = 12345
+
+[telegram]
+bot_token = "test_token_that_is_not_real"
+
+[blocklist]
+patterns = ["sudo"]
+"#,
+        )
+        .unwrap();
+        let config = Config::load(&toml_path).expect("config load");
+        let state_path = dir.path().join("terminus-state.json");
+        let store = StateStore::load(&state_path).unwrap();
+        let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
+        let mut app = App::new(&config, store, state_tx).unwrap();
+        bootstrap_foreground_session(&mut app);
+
+        // `: sudo reboot` → ShellCommand("sudo reboot") → blocked.
+        let (msg, mut reply_rx) = fake_socket_msg(": sudo reboot");
+        app.handle_command(&msg).await;
+
+        let replies = drain_replies(&mut reply_rx);
+        let joined = replies.join("\n");
+        assert!(
+            joined.contains("Command blocked by security policy"),
+            "blocked shell command must trip the blocklist guard. Got: {:?}",
+            replies
         );
     }
 

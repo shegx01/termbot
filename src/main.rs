@@ -3,6 +3,7 @@ mod banner;
 mod buffer;
 mod chat_adapters;
 mod command;
+mod command_router;
 mod config;
 mod delivery;
 mod harness;
