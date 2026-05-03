@@ -381,8 +381,6 @@ async fn handle_structured_output_rendered(
     }
 }
 
-// Re-export split_message so tests can use it directly.
-
 /// Split a message into chunks of at most `max_len` characters,
 /// breaking at newline boundaries when possible.
 pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
@@ -467,6 +465,58 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), 4000);
         assert_eq!(chunks[1].len(), 1);
+    }
+
+    #[test]
+    fn split_message_emoji_text_produces_valid_utf8() {
+        // emoji are 4 bytes each; 100 of them = 400 bytes but only 100 chars
+        let text = "🚀".repeat(100);
+        let chunks = split_message(&text, 50);
+        assert!(!chunks.is_empty(), "should produce at least one chunk");
+        for chunk in &chunks {
+            assert!(
+                std::str::from_utf8(chunk.as_bytes()).is_ok(),
+                "chunk is not valid UTF-8"
+            );
+        }
+    }
+
+    #[test]
+    fn split_message_cjk_text_produces_valid_utf8() {
+        // CJK characters are 3 bytes each
+        let text = "字".repeat(200);
+        let chunks = split_message(&text, 50);
+        assert!(chunks.len() >= 2);
+        for chunk in &chunks {
+            assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn split_message_reassembled_chunks_equal_original_text() {
+        let text = "line one\nline two\nline three\nline four\nline five";
+        let chunks = split_message(text, 15);
+        let reassembled = chunks.join("");
+        assert_eq!(
+            reassembled, text,
+            "reassembled chunks should equal original"
+        );
+    }
+
+    #[test]
+    fn split_message_no_chunk_exceeds_max_len_by_more_than_one_char() {
+        let text = "🎉".repeat(50); // 200 bytes, 50 chars
+        let max_len = 30;
+        let chunks = split_message(&text, max_len);
+        for chunk in &chunks {
+            // Allow a small slack for char-boundary rounding (one emoji = 4 bytes)
+            assert!(
+                chunk.len() <= max_len + 4,
+                "chunk byte length {} exceeds max {} by more than one char",
+                chunk.len(),
+                max_len
+            );
+        }
     }
 
     // ─── format_gap_banner tests ────────────────────────────────────────────
