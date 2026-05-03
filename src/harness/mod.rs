@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use crate::buffer::{StreamEvent, StructuredOutputPayload};
 use crate::chat_adapters::{Attachment, ChatBinding, ChatPlatform, PlatformType, ReplyContext};
 use crate::command::HarnessOptions;
+use crate::delivery::split_message;
 use crate::structured_output::{DeliveryJob, DeliveryQueue, SchemaRegistry, WebhookClient};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -824,39 +825,6 @@ async fn send_document_reply(
     }
 }
 
-/// Split a message into chunks of at most `max_len` characters,
-/// breaking at newline boundaries when possible.
-pub(crate) fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
-        return vec![text.to_string()];
-    }
-    let mut chunks = Vec::new();
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        if remaining.len() <= max_len {
-            chunks.push(remaining.to_string());
-            break;
-        }
-        let byte_limit = max_len.min(remaining.len());
-        let safe_limit = match remaining.get(..byte_limit) {
-            Some(_) => byte_limit,
-            None => remaining
-                .char_indices()
-                .take_while(|(i, _)| *i <= byte_limit)
-                .last()
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(remaining.len()),
-        };
-        let split_at = remaining[..safe_limit]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(safe_limit);
-        chunks.push(remaining[..split_at].to_string());
-        remaining = &remaining[split_at..];
-    }
-    chunks
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,95 +945,6 @@ mod tests {
             std::str::from_utf8(result.as_bytes()).is_ok(),
             "must be valid UTF-8"
         );
-    }
-
-    // ── split_message ────────────────────────────────────────────────────────
-
-    #[test]
-    fn split_message_short_text_returns_single_chunk() {
-        let chunks = split_message("hello", 100);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], "hello");
-    }
-
-    #[test]
-    fn split_message_text_over_limit_returns_multiple_chunks() {
-        let text = "a".repeat(200);
-        let chunks = split_message(&text, 100);
-        assert!(chunks.len() >= 2, "expected multiple chunks");
-    }
-
-    #[test]
-    fn split_message_prefers_newline_boundary_over_mid_word_split() {
-        // "aaaa\n" is 5 chars; "bbbb" is 4; total 9 > 8 limit.
-        // Should split at the newline so first chunk is "aaaa\n".
-        let text = "aaaa\nbbbb";
-        let chunks = split_message(text, 8);
-        assert!(
-            chunks[0].ends_with('\n') || chunks[0] == "aaaa\n",
-            "first chunk should end at newline boundary, got: {:?}",
-            chunks[0]
-        );
-        assert!(chunks.last().unwrap().contains("bbbb"));
-    }
-
-    #[test]
-    fn split_message_text_exactly_at_limit_returns_single_chunk() {
-        let text = "a".repeat(50);
-        let chunks = split_message(&text, 50);
-        assert_eq!(chunks.len(), 1);
-    }
-
-    #[test]
-    fn split_message_emoji_text_does_not_panic_and_produces_valid_utf8() {
-        // emoji are 4 bytes each; 100 of them = 400 bytes but only 100 chars
-        let text = "🚀".repeat(100);
-        let chunks = split_message(&text, 50);
-        assert!(!chunks.is_empty(), "should produce at least one chunk");
-        for chunk in &chunks {
-            assert!(
-                std::str::from_utf8(chunk.as_bytes()).is_ok(),
-                "chunk is not valid UTF-8"
-            );
-        }
-    }
-
-    #[test]
-    fn split_message_cjk_text_does_not_panic_and_produces_valid_utf8() {
-        // CJK characters are 3 bytes each
-        let text = "字".repeat(200);
-        let chunks = split_message(&text, 50);
-        assert!(chunks.len() >= 2);
-        for chunk in &chunks {
-            assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());
-        }
-    }
-
-    #[test]
-    fn split_message_reassembled_chunks_equal_original_text() {
-        let text = "line one\nline two\nline three\nline four\nline five";
-        let chunks = split_message(text, 15);
-        let reassembled = chunks.join("");
-        assert_eq!(
-            reassembled, text,
-            "reassembled chunks should equal original"
-        );
-    }
-
-    #[test]
-    fn split_message_no_chunk_exceeds_max_len_by_more_than_char_boundary_slack() {
-        let text = "🎉".repeat(50); // 200 bytes, 50 chars
-        let max_len = 30;
-        let chunks = split_message(&text, max_len);
-        for chunk in &chunks {
-            // Allow a small slack for char-boundary rounding (one emoji = 4 bytes)
-            assert!(
-                chunk.len() <= max_len + 4,
-                "chunk byte length {} exceeds max {} by more than one char",
-                chunk.len(),
-                max_len
-            );
-        }
     }
 
     // ── ToolPairingBuffer ───────────────────────────────────────────────────
