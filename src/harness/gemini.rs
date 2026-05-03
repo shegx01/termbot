@@ -35,7 +35,9 @@
 //! Live-binary tests are gated `#[ignore]` + `TERMINUS_HAS_GEMINI=1`.
 //! Run with `TERMINUS_HAS_GEMINI=1 cargo test -- --ignored`.
 
-use super::{Harness, HarnessEvent, HarnessKind, SessionStore, ToolPairingBuffer};
+use super::{
+    Harness, HarnessEvent, HarnessKind, SessionStore, SpawnedSubprocess, ToolPairingBuffer,
+};
 use crate::chat_adapters::Attachment;
 #[cfg(test)]
 use crate::command::{GeminiExtras, HarnessExtras};
@@ -44,14 +46,9 @@ use crate::config::GeminiConfig;
 use crate::socket::events::AmbientEvent;
 use anyhow::Result;
 use async_trait::async_trait;
-use futures_util::FutureExt;
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 #[cfg(test)]
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc};
 
 /// Gemini CLI-subprocess harness.
@@ -103,16 +100,15 @@ impl GeminiHarness {
         let argv = build_subcommand_argv(&sub, &args);
         tokio::spawn(async move {
             let body = run_subcommand_inner(binary, argv, sub, args, event_tx.clone());
-            let result = AssertUnwindSafe(body).catch_unwind().await;
-            if let Err(panic_info) = result {
-                let msg = super::format_panic_message(HarnessKind::Gemini, &*panic_info);
-                let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-                let _ = event_tx
-                    .send(HarnessEvent::Done {
-                        session_id: String::new(),
-                    })
-                    .await;
-            }
+            super::run_with_panic_guard(
+                HarnessKind::Gemini,
+                String::new(),
+                None,
+                &event_tx,
+                &[],
+                body,
+            )
+            .await;
         });
         Ok(event_rx)
     }
@@ -147,130 +143,16 @@ async fn run_subcommand_inner(
     extra_args: Vec<String>,
     event_tx: mpsc::Sender<HarnessEvent>,
 ) {
-    let sub_label = sub_display_name(&sub);
-
-    let mut cmd = Command::new(&binary);
-    cmd.args(&argv)
-        .env("NO_COLOR", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "gemini binary not found: {} (set [harness.gemini] binary_path or install gemini-cli on PATH)",
-                    binary.display()
-                )
-            } else {
-                format!("gemini subcommand spawn failed: {}", e)
-            };
-            let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-            let _ = event_tx
-                .send(HarnessEvent::Done {
-                    session_id: String::new(),
-                })
-                .await;
-            return;
-        }
+    let cfg = super::SubcommandConfig {
+        kind: HarnessKind::Gemini,
+        sub_label: sub_display_name(&sub).to_string(),
+        extra_args,
+        strip_ansi: false,
+        max_chars: None,
+        install_hint: "set [harness.gemini] binary_path or install gemini-cli on PATH",
+        sanitize: sanitize_stderr,
     };
-
-    let out =
-        match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
-            .await
-        {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                let _ = event_tx
-                    .send(HarnessEvent::Error(format!(
-                        "gemini {} wait failed: {}",
-                        sub_label, e
-                    )))
-                    .await;
-                let _ = event_tx
-                    .send(HarnessEvent::Done {
-                        session_id: String::new(),
-                    })
-                    .await;
-                return;
-            }
-            Err(_) => {
-                let _ = event_tx
-                    .send(HarnessEvent::Error(format!(
-                        "gemini {} timed out after 30s",
-                        sub_label
-                    )))
-                    .await;
-                let _ = event_tx
-                    .send(HarnessEvent::Done {
-                        session_id: String::new(),
-                    })
-                    .await;
-                return;
-            }
-        };
-
-    if !out.status.success() {
-        let raw_stderr = if out.stderr.len() > 64 * 1024 {
-            &out.stderr[..64 * 1024]
-        } else {
-            &out.stderr
-        };
-        let stderr_trim = String::from_utf8_lossy(raw_stderr).trim().to_string();
-        tracing::debug!(
-            "gemini {} non-zero exit; raw stderr: {}",
-            sub_label,
-            stderr_trim
-        );
-        let code = out
-            .status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".into());
-        let sanitized = sanitize_stderr(&stderr_trim);
-        let detail = if sanitized.is_empty() {
-            format!(
-                "gemini {} exited with status {} (no stderr)",
-                sub_label, code
-            )
-        } else {
-            format!(
-                "gemini {} exited with status {}: {}",
-                sub_label, code, sanitized
-            )
-        };
-        let _ = event_tx.send(HarnessEvent::Error(detail)).await;
-        let _ = event_tx
-            .send(HarnessEvent::Done {
-                session_id: String::new(),
-            })
-            .await;
-        return;
-    }
-
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stripped = stdout.trim();
-
-    let message = if stripped.is_empty() {
-        let arg_summary = if extra_args.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", extra_args.join(" "))
-        };
-        format!("gemini {}{}: no results", sub_label, arg_summary)
-    } else {
-        format!("```\n{}\n```", stripped)
-    };
-
-    let _ = event_tx.send(HarnessEvent::Text(message)).await;
-    let _ = event_tx
-        .send(HarnessEvent::Done {
-            session_id: String::new(),
-        })
-        .await;
+    super::run_subcommand(binary, argv, cfg, event_tx).await;
 }
 
 #[async_trait]
@@ -352,33 +234,15 @@ impl Harness for GeminiHarness {
         let run_id_for_task = run_id.clone();
         tokio::spawn(async move {
             let body = run_gemini_inner(binary, args, cwd, event_tx.clone());
-            let result: std::result::Result<(), Box<dyn std::any::Any + Send>> =
-                AssertUnwindSafe(body).catch_unwind().await;
-
-            let status = match result {
-                Ok(()) => "ok",
-                Err(panic_info) => {
-                    let msg = super::format_panic_message(HarnessKind::Gemini, &*panic_info);
-                    let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-                    // Panic short-circuited `run_gemini_inner` before its own
-                    // `Done` emission. Send one here so the receiver doesn't
-                    // block forever waiting for a terminal event.
-                    let _ = event_tx
-                        .send(HarnessEvent::Done {
-                            session_id: String::new(),
-                        })
-                        .await;
-                    "error"
-                }
-            };
-
-            if let Some(tx) = ambient_tx {
-                let _ = tx.send(AmbientEvent::HarnessFinished {
-                    harness: HarnessKind::Gemini.name().to_string(),
-                    run_id: run_id_for_task,
-                    status: status.to_string(),
-                });
-            }
+            super::run_with_panic_guard(
+                HarnessKind::Gemini,
+                run_id_for_task,
+                ambient_tx,
+                &event_tx,
+                &[],
+                body,
+            )
+            .await;
         });
 
         Ok(event_rx)
@@ -461,72 +325,29 @@ async fn run_gemini_inner(
     cwd: PathBuf,
     event_tx: mpsc::Sender<HarnessEvent>,
 ) {
-    let mut cmd = Command::new(&binary);
-    cmd.args(&args)
-        .current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "gemini binary not found: {} (set [harness.gemini] binary_path or install gemini on PATH)",
-                    binary.display()
-                )
-            } else {
-                format!("gemini spawn failed: {}", e)
-            };
-            let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-            let _ = event_tx
-                .send(HarnessEvent::Done {
-                    session_id: String::new(),
-                })
-                .await;
-            return;
-        }
-    };
-
-    let stdout = match child.stdout.take() {
+    // The shared helper applies the post-cap `tokio::io::sink` drain that the
+    // earlier per-harness implementation here was missing — without it,
+    // gemini-cli writing >64 KiB of stderr while we read stdout would fill
+    // the OS pipe buffer and stall both processes until the read-loop idle
+    // timeout fired.
+    let SpawnedSubprocess {
+        mut child,
+        stdout_lines: mut reader,
+        stderr_handle,
+    } = match super::spawn_subprocess(
+        &binary,
+        &args,
+        &cwd,
+        HarnessKind::Gemini,
+        "set [harness.gemini] binary_path or install gemini on PATH",
+        &event_tx,
+    )
+    .await
+    {
         Some(s) => s,
-        None => {
-            let _ = event_tx
-                .send(HarnessEvent::Error(
-                    "gemini: stdout pipe missing".to_string(),
-                ))
-                .await;
-            let _ = child.kill().await;
-            // Reap the (now-killed) child so the process-table entry is freed.
-            // `kill_on_drop` only sends SIGKILL — it does not call `wait()`.
-            let _ = child.wait().await;
-            let _ = event_tx
-                .send(HarnessEvent::Done {
-                    session_id: String::new(),
-                })
-                .await;
-            return;
-        }
+        None => return,
     };
 
-    // Drain stderr concurrently with stdout so gemini-cli doesn't pipe-deadlock
-    // when its stderr buffer fills (~64 KiB on Linux, ~8 KiB on macOS).
-    // Without a concurrent drain, if gemini writes substantial stderr while
-    // also writing stdout, gemini will block on the stderr write — and we'll
-    // block on stdout's `next_line()` waiting for output that never comes.
-    let stderr_handle: Option<tokio::task::JoinHandle<Vec<u8>>> = child.stderr.take().map(|s| {
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut buf: Vec<u8> = Vec::new();
-            let mut limited = s.take(64 * 1024);
-            let _ = limited.read_to_end(&mut buf).await;
-            buf
-        })
-    });
-
-    let mut reader = BufReader::new(stdout).lines();
     let mut captured_session_id: Option<String> = None;
     let mut saw_recognized = false;
     let mut saw_unknown = false;
@@ -731,14 +552,7 @@ async fn run_gemini_inner(
         let _ = event_tx.send(HarnessEvent::Error(msg)).await;
     }
 
-    // Always await the stderr-drain handle (even on success paths) so the
-    // spawned task ends cleanly. Buffered stderr is only used on non-zero-
-    // exit paths but the drain task must run to completion to avoid a
-    // leaked tokio task and a half-open pipe.
-    let raw_stderr_buf: Vec<u8> = match stderr_handle {
-        Some(h) => h.await.unwrap_or_default(),
-        None => Vec::new(),
-    };
+    let raw_stderr_buf = super::collect_stderr(stderr_handle, HarnessKind::Gemini).await;
 
     // Non-zero exit → surface sanitized stderr.
     if let Some(status) = status {
