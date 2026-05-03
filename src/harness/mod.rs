@@ -7,6 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
 
 use crate::buffer::{StreamEvent, StructuredOutputPayload};
@@ -47,6 +48,19 @@ impl HarnessKind {
             Self::Opencode => "OpenCode",
         }
     }
+
+    /// Lowercase identifier used in user-facing error prefixes (e.g. panic
+    /// messages, schema error redirects, log fields) and in cross-harness
+    /// state-key construction via [`build_session_key`]. Matches `from_str`'s
+    /// expected input so round-tripping is lossless.
+    pub(crate) fn cli_label(&self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Gemini => "gemini",
+            Self::Codex => "codex",
+            Self::Opencode => "opencode",
+        }
+    }
 }
 
 /// Build the prefixed key used to index a named harness session in state.
@@ -56,7 +70,7 @@ impl HarnessKind {
 /// used across different harnesses (users expect `claude --name foo` and
 /// `opencode --name foo` to be distinct conversations).
 pub fn build_session_key(kind: HarnessKind, name: &str) -> String {
-    format!("{}:{}", kind.name().to_lowercase(), name)
+    format!("{}:{}", kind.cli_label(), name)
 }
 
 /// Events streamed from a harness session to the chat delivery layer.
@@ -386,6 +400,111 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     }
     let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
     format!("{}...", &s[..end])
+}
+
+/// Format a panic payload as a chat-safe error string for the given harness.
+///
+/// Used inside each subprocess harness's `tokio::spawn` + `catch_unwind` panic
+/// handler so a fault in the spawned task surfaces as a `HarnessEvent::Error`
+/// instead of crashing the process. `info` is the dereferenced
+/// `Box<dyn Any + Send>` returned by `catch_unwind` on a panic.
+#[must_use]
+pub(crate) fn format_panic_message(kind: HarnessKind, info: &(dyn std::any::Any + Send)) -> String {
+    let label = kind.cli_label();
+    if let Some(s) = info.downcast_ref::<&str>() {
+        format!("{}: internal panic: {}", label, s)
+    } else if let Some(s) = info.downcast_ref::<String>() {
+        format!("{}: internal panic: {}", label, s)
+    } else {
+        format!("{}: internal panic (unknown)", label)
+    }
+}
+
+/// Strip ANSI escape sequences (CSI sequences and simple OSC). Hand-rolled to
+/// avoid adding a crate dependency — matches `\x1b[...m`, `\x1b[...K`, and
+/// the OSC titlebar form `\x1b]...(\x07|\x1b\\)`. Moved from the opencode
+/// harness; the helper is `pub(crate)` so future subprocess harnesses can call
+/// it from the shared lifecycle path.
+#[must_use]
+pub(crate) fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some(&'[') => {
+                    chars.next();
+                    for cc in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&cc) {
+                            break;
+                        }
+                    }
+                }
+                Some(&']') => {
+                    chars.next();
+                    while let Some(cc) = chars.next() {
+                        if cc == '\x07' {
+                            break;
+                        }
+                        if cc == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    // Two-char ESC (e.g. `\x1bM` reverse-index, `\x1b=`
+                    // DECKPAM): consume both bytes so the trailing char
+                    // doesn't leak into the output.
+                    chars.next();
+                }
+                None => {
+                    // Lone trailing ESC at end of input — drop and exit.
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Thread-safe `name → session_id` map shared across the subprocess harnesses.
+///
+/// Wraps an `Arc<StdMutex<HashMap<String, String>>>`. All operations are
+/// poison-recovering — if a holder panicked while inside the critical section,
+/// readers and writers can still proceed because the data type doesn't
+/// observe partial mutations. `Clone` is load-bearing: harnesses clone the
+/// store before moving it into a `tokio::spawn` task.
+#[derive(Default, Clone)]
+pub(crate) struct SessionStore {
+    inner: Arc<StdMutex<HashMap<String, String>>>,
+}
+
+impl SessionStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up a session id by user-supplied name.
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
+        let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(name).cloned()
+    }
+
+    /// Insert (or overwrite) a session id for a user-supplied name.
+    pub(crate) fn set(&self, name: &str, id: String) {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(name.to_string(), id);
+    }
+
+    /// Test-only: borrow the underlying mutex so tests can inject a poison
+    /// condition (panic while holding the guard) and verify that `get`/`set`
+    /// recover. Compiled only under `#[cfg(test)]`.
+    #[cfg(test)]
+    pub(crate) fn raw(&self) -> &StdMutex<HashMap<String, String>> {
+        &self.inner
+    }
 }
 
 /// Format a tool use event for display in chat.
@@ -945,6 +1064,147 @@ mod tests {
             std::str::from_utf8(result.as_bytes()).is_ok(),
             "must be valid UTF-8"
         );
+    }
+
+    // ── strip_ansi ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_ansi_removes_csi_color_codes() {
+        let input = "\x1b[31mred\x1b[0m";
+        assert_eq!(strip_ansi(input), "red");
+    }
+
+    #[test]
+    fn strip_ansi_removes_erase_codes() {
+        let input = "\x1b[2Kline";
+        assert_eq!(strip_ansi(input), "line");
+    }
+
+    #[test]
+    fn strip_ansi_passes_through_plain_text() {
+        let input = "hello world";
+        assert_eq!(strip_ansi(input), "hello world");
+    }
+
+    #[test]
+    fn strip_ansi_handles_osc_titlebar_sequence() {
+        let input = "\x1b]0;title\x07body";
+        assert_eq!(strip_ansi(input), "body");
+    }
+
+    #[test]
+    fn strip_ansi_consumes_two_char_escapes_without_leaking_trailing_byte() {
+        // `\x1bM` (RI / Reverse Index) and `\x1b=` (DECKPAM) are two-byte
+        // sequences. Both bytes must be consumed; the trailing char must not
+        // appear in the output.
+        assert_eq!(strip_ansi("a\x1bMb"), "ab");
+        assert_eq!(strip_ansi("x\x1b=y"), "xy");
+    }
+
+    // ── format_panic_message ────────────────────────────────────────────────
+
+    #[test]
+    fn format_panic_on_str_slice() {
+        let info: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(
+            format_panic_message(HarnessKind::Opencode, &*info),
+            "opencode: internal panic: boom"
+        );
+    }
+
+    #[test]
+    fn format_panic_on_owned_string() {
+        let info: Box<dyn std::any::Any + Send> = Box::new(String::from("kaboom"));
+        assert_eq!(
+            format_panic_message(HarnessKind::Gemini, &*info),
+            "gemini: internal panic: kaboom"
+        );
+    }
+
+    #[test]
+    fn format_panic_on_str_slice_for_claude() {
+        let info: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(
+            format_panic_message(HarnessKind::Claude, &*info),
+            "claude: internal panic: boom"
+        );
+    }
+
+    #[test]
+    fn format_panic_on_unknown_payload() {
+        let info: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(
+            format_panic_message(HarnessKind::Codex, &*info),
+            "codex: internal panic (unknown)"
+        );
+    }
+
+    // ── HarnessKind::cli_label round-trip ───────────────────────────────────
+
+    #[test]
+    fn cli_label_round_trips_through_from_str() {
+        for kind in [
+            HarnessKind::Claude,
+            HarnessKind::Gemini,
+            HarnessKind::Codex,
+            HarnessKind::Opencode,
+        ] {
+            let label = kind.cli_label();
+            assert_eq!(
+                HarnessKind::from_str(label),
+                Some(kind),
+                "from_str must accept the label produced by cli_label"
+            );
+        }
+    }
+
+    #[test]
+    fn from_str_accepts_uppercase_input() {
+        // `from_str` lowercases its input before matching; the contract is
+        // documented and worth pinning so a stricter match doesn't silently
+        // regress callers that pass user-supplied case.
+        assert_eq!(HarnessKind::from_str("CLAUDE"), Some(HarnessKind::Claude));
+        assert_eq!(
+            HarnessKind::from_str("OpenCode"),
+            Some(HarnessKind::Opencode)
+        );
+    }
+
+    // ── SessionStore ────────────────────────────────────────────────────────
+
+    #[test]
+    fn session_store_get_and_set_round_trip() {
+        let s = SessionStore::new();
+        s.set("alpha", "ses_abc".into());
+        assert_eq!(s.get("alpha"), Some("ses_abc".into()));
+        assert_eq!(s.get("missing"), None);
+    }
+
+    #[test]
+    fn session_store_set_overwrites_existing_value() {
+        let s = SessionStore::new();
+        s.set("alpha", "ses_old".into());
+        s.set("alpha", "ses_new".into());
+        assert_eq!(s.get("alpha"), Some("ses_new".into()));
+    }
+
+    #[test]
+    fn session_store_get_and_set_recover_from_poisoned_lock() {
+        let s = SessionStore::new();
+        s.set("alpha", "pre".into());
+
+        let s_panic = s.clone();
+        let result = std::thread::spawn(move || {
+            let _guard = s_panic.raw().lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(result.is_err(), "panic thread should have unwound");
+
+        // Reads and writes still work despite the poisoned lock.
+        assert_eq!(s.get("alpha"), Some("pre".into()));
+        s.set("beta", "post".into());
+        assert_eq!(s.get("beta"), Some("post".into()));
     }
 
     // ── ToolPairingBuffer ───────────────────────────────────────────────────

@@ -35,7 +35,7 @@
 //! Live-binary tests are gated `#[ignore]` + `TERMINUS_HAS_GEMINI=1`.
 //! Run with `TERMINUS_HAS_GEMINI=1 cargo test -- --ignored`.
 
-use super::{Harness, HarnessEvent, HarnessKind, ToolPairingBuffer};
+use super::{Harness, HarnessEvent, HarnessKind, SessionStore, ToolPairingBuffer};
 use crate::chat_adapters::Attachment;
 #[cfg(test)]
 use crate::command::{GeminiExtras, HarnessExtras};
@@ -45,11 +45,11 @@ use crate::socket::events::AmbientEvent;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex as StdMutex};
+#[cfg(test)]
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc};
@@ -60,7 +60,7 @@ pub struct GeminiHarness {
     /// Map of opaque session-name → gemini session id. Keys here are the raw
     /// user-supplied names; the App layer owns the prefixed `gemini:{name}`
     /// form used for cross-harness isolation in state.
-    sessions: Arc<StdMutex<HashMap<String, String>>>,
+    sessions: SessionStore,
     ambient_tx: Option<broadcast::Sender<AmbientEvent>>,
 }
 
@@ -69,7 +69,7 @@ impl GeminiHarness {
     pub fn new(config: GeminiConfig, ambient_tx: broadcast::Sender<AmbientEvent>) -> Self {
         Self {
             config,
-            sessions: Arc::new(StdMutex::new(HashMap::new())),
+            sessions: SessionStore::new(),
             ambient_tx: Some(ambient_tx),
         }
     }
@@ -79,7 +79,7 @@ impl GeminiHarness {
     pub fn new_with_config(config: GeminiConfig) -> Self {
         Self {
             config,
-            sessions: Arc::new(StdMutex::new(HashMap::new())),
+            sessions: SessionStore::new(),
             ambient_tx: None,
         }
     }
@@ -105,7 +105,7 @@ impl GeminiHarness {
             let body = run_subcommand_inner(binary, argv, sub, args, event_tx.clone());
             let result = AssertUnwindSafe(body).catch_unwind().await;
             if let Err(panic_info) = result {
-                let msg = format_panic_message(&*panic_info);
+                let msg = super::format_panic_message(HarnessKind::Gemini, &*panic_info);
                 let _ = event_tx.send(HarnessEvent::Error(msg)).await;
                 let _ = event_tx
                     .send(HarnessEvent::Done {
@@ -358,7 +358,7 @@ impl Harness for GeminiHarness {
             let status = match result {
                 Ok(()) => "ok",
                 Err(panic_info) => {
-                    let msg = format_panic_message(&*panic_info);
+                    let msg = super::format_panic_message(HarnessKind::Gemini, &*panic_info);
                     let _ = event_tx.send(HarnessEvent::Error(msg)).await;
                     // Panic short-circuited `run_gemini_inner` before its own
                     // `Done` emission. Send one here so the receiver doesn't
@@ -385,15 +385,11 @@ impl Harness for GeminiHarness {
     }
 
     fn get_session_id(&self, session_name: &str) -> Option<String> {
-        // Recover from poison: another thread panicked while holding the lock,
-        // but the data is still consistent. Mirrors the codex harness handling.
-        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.get(session_name).cloned()
+        self.sessions.get(session_name)
     }
 
     fn set_session_id(&self, session_name: &str, session_id: String) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.insert(session_name.to_string(), session_id);
+        self.sessions.set(session_name, session_id);
     }
 }
 
@@ -452,16 +448,6 @@ fn build_argv(
 /// in [`crate::harness::sanitize_stderr_base`].
 pub(crate) fn sanitize_stderr(s: &str) -> String {
     crate::harness::sanitize_stderr_base(s)
-}
-
-fn format_panic_message(info: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = info.downcast_ref::<&str>() {
-        format!("gemini: internal panic: {}", s)
-    } else if let Some(s) = info.downcast_ref::<String>() {
-        format!("gemini: internal panic: {}", s)
-    } else {
-        "gemini: internal panic (unknown)".to_string()
-    }
 }
 
 /// Spawn the gemini child, read NDJSON events, translate them, and drive a
@@ -1502,7 +1488,7 @@ mod tests {
         // Poison the mutex by panicking inside a `lock()` guard's scope.
         let h_panic = Arc::clone(&h);
         let result = std::thread::spawn(move || {
-            let _guard = h_panic.sessions.lock().unwrap();
+            let _guard = h_panic.sessions.raw().lock().unwrap();
             panic!("intentional poison");
         })
         .join();
@@ -1745,26 +1731,6 @@ mod tests {
         );
         let count = args.iter().filter(|a| *a == "--approval-mode").count();
         assert_eq!(count, 1, "only one --approval-mode expected");
-    }
-
-    // ── Panic formatter ────────────────────────────────────────────────────
-
-    #[test]
-    fn format_panic_on_str() {
-        let boxed: Box<dyn std::any::Any + Send> = Box::new("kaboom");
-        assert_eq!(
-            format_panic_message(&*boxed),
-            "gemini: internal panic: kaboom"
-        );
-    }
-
-    #[test]
-    fn format_panic_on_unknown() {
-        let boxed: Box<dyn std::any::Any + Send> = Box::new(42u32);
-        assert_eq!(
-            format_panic_message(&*boxed),
-            "gemini: internal panic (unknown)"
-        );
     }
 
     // ── Ambient event emission ─────────────────────────────────────────────

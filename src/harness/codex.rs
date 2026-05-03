@@ -49,7 +49,7 @@
 //! turn — the read loop continues until `turn.completed` (success) or
 //! `turn.failed` (failure) arrives.
 
-use super::{Harness, HarnessEvent, HarnessKind, ToolPairingBuffer};
+use super::{Harness, HarnessEvent, HarnessKind, SessionStore, ToolPairingBuffer};
 use crate::chat_adapters::Attachment;
 use crate::command::{CodexCloudSubcommand, CodexSubcommand, HarnessOptions};
 #[cfg(test)]
@@ -59,11 +59,10 @@ use crate::socket::events::AmbientEvent;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc};
@@ -74,7 +73,7 @@ pub struct CodexHarness {
     /// Map of opaque session-name → codex `thread_id`. Keys here are the raw
     /// user-supplied names; the App layer owns the prefixed `codex:{name}`
     /// form used for cross-harness isolation in state.
-    sessions: Arc<StdMutex<HashMap<String, String>>>,
+    sessions: SessionStore,
     ambient_tx: Option<broadcast::Sender<AmbientEvent>>,
     /// Schema registry. Defaults to an empty registry; `with_schema_registry`
     /// swaps in the App-shared one. Symmetric with `ClaudeHarness` so the
@@ -90,7 +89,7 @@ impl CodexHarness {
     pub fn new(config: CodexConfig, ambient_tx: broadcast::Sender<AmbientEvent>) -> Self {
         Self {
             config,
-            sessions: Arc::new(StdMutex::new(HashMap::new())),
+            sessions: SessionStore::new(),
             ambient_tx: Some(ambient_tx),
             schema_registry: Arc::new(crate::structured_output::SchemaRegistry::default()),
         }
@@ -101,7 +100,7 @@ impl CodexHarness {
     pub fn new_with_config(config: CodexConfig) -> Self {
         Self {
             config,
-            sessions: Arc::new(StdMutex::new(HashMap::new())),
+            sessions: SessionStore::new(),
             ambient_tx: None,
             schema_registry: Arc::new(crate::structured_output::SchemaRegistry::default()),
         }
@@ -143,7 +142,7 @@ impl CodexHarness {
             let body = run_subcommand_inner(binary, argv, sub, args, event_tx.clone());
             let result = AssertUnwindSafe(body).catch_unwind().await;
             if let Err(panic_info) = result {
-                let msg = format_panic_message(&*panic_info);
+                let msg = super::format_panic_message(HarnessKind::Codex, &*panic_info);
                 let _ = event_tx.send(HarnessEvent::Error(msg)).await;
                 let _ = event_tx
                     .send(HarnessEvent::Done {
@@ -472,7 +471,7 @@ impl Harness for CodexHarness {
             let status = match result {
                 Ok(()) => "ok",
                 Err(panic_info) => {
-                    let msg = format_panic_message(&*panic_info);
+                    let msg = super::format_panic_message(HarnessKind::Codex, &*panic_info);
                     let _ = event_tx.send(HarnessEvent::Error(msg)).await;
                     // The panic short-circuited `run_codex_inner` before its
                     // own `Done` emission. Send one here so the receiver
@@ -499,15 +498,11 @@ impl Harness for CodexHarness {
     }
 
     fn get_session_id(&self, session_name: &str) -> Option<String> {
-        // Recover from poison rather than panicking. A panic in another
-        // session-mutating call shouldn't make subsequent reads also panic.
-        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.get(session_name).cloned()
+        self.sessions.get(session_name)
     }
 
     fn set_session_id(&self, session_name: &str, session_id: String) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.insert(session_name.to_string(), session_id);
+        self.sessions.set(session_name, session_id);
     }
 }
 
@@ -870,16 +865,6 @@ pub(crate) fn sanitize_stderr(s: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     crate::harness::sanitize_stderr_base(&filtered)
-}
-
-fn format_panic_message(info: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = info.downcast_ref::<&str>() {
-        format!("codex: internal panic: {}", s)
-    } else if let Some(s) = info.downcast_ref::<String>() {
-        format!("codex: internal panic: {}", s)
-    } else {
-        "codex: internal panic (unknown)".to_string()
-    }
 }
 
 /// Spawn the codex child, read NDJSON events, translate them, and drive a
@@ -2059,30 +2044,6 @@ mod tests {
         let raw = "x".repeat(700);
         let out = sanitize_stderr(&raw);
         assert!(out.chars().count() <= 500);
-    }
-
-    // ── format_panic_message ───────────────────────────────────────────────
-
-    #[test]
-    fn format_panic_message_handles_str() {
-        let info: Box<dyn std::any::Any + Send> = Box::new("boom");
-        let msg = format_panic_message(&*info);
-        assert!(msg.contains("boom"));
-        assert!(msg.contains("codex"));
-    }
-
-    #[test]
-    fn format_panic_message_handles_string() {
-        let info: Box<dyn std::any::Any + Send> = Box::new(String::from("kaboom"));
-        let msg = format_panic_message(&*info);
-        assert!(msg.contains("kaboom"));
-    }
-
-    #[test]
-    fn format_panic_message_handles_unknown() {
-        let info: Box<dyn std::any::Any + Send> = Box::new(42i32);
-        let msg = format_panic_message(&*info);
-        assert!(msg.contains("unknown"));
     }
 
     // ── Review-driven regression tests (post-six-pass fixes) ───────────────
