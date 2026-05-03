@@ -30,7 +30,7 @@
 
 #[cfg(test)]
 use super::build_session_key;
-use super::{Harness, HarnessEvent, HarnessKind};
+use super::{Harness, HarnessEvent, HarnessKind, SessionStore};
 use crate::chat_adapters::Attachment;
 #[cfg(test)]
 use crate::command::{HarnessExtras, OpencodeExtras};
@@ -40,11 +40,11 @@ use crate::socket::events::AmbientEvent;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex as StdMutex};
+#[cfg(test)]
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc};
@@ -55,7 +55,7 @@ pub struct OpencodeHarness {
     /// Map of opaque session-name → opencode sessionID (`ses_…`). Keys here
     /// are the raw user-supplied names — the App layer owns the prefixed
     /// `{kind}:{name}` form used for cross-harness isolation in state.
-    sessions: Arc<StdMutex<HashMap<String, String>>>,
+    sessions: SessionStore,
     ambient_tx: Option<broadcast::Sender<AmbientEvent>>,
 }
 
@@ -64,7 +64,7 @@ impl OpencodeHarness {
     pub fn new(config: OpencodeConfig, ambient_tx: broadcast::Sender<AmbientEvent>) -> Self {
         Self {
             config,
-            sessions: Arc::new(StdMutex::new(HashMap::new())),
+            sessions: SessionStore::new(),
             ambient_tx: Some(ambient_tx),
         }
     }
@@ -74,7 +74,7 @@ impl OpencodeHarness {
     pub fn new_with_config(config: OpencodeConfig) -> Self {
         Self {
             config,
-            sessions: Arc::new(StdMutex::new(HashMap::new())),
+            sessions: SessionStore::new(),
             ambient_tx: None,
         }
     }
@@ -178,7 +178,7 @@ impl Harness for OpencodeHarness {
 
         let cwd = cwd.to_path_buf();
         let attachment_paths: Vec<PathBuf> = attachments.iter().map(|a| a.path.clone()).collect();
-        let sessions = Arc::clone(&self.sessions);
+        let sessions = self.sessions.clone();
         let ambient_tx = self.ambient_tx.clone();
         let run_id = ulid::Ulid::new().to_string();
 
@@ -197,15 +197,14 @@ impl Harness for OpencodeHarness {
 
         let run_id_for_task = run_id.clone();
         tokio::spawn(async move {
-            let body =
-                run_opencode_inner(binary, args, cwd, event_tx.clone(), Arc::clone(&sessions));
+            let body = run_opencode_inner(binary, args, cwd, event_tx.clone(), sessions.clone());
             let result: std::result::Result<(), Box<dyn std::any::Any + Send>> =
                 AssertUnwindSafe(body).catch_unwind().await;
 
             let status = match result {
                 Ok(()) => "ok",
                 Err(panic_info) => {
-                    let msg = format_panic_message(&*panic_info);
+                    let msg = super::format_panic_message(HarnessKind::Opencode, &*panic_info);
                     let _ = event_tx.send(HarnessEvent::Error(msg)).await;
                     // The panic short-circuited `run_opencode_inner` before
                     // its own `Done` emission. Send one here so the receiver
@@ -239,15 +238,11 @@ impl Harness for OpencodeHarness {
     }
 
     fn get_session_id(&self, session_name: &str) -> Option<String> {
-        // Recover from poison: another thread panicked while holding the lock,
-        // but the data is still consistent. Mirrors codex/gemini handling.
-        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.get(session_name).cloned()
+        self.sessions.get(session_name)
     }
 
     fn set_session_id(&self, session_name: &str, session_id: String) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.insert(session_name.to_string(), session_id);
+        self.sessions.set(session_name, session_id);
     }
 }
 
@@ -256,45 +251,6 @@ impl Harness for OpencodeHarness {
 // `Arc<OpencodeHarness>` for direct shutdown access while inserting a
 // clone into the type-erased `harnesses: HashMap<HarnessKind, Box<dyn
 // Harness>>` map.
-
-/// Strip ANSI escape sequences (CSI sequences and simple OSC). Hand-rolled
-/// to avoid a new crate dep — matches `\x1b[...m`, `\x1b[...K`, and similar.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip until a terminator: letter @-~ for CSI; `\x07` or `\x1b\\` for OSC.
-            if let Some(&next) = chars.peek() {
-                if next == '[' {
-                    chars.next(); // consume `[`
-                    for cc in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&cc) {
-                            break;
-                        }
-                    }
-                    continue;
-                } else if next == ']' {
-                    chars.next(); // consume `]`
-                    while let Some(cc) = chars.next() {
-                        if cc == '\x07' {
-                            break;
-                        }
-                        if cc == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                    continue;
-                }
-            }
-            // Unknown escape — drop the ESC and continue.
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
 
 /// Sanitize opencode stderr before forwarding to chat. Opencode has no
 /// benign noise to pre-filter, so this is a thin pass-through to the shared
@@ -329,17 +285,6 @@ fn sub_display_name(sub: &OpencodeSubcommand) -> &'static str {
         OpencodeSubcommand::Sessions => "session list",
         OpencodeSubcommand::Providers => "auth list",
         OpencodeSubcommand::Export => "export",
-    }
-}
-
-/// Format a panic payload into a human-readable error string.
-fn format_panic_message(info: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = info.downcast_ref::<&str>() {
-        format!("opencode: internal panic: {}", s)
-    } else if let Some(s) = info.downcast_ref::<String>() {
-        format!("opencode: internal panic: {}", s)
-    } else {
-        "opencode: internal panic (unknown)".to_string()
     }
 }
 
@@ -459,7 +404,7 @@ async fn run_subcommand_inner(
     }
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stripped = strip_ansi(&stdout);
+    let stripped = super::strip_ansi(&stdout);
     let stripped = stripped.trim();
 
     let message = if stripped.is_empty() {
@@ -510,7 +455,7 @@ impl OpencodeHarness {
             let body = run_subcommand_inner(binary, argv, sub, args, event_tx.clone());
             let result = AssertUnwindSafe(body).catch_unwind().await;
             if let Err(panic_info) = result {
-                let msg = format_panic_message(&*panic_info);
+                let msg = super::format_panic_message(HarnessKind::Opencode, &*panic_info);
                 let _ = event_tx.send(HarnessEvent::Error(msg)).await;
                 let _ = event_tx
                     .send(HarnessEvent::Done {
@@ -542,7 +487,7 @@ async fn run_opencode_inner(
     args: Vec<String>,
     cwd: PathBuf,
     event_tx: mpsc::Sender<HarnessEvent>,
-    _sessions: Arc<StdMutex<HashMap<String, String>>>,
+    _sessions: SessionStore,
 ) {
     let mut cmd = Command::new(&binary);
     cmd.args(&args)
@@ -1449,7 +1394,7 @@ mod tests {
 
         let h_panic = Arc::clone(&h);
         let result = std::thread::spawn(move || {
-            let _guard = h_panic.sessions.lock().unwrap();
+            let _guard = h_panic.sessions.raw().lock().unwrap();
             panic!("intentional poison");
         })
         .join();
@@ -1577,36 +1522,6 @@ mod tests {
             }
             other => panic!("expected HarnessFinished, got {:?}", other),
         }
-    }
-
-    // ── Panic-message formatter (matches claude.rs pattern) ──────────────────
-    // Tests call the production `format_panic_message` via `super::` (Fix 1.6).
-
-    #[test]
-    fn format_panic_on_str_slice() {
-        let boxed: Box<dyn std::any::Any + Send> = Box::new("kaboom");
-        assert_eq!(
-            super::format_panic_message(&*boxed),
-            "opencode: internal panic: kaboom"
-        );
-    }
-
-    #[test]
-    fn format_panic_on_owned_string() {
-        let boxed: Box<dyn std::any::Any + Send> = Box::new(String::from("owned boom"));
-        assert_eq!(
-            super::format_panic_message(&*boxed),
-            "opencode: internal panic: owned boom"
-        );
-    }
-
-    #[test]
-    fn format_panic_on_unknown_box() {
-        let boxed: Box<dyn std::any::Any + Send> = Box::new(42u32);
-        assert_eq!(
-            super::format_panic_message(&*boxed),
-            "opencode: internal panic (unknown)"
-        );
     }
 
     // ── Argv construction smoke test (exercises the -f attachment path) ──────
@@ -1880,32 +1795,6 @@ mod tests {
             "tool output should be non-empty, got empty string"
         );
         assert!(saw_done, "expected HarnessEvent::Done after tool use");
-    }
-
-    // ── strip_ansi unit tests ────────────────────────────────────────────────
-
-    #[test]
-    fn strip_ansi_removes_csi_color_codes() {
-        let input = "\x1b[31mred\x1b[0m";
-        assert_eq!(strip_ansi(input), "red");
-    }
-
-    #[test]
-    fn strip_ansi_removes_erase_codes() {
-        let input = "\x1b[2Kline";
-        assert_eq!(strip_ansi(input), "line");
-    }
-
-    #[test]
-    fn strip_ansi_passes_through_plain_text() {
-        let input = "hello world";
-        assert_eq!(strip_ansi(input), "hello world");
-    }
-
-    #[test]
-    fn strip_ansi_handles_osc_titlebar_sequence() {
-        let input = "\x1b]0;title\x07body";
-        assert_eq!(strip_ansi(input), "body");
     }
 
     // ── sanitize_stderr unit tests ───────────────────────────────────────────
