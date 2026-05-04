@@ -634,6 +634,11 @@ mod tests {
             PlatformType::Telegram => 0,
             PlatformType::Slack => 1,
             PlatformType::Discord => 2,
+            // Socket-origin messages aren't bound to any wake-coordinator
+            // chat set, so they never appear in this test's gap-banner stream.
+            PlatformType::Socket => {
+                unreachable!("Socket chats must never appear in wake coordinator sets")
+            }
         });
         assert_eq!(
             platforms_seen,

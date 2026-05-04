@@ -117,6 +117,14 @@ impl ChatPlatform for MockPlatform {
             PlatformType::Telegram => PlatformMessageId::Telegram(1),
             PlatformType::Slack => PlatformMessageId::Slack("1.0".to_string()),
             PlatformType::Discord => PlatformMessageId::Discord(1),
+            // MockPlatform is constructed only for chat-platform tests;
+            // socket-origin paths don't go through `ChatPlatform`. To
+            // exercise socket behavior, inject a `socket_reply_tx` into
+            // `ReplyContext` and assert on the receiver — see
+            // `src/socket/connection.rs` for the wiring pattern.
+            PlatformType::Socket => {
+                unreachable!("MockPlatform is not used for socket-origin tests")
+            }
         })
     }
 
@@ -153,6 +161,14 @@ impl ChatPlatform for MockPlatform {
             PlatformType::Telegram => PlatformMessageId::Telegram(1),
             PlatformType::Slack => PlatformMessageId::Slack("1.0".to_string()),
             PlatformType::Discord => PlatformMessageId::Discord(1),
+            // MockPlatform is constructed only for chat-platform tests;
+            // socket-origin paths don't go through `ChatPlatform`. To
+            // exercise socket behavior, inject a `socket_reply_tx` into
+            // `ReplyContext` and assert on the receiver — see
+            // `src/socket/connection.rs` for the wiring pattern.
+            PlatformType::Socket => {
+                unreachable!("MockPlatform is not used for socket-origin tests")
+            }
         })
     }
 
@@ -176,6 +192,14 @@ impl ChatPlatform for MockPlatform {
             PlatformType::Telegram => PlatformMessageId::Telegram(1),
             PlatformType::Slack => PlatformMessageId::Slack("1.0".to_string()),
             PlatformType::Discord => PlatformMessageId::Discord(1),
+            // MockPlatform is constructed only for chat-platform tests;
+            // socket-origin paths don't go through `ChatPlatform`. To
+            // exercise socket behavior, inject a `socket_reply_tx` into
+            // `ReplyContext` and assert on the receiver — see
+            // `src/socket/connection.rs` for the wiring pattern.
+            PlatformType::Socket => {
+                unreachable!("MockPlatform is not used for socket-origin tests")
+            }
         })
     }
 

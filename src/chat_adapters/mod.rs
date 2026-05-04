@@ -16,11 +16,56 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+// COMPAT: variant names are serialized to queue-file JSON via `ChatBinding`.
+// Renaming a variant breaks deserialization of pending queue files written by
+// older terminus versions. Adding a new variant is a wire-format bump (see
+// the golden tests below). When adding a new platform:
+//   1. Add a variant here.
+//   2. Add a matching arm to `select_adapter` (returns the adapter handle).
+//   3. Update the chunk-size match in `src/harness/mod.rs` and any other
+//      explicit `match ctx.platform` site that doesn't use a wildcard.
+//   4. Add a golden serialization test in this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlatformType {
     Telegram,
     Slack,
     Discord,
+    /// Messages originating from the WebSocket bidirectional API (`src/socket/`).
+    /// Replies do not go through a chat-platform adapter — they're routed back
+    /// to the socket connection via `ReplyContext::socket_reply_tx`. This
+    /// variant exists so code that branches on `PlatformType` (chunk-size
+    /// limits, adapter lookups, gap-banner sequencing) can handle the
+    /// socket-origin case explicitly instead of inheriting Telegram defaults.
+    Socket,
+}
+
+impl PlatformType {
+    /// Pick the chat-platform adapter for this platform, given the three
+    /// optionally-configured adapter handles. `Socket` returns `None` because
+    /// socket-origin replies route through `ReplyContext::socket_reply_tx`,
+    /// not through any `ChatPlatform`.
+    ///
+    /// Centralizes the Telegram/Slack/Discord/Socket match so a future
+    /// platform addition only needs one update site here.
+    ///
+    /// **Argument-order invariant**: arguments must appear in the same order
+    /// as the enum variants (`telegram, slack, discord`). When adding a new
+    /// platform between existing variants, every call site must update its
+    /// argument list in lockstep — the compiler can't catch a positional swap
+    /// because all three params have the same `Option<&dyn ChatPlatform>` type.
+    pub(crate) fn select_adapter<'a>(
+        self,
+        telegram: Option<&'a dyn ChatPlatform>,
+        slack: Option<&'a dyn ChatPlatform>,
+        discord: Option<&'a dyn ChatPlatform>,
+    ) -> Option<&'a dyn ChatPlatform> {
+        match self {
+            PlatformType::Telegram => telegram,
+            PlatformType::Slack => slack,
+            PlatformType::Discord => discord,
+            PlatformType::Socket => None,
+        }
+    }
 }
 
 /// Serializable chat routing context.
@@ -167,6 +212,7 @@ mod tests {
             PlatformType::Telegram,
             PlatformType::Slack,
             PlatformType::Discord,
+            PlatformType::Socket,
         ] {
             let serialized = serde_json::to_string(&variant)
                 .unwrap_or_else(|e| panic!("Failed to serialize {:?}: {}", variant, e));
@@ -233,6 +279,123 @@ mod tests {
             json, r#"{"platform":"Telegram","chat_id":"12345","thread_ts":null}"#,
             "ChatBinding JSON wire format changed; this breaks persisted queue \
              files. If intentional, coordinate with a queue-file migration."
+        );
+    }
+
+    #[test]
+    fn select_adapter_routes_to_correct_handle_and_returns_none_for_socket() {
+        // Minimal stub so we have non-None `&dyn ChatPlatform` references to
+        // distinguish via pointer identity. Methods are never called; the
+        // `Send + Sync` bound is met by an empty struct.
+        struct Stub;
+        #[async_trait]
+        impl ChatPlatform for Stub {
+            async fn start(&self, _: mpsc::Sender<IncomingMessage>) -> Result<()> {
+                unreachable!()
+            }
+            async fn send_message(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<PlatformMessageId> {
+                unreachable!()
+            }
+            async fn edit_message(&self, _: &PlatformMessageId, _: &str, _: &str) -> Result<()> {
+                unreachable!()
+            }
+            async fn send_photo(
+                &self,
+                _: &[u8],
+                _: &str,
+                _: Option<&str>,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<PlatformMessageId> {
+                unreachable!()
+            }
+            async fn send_document(
+                &self,
+                _: &[u8],
+                _: &str,
+                _: Option<&str>,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<PlatformMessageId> {
+                unreachable!()
+            }
+            fn is_connected(&self) -> bool {
+                false
+            }
+            fn platform_type(&self) -> PlatformType {
+                PlatformType::Telegram
+            }
+        }
+
+        let t = Stub;
+        let s = Stub;
+        let d = Stub;
+        let t_ref: &dyn ChatPlatform = &t;
+        let s_ref: &dyn ChatPlatform = &s;
+        let d_ref: &dyn ChatPlatform = &d;
+
+        // Each chat-platform variant routes to its matching adapter slot.
+        assert!(std::ptr::eq(
+            PlatformType::Telegram
+                .select_adapter(Some(t_ref), Some(s_ref), Some(d_ref))
+                .unwrap() as *const _ as *const (),
+            t_ref as *const _ as *const (),
+        ));
+        assert!(std::ptr::eq(
+            PlatformType::Slack
+                .select_adapter(Some(t_ref), Some(s_ref), Some(d_ref))
+                .unwrap() as *const _ as *const (),
+            s_ref as *const _ as *const (),
+        ));
+        assert!(std::ptr::eq(
+            PlatformType::Discord
+                .select_adapter(Some(t_ref), Some(s_ref), Some(d_ref))
+                .unwrap() as *const _ as *const (),
+            d_ref as *const _ as *const (),
+        ));
+
+        // Socket returns None even when all three adapters are wired up —
+        // the load-bearing invariant: socket-origin replies must NOT route
+        // to any chat platform; they go through `socket_reply_tx`.
+        assert!(PlatformType::Socket
+            .select_adapter(Some(t_ref), Some(s_ref), Some(d_ref))
+            .is_none());
+
+        // Each variant returns None when its slot is None.
+        assert!(PlatformType::Telegram
+            .select_adapter(None, Some(s_ref), Some(d_ref))
+            .is_none());
+        assert!(PlatformType::Slack
+            .select_adapter(Some(t_ref), None, Some(d_ref))
+            .is_none());
+        assert!(PlatformType::Discord
+            .select_adapter(Some(t_ref), Some(s_ref), None)
+            .is_none());
+    }
+
+    #[test]
+    fn chat_binding_socket_variant_serializes_to_exact_known_json() {
+        // Pins the wire form for the `Socket` variant. Socket-origin messages
+        // do not normally reach the queue file (replies route through the
+        // per-request `socket_reply_tx`), but a structured-output run that
+        // queues a webhook delivery from a socket-origin prompt would record
+        // `Socket` here. The retry worker would then fail to find a chat
+        // adapter on redeliver — a no-op, which is the desired behavior since
+        // the socket connection is long gone by the time the worker runs.
+        let binding = ChatBinding {
+            platform: PlatformType::Socket,
+            chat_id: "socket:client-1".to_string(),
+            thread_ts: None,
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        assert_eq!(
+            json,
+            r#"{"platform":"Socket","chat_id":"socket:client-1","thread_ts":null}"#,
         );
     }
 

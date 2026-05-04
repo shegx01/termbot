@@ -42,8 +42,10 @@ src/
   chat_adapters/
     mod.rs          ChatPlatform trait (async_trait), IncomingMessage,
                     ReplyContext (with optional socket_reply_tx for socket-
-                    origin routing), PlatformType (Telegram/Slack/Discord —
-                    NOT modified for socket; socket uses socket_reply_tx)
+                    origin routing), PlatformType (Telegram/Slack/Discord/Socket —
+                    Socket replies route through socket_reply_tx;
+                    PlatformType::select_adapter centralises the chat-adapter
+                    lookup so all four-variant matches live in one place)
     telegram.rs     Telegram adapter (teloxide, long-polling, level-triggered
                     watch-channel pause/resume for banner ordering)
     slack.rs        Slack adapter (Socket Mode via tokio-tungstenite)
@@ -379,7 +381,12 @@ spawns a per-connection task.
   event types emitted from `App` methods: `SessionCreated`, `SessionKilled`,
   `SessionLimitReached`, `ChatForward`, `HarnessStarted`, `HarnessFinished`,
   `SessionOutput` (translated from `StreamEvent::NewMessage` at socket layer).
-- `PlatformType` is NOT modified (preserves golden-tested queue-file wire format).
+- `PlatformType::Socket` variant added so socket-origin messages branch
+  explicitly instead of inheriting Telegram defaults; queue-file wire format
+  bumped accordingly and pinned by a golden serialization test in
+  `chat_adapters/mod.rs`. Replies route through `socket_reply_tx` and never
+  reach a `ChatPlatform` adapter — `PlatformType::select_adapter` returns
+  `None` for `Socket`.
 
 **Config hot-reload:** `src/socket/config_watcher.rs` uses the `notify` crate to
 watch `terminus.toml` for changes, debounces at 500ms, and atomically swaps the

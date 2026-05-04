@@ -62,13 +62,11 @@ pub async fn route_command(app: &mut App, msg: &IncomingMessage) {
         });
     }
 
-    // 3. Skip chat binding for socket-origin messages — they use
-    //    PlatformType::Telegram as a wire-compat placeholder but should NOT
-    //    pollute the wake coordinator's active-chat sets or trigger gap
-    //    banners.
-    if msg.reply_context.socket_reply_tx.is_none() {
-        bind_chat_for_message(app, msg);
-    }
+    // 3. Bind chat for the active platform. `bind_chat_for_message` is a
+    //    no-op for `PlatformType::Socket` — socket-origin messages do not
+    //    pollute the wake coordinator's active-chat sets and never trigger
+    //    gap banners.
+    bind_chat_for_message(app, msg);
 
     let cmd = match ParsedCommand::parse(&msg.text, app.trigger) {
         Ok(cmd) => cmd,
@@ -182,6 +180,10 @@ fn bind_chat_for_message(app: &mut App, msg: &IncomingMessage) {
                 }
             }
         }
+        // Socket-origin messages aren't bound to any wake-coordinator set:
+        // each socket request runs over a short-lived connection and doesn't
+        // need a gap-banner on resume.
+        PlatformType::Socket => {}
     }
 }
 
