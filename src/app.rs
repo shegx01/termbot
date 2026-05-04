@@ -15,7 +15,9 @@ use crate::buffer::{OutputBuffer, StreamEvent};
 use crate::chat_adapters::discord::DiscordAdapter;
 #[cfg(feature = "slack")]
 use crate::chat_adapters::slack::SlackPlatform;
-use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
+#[cfg(test)]
+use crate::chat_adapters::PlatformType;
+use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, ReplyContext};
 use crate::command::{CommandBlocklist, HarnessOptions};
 use crate::config::Config;
 use crate::delivery::{GapInfo, GapPrefixes, PendingBannerAcks};
@@ -539,11 +541,11 @@ impl App {
             return;
         }
         // Chat-origin: route to the platform adapter.
-        let platform: Option<&dyn ChatPlatform> = match ctx.platform {
-            PlatformType::Telegram => self.telegram.as_deref(),
-            PlatformType::Slack => self.slack.as_deref(),
-            PlatformType::Discord => self.discord.as_deref(),
-        };
+        let platform = ctx.platform.select_adapter(
+            self.telegram.as_deref(),
+            self.slack.as_deref(),
+            self.discord.as_deref(),
+        );
         if let Some(p) = platform {
             if let Err(e) = p
                 .send_message(text, &ctx.chat_id, ctx.thread_ts.as_deref())

@@ -21,6 +21,36 @@ pub enum PlatformType {
     Telegram,
     Slack,
     Discord,
+    /// Messages originating from the WebSocket bidirectional API (`src/socket/`).
+    /// Replies do not go through a chat-platform adapter — they're routed back
+    /// to the socket connection via `ReplyContext::socket_reply_tx`. This
+    /// variant exists so code that branches on `PlatformType` (chunk-size
+    /// limits, adapter lookups, gap-banner sequencing) can handle the
+    /// socket-origin case explicitly instead of inheriting Telegram defaults.
+    Socket,
+}
+
+impl PlatformType {
+    /// Pick the chat-platform adapter for this platform, given the three
+    /// optionally-configured adapter handles. `Socket` returns `None` because
+    /// socket-origin replies route through `ReplyContext::socket_reply_tx`,
+    /// not through any `ChatPlatform`.
+    ///
+    /// Centralizes the Telegram/Slack/Discord/Socket match so a future
+    /// platform addition only needs one update site.
+    pub(crate) fn select_adapter<'a>(
+        &self,
+        telegram: Option<&'a dyn ChatPlatform>,
+        slack: Option<&'a dyn ChatPlatform>,
+        discord: Option<&'a dyn ChatPlatform>,
+    ) -> Option<&'a dyn ChatPlatform> {
+        match self {
+            PlatformType::Telegram => telegram,
+            PlatformType::Slack => slack,
+            PlatformType::Discord => discord,
+            PlatformType::Socket => None,
+        }
+    }
 }
 
 /// Serializable chat routing context.
@@ -233,6 +263,27 @@ mod tests {
             json, r#"{"platform":"Telegram","chat_id":"12345","thread_ts":null}"#,
             "ChatBinding JSON wire format changed; this breaks persisted queue \
              files. If intentional, coordinate with a queue-file migration."
+        );
+    }
+
+    #[test]
+    fn chat_binding_socket_variant_serializes_to_exact_known_json() {
+        // Pins the wire form for the `Socket` variant. Socket-origin messages
+        // do not normally reach the queue file (replies route through the
+        // per-request `socket_reply_tx`), but a structured-output run that
+        // queues a webhook delivery from a socket-origin prompt would record
+        // `Socket` here. The retry worker would then fail to find a chat
+        // adapter on redeliver — a no-op, which is the desired behavior since
+        // the socket connection is long gone by the time the worker runs.
+        let binding = ChatBinding {
+            platform: PlatformType::Socket,
+            chat_id: "socket:client-1".to_string(),
+            thread_ts: None,
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        assert_eq!(
+            json,
+            r#"{"platform":"Socket","chat_id":"socket:client-1","thread_ts":null}"#,
         );
     }
 

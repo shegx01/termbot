@@ -46,7 +46,9 @@ use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::buffer::StreamEvent;
-use crate::chat_adapters::{Attachment, ChatPlatform, PlatformType, ReplyContext};
+#[cfg(test)]
+use crate::chat_adapters::PlatformType;
+use crate::chat_adapters::{Attachment, ChatPlatform, ReplyContext};
 use crate::command::HarnessOptions;
 use crate::config::Config;
 use crate::harness::claude::ClaudeHarness;
@@ -106,11 +108,9 @@ impl PromptDispatchContext<'_> {
             let _ = tx.send(text.to_string());
             return;
         }
-        let platform: Option<&dyn ChatPlatform> = match ctx.platform {
-            PlatformType::Telegram => self.telegram,
-            PlatformType::Slack => self.slack,
-            PlatformType::Discord => self.discord,
-        };
+        let platform = ctx
+            .platform
+            .select_adapter(self.telegram, self.slack, self.discord);
         if let Some(p) = platform {
             if let Err(e) = p
                 .send_message(text, &ctx.chat_id, ctx.thread_ts.as_deref())

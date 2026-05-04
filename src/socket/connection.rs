@@ -338,15 +338,18 @@ pub(crate) async fn run(
                                 // Create per-request response channel
                                 let (reply_tx, reply_rx) = mpsc::unbounded_channel::<String>();
 
-                                // Build IncomingMessage for the main loop
-                                // (fix #4: use PlatformType::Telegram as wire-compat placeholder,
-                                // but socket_reply_tx intercepts all replies before platform routing)
+                                // Build IncomingMessage for the main loop.
+                                // `PlatformType::Socket` lets downstream code
+                                // (chunk-size limits, adapter lookups, gap-banner
+                                // sequencing) branch explicitly on socket-origin
+                                // messages; `socket_reply_tx` then intercepts
+                                // replies before any chat-platform routing.
                                 let incoming = IncomingMessage {
                                     user_id: client_name.clone(),
                                     text: command,
-                                    platform: PlatformType::Telegram,
+                                    platform: PlatformType::Socket,
                                     reply_context: ReplyContext {
-                                        platform: PlatformType::Telegram,
+                                        platform: PlatformType::Socket,
                                         chat_id: format!("socket:{}", client_name),
                                         thread_ts: None,
                                         socket_reply_tx: Some(reply_tx),

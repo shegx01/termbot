@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
 
 use crate::buffer::{StreamEvent, StructuredOutputPayload};
-use crate::chat_adapters::{Attachment, ChatBinding, ChatPlatform, PlatformType, ReplyContext};
+use crate::chat_adapters::{Attachment, ChatBinding, ChatPlatform, ReplyContext};
 use crate::command::HarnessOptions;
 use crate::delivery::split_message;
 use crate::structured_output::{DeliveryJob, DeliveryQueue, SchemaRegistry, WebhookClient};
@@ -863,12 +863,7 @@ async fn send_reply(
         let _ = tx.send(text.to_string());
         return;
     }
-    use crate::chat_adapters::PlatformType;
-    let platform: Option<&dyn ChatPlatform> = match ctx.platform {
-        PlatformType::Telegram => telegram,
-        PlatformType::Slack => slack,
-        PlatformType::Discord => discord,
-    };
+    let platform = ctx.platform.select_adapter(telegram, slack, discord);
     if let Some(p) = platform {
         if let Err(e) = p
             .send_message(text, &ctx.chat_id, ctx.thread_ts.as_deref())
@@ -903,11 +898,7 @@ async fn send_photo_reply(
         let _ = tx.send(format!("[file: {}]", filename));
         return;
     }
-    let platform: Option<&dyn ChatPlatform> = match ctx.platform {
-        PlatformType::Telegram => telegram,
-        PlatformType::Slack => slack,
-        PlatformType::Discord => discord,
-    };
+    let platform = ctx.platform.select_adapter(telegram, slack, discord);
     if let Some(p) = platform {
         if let Err(e) = p
             .send_photo(
@@ -938,11 +929,7 @@ async fn send_document_reply(
         let _ = tx.send(format!("[file: {}]", filename));
         return;
     }
-    let platform: Option<&dyn ChatPlatform> = match ctx.platform {
-        PlatformType::Telegram => telegram,
-        PlatformType::Slack => slack,
-        PlatformType::Discord => discord,
-    };
+    let platform = ctx.platform.select_adapter(telegram, slack, discord);
     if let Some(p) = platform {
         if let Err(e) = p
             .send_document(
