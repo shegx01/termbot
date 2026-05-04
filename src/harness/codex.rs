@@ -49,7 +49,9 @@
 //! turn — the read loop continues until `turn.completed` (success) or
 //! `turn.failed` (failure) arrives.
 
-use super::{Harness, HarnessEvent, HarnessKind, SessionStore, ToolPairingBuffer};
+use super::{
+    Harness, HarnessEvent, HarnessKind, SessionStore, SpawnedSubprocess, ToolPairingBuffer,
+};
 use crate::chat_adapters::Attachment;
 use crate::command::{CodexCloudSubcommand, CodexSubcommand, HarnessOptions};
 #[cfg(test)]
@@ -58,13 +60,8 @@ use crate::config::CodexConfig;
 use crate::socket::events::AmbientEvent;
 use anyhow::Result;
 use async_trait::async_trait;
-use futures_util::FutureExt;
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc};
 
 /// Codex CLI-subprocess harness.
@@ -140,16 +137,15 @@ impl CodexHarness {
         let argv = build_subcommand_argv(&sub, &args);
         tokio::spawn(async move {
             let body = run_subcommand_inner(binary, argv, sub, args, event_tx.clone());
-            let result = AssertUnwindSafe(body).catch_unwind().await;
-            if let Err(panic_info) = result {
-                let msg = super::format_panic_message(HarnessKind::Codex, &*panic_info);
-                let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-                let _ = event_tx
-                    .send(HarnessEvent::Done {
-                        session_id: String::new(),
-                    })
-                    .await;
-            }
+            super::run_with_panic_guard(
+                HarnessKind::Codex,
+                String::new(),
+                None,
+                &event_tx,
+                &[],
+                body,
+            )
+            .await;
         });
         Ok(event_rx)
     }
@@ -201,146 +197,16 @@ async fn run_subcommand_inner(
     extra_args: Vec<String>,
     event_tx: mpsc::Sender<HarnessEvent>,
 ) {
-    let sub_label = sub_display_name(&sub);
-
-    let mut cmd = Command::new(&binary);
-    cmd.args(&argv)
-        .env("NO_COLOR", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "codex binary not found: {} (set [harness.codex] binary_path or install codex on PATH)",
-                    binary.display()
-                )
-            } else {
-                format!("codex {} spawn failed: {}", sub_label, e)
-            };
-            let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-            let _ = event_tx
-                .send(HarnessEvent::Done {
-                    session_id: String::new(),
-                })
-                .await;
-            return;
-        }
+    let cfg = super::SubcommandConfig {
+        kind: HarnessKind::Codex,
+        sub_label: sub_display_name(&sub).to_string(),
+        extra_args,
+        strip_ansi: false,
+        max_chars: Some(3000),
+        install_hint: "set [harness.codex] binary_path or install codex on PATH",
+        sanitize: sanitize_stderr,
     };
-
-    let out =
-        match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
-            .await
-        {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                let _ = event_tx
-                    .send(HarnessEvent::Error(format!(
-                        "codex {} wait failed: {}",
-                        sub_label, e
-                    )))
-                    .await;
-                let _ = event_tx
-                    .send(HarnessEvent::Done {
-                        session_id: String::new(),
-                    })
-                    .await;
-                return;
-            }
-            Err(_) => {
-                let _ = event_tx
-                    .send(HarnessEvent::Error(format!(
-                        "codex {} timed out after 30s",
-                        sub_label
-                    )))
-                    .await;
-                let _ = event_tx
-                    .send(HarnessEvent::Done {
-                        session_id: String::new(),
-                    })
-                    .await;
-                return;
-            }
-        };
-
-    if !out.status.success() {
-        let raw_stderr = if out.stderr.len() > 64 * 1024 {
-            &out.stderr[..64 * 1024]
-        } else {
-            &out.stderr
-        };
-        let stderr_trim = String::from_utf8_lossy(raw_stderr).trim().to_string();
-        let code = out
-            .status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".into());
-        let sanitized = sanitize_stderr(&stderr_trim);
-        // Log the sanitized stderr (env-vars and absolute user paths redacted)
-        // rather than the raw form so `RUST_LOG=debug` captures don't leak
-        // secrets into shared log aggregators. (Security review LOW-1.)
-        tracing::debug!(
-            "codex {} non-zero exit; sanitized stderr: {}",
-            sub_label,
-            sanitized
-        );
-        let detail = if sanitized.is_empty() {
-            format!(
-                "codex {} exited with status {} (no stderr)",
-                sub_label, code
-            )
-        } else {
-            format!(
-                "codex {} exited with status {}: {}",
-                sub_label, code, sanitized
-            )
-        };
-        let _ = event_tx.send(HarnessEvent::Error(detail)).await;
-        let _ = event_tx
-            .send(HarnessEvent::Done {
-                session_id: String::new(),
-            })
-            .await;
-        return;
-    }
-
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stripped = stdout.trim();
-
-    let message = if stripped.is_empty() {
-        let arg_summary = if extra_args.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", extra_args.join(" "))
-        };
-        // "no results" matches the wording used by gemini and opencode for the
-        // same situation (Code-reviewer MED-1, cross-harness wording parity).
-        format!("codex {}{}: no results", sub_label, arg_summary)
-    } else {
-        // Truncate at 3000 chars for chat-friendliness, mirroring opencode.
-        const MAX_CHARS: usize = 3000;
-        let body = if stripped.chars().count() > MAX_CHARS {
-            let truncated: String = stripped.chars().take(MAX_CHARS).collect();
-            format!(
-                "{}\n…[truncated; run from terminal for full output]",
-                truncated
-            )
-        } else {
-            stripped.to_string()
-        };
-        format!("```\n{}\n```", body)
-    };
-
-    let _ = event_tx.send(HarnessEvent::Text(message)).await;
-    let _ = event_tx
-        .send(HarnessEvent::Done {
-            session_id: String::new(),
-        })
-        .await;
+    super::run_subcommand(binary, argv, cfg, event_tx).await;
 }
 
 #[async_trait]
@@ -442,8 +308,9 @@ impl Harness for CodexHarness {
         // outlive the subprocess. The schema TempFile drop-cleans the tmp
         // file. Attachment paths are explicitly removed after the run.
         tokio::spawn(async move {
+            // Hold the schema temp file alive for the duration of the run; the
+            // child reads its `--output-schema <path>` arg lazily.
             let _schema_guard = schema_temp;
-
             let body = run_codex_inner(
                 binary,
                 args,
@@ -451,47 +318,15 @@ impl Harness for CodexHarness {
                 event_tx.clone(),
                 structured_schema_for_run,
             );
-            let result: std::result::Result<(), Box<dyn std::any::Any + Send>> =
-                AssertUnwindSafe(body).catch_unwind().await;
-
-            // Clean up attachment temp files. The Attachment::Drop is a
-            // fallback — explicit cleanup here mirrors opencode's pattern.
-            for path in &attachment_paths {
-                if let Err(e) = std::fs::remove_file(path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::debug!(
-                            "codex: failed to remove attachment temp {}: {}",
-                            path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-
-            let status = match result {
-                Ok(()) => "ok",
-                Err(panic_info) => {
-                    let msg = super::format_panic_message(HarnessKind::Codex, &*panic_info);
-                    let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-                    // The panic short-circuited `run_codex_inner` before its
-                    // own `Done` emission. Send one here so the receiver
-                    // doesn't block forever waiting for a terminal event.
-                    let _ = event_tx
-                        .send(HarnessEvent::Done {
-                            session_id: String::new(),
-                        })
-                        .await;
-                    "error"
-                }
-            };
-
-            if let Some(tx) = ambient_tx {
-                let _ = tx.send(AmbientEvent::HarnessFinished {
-                    harness: HarnessKind::Codex.name().to_string(),
-                    run_id: run_id_for_task,
-                    status: status.to_string(),
-                });
-            }
+            super::run_with_panic_guard(
+                HarnessKind::Codex,
+                run_id_for_task,
+                ambient_tx,
+                &event_tx,
+                &attachment_paths,
+                body,
+            )
+            .await;
         });
 
         Ok(event_rx)
@@ -884,86 +719,28 @@ async fn run_codex_inner(
     event_tx: mpsc::Sender<HarnessEvent>,
     structured_schema: Option<String>,
 ) {
-    let mut cmd = Command::new(&binary);
-    cmd.args(&args)
-        .current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // CRITICAL: `codex exec` reads stdin even when prompt is supplied as
-        // a positional arg (still true in 0.128 — codex prints "Reading
-        // additional input from stdin..." before continuing). Pin stdin to
-        // /dev/null or it blocks indefinitely.
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "codex: binary not found at {} (set [harness.codex] binary_path or install codex on PATH; e.g. `brew install --cask codex` or `npm install -g @openai/codex`)",
-                    binary.display()
-                )
-            } else {
-                format!("codex: spawn failed: {}", e)
-            };
-            let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-            let _ = event_tx
-                .send(HarnessEvent::Done {
-                    session_id: String::new(),
-                })
-                .await;
-            return;
-        }
-    };
-
-    let stdout = match child.stdout.take() {
+    // CRITICAL: `codex exec` reads stdin even when the prompt is supplied as
+    // a positional arg (still true in 0.128 — codex prints "Reading additional
+    // input from stdin..." before continuing). The shared helper pins stdin
+    // to /dev/null so the child can never block on it.
+    let SpawnedSubprocess {
+        mut child,
+        stdout_lines: mut reader,
+        stderr_handle,
+    } = match super::spawn_subprocess(
+        &binary,
+        &args,
+        &cwd,
+        HarnessKind::Codex,
+        "set [harness.codex] binary_path or install codex on PATH; e.g. `brew install --cask codex` or `npm install -g @openai/codex`",
+        &event_tx,
+    )
+    .await
+    {
         Some(s) => s,
-        None => {
-            let _ = event_tx
-                .send(HarnessEvent::Error(
-                    "codex: stdout pipe missing".to_string(),
-                ))
-                .await;
-            let _ = child.kill().await;
-            // Reap the (now-killed) child so the process-table entry is freed.
-            // `kill_on_drop` only sends SIGKILL — it does not call `wait()`.
-            let _ = child.wait().await;
-            let _ = event_tx
-                .send(HarnessEvent::Done {
-                    session_id: String::new(),
-                })
-                .await;
-            return;
-        }
+        None => return,
     };
 
-    // Drain stderr concurrently with stdout so codex doesn't pipe-deadlock
-    // when its stderr buffer fills (~64 KiB on Linux, ~8 KiB on macOS).
-    //
-    // The buffered portion (first 64 KiB) is captured for sanitization on
-    // non-zero exit. Anything past 64 KiB is forwarded to `tokio::io::sink`
-    // so the child can keep writing without blocking — without the post-cap
-    // drain, codex could fill the OS pipe buffer past 64 KiB and stall on
-    // its next stderr write, hanging `child.wait()` until the 5-minute
-    // idle timeout fired. (Critic-2 P1.)
-    let stderr_handle: Option<tokio::task::JoinHandle<Vec<u8>>> = child.stderr.take().map(|s| {
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buf: Vec<u8> = Vec::new();
-            let mut s = s;
-            {
-                let mut limited = (&mut s).take(64 * 1024);
-                let _ = limited.read_to_end(&mut buf).await;
-            }
-            let mut sink = tokio::io::sink();
-            let _ = tokio::io::copy(&mut s, &mut sink).await;
-            let _ = sink.flush().await;
-            buf
-        })
-    });
-
-    let mut reader = BufReader::new(stdout).lines();
     let mut captured_thread_id: Option<String> = None;
     let mut saw_recognized = false;
     let mut saw_unknown = false;
@@ -1185,17 +962,7 @@ async fn run_codex_inner(
             .await;
     }
 
-    // Always await the stderr-drain handle (even on success paths) so the
-    // spawned task ends cleanly. The buffered stderr is only used on
-    // non-zero-exit paths but the drain task must run to completion to
-    // avoid a leaked tokio task and a half-open pipe.
-    let raw_stderr_buf: Vec<u8> = match stderr_handle {
-        Some(h) => h.await.unwrap_or_else(|e| {
-            tracing::warn!("codex stderr drain task failed: {}", e);
-            Vec::new()
-        }),
-        None => Vec::new(),
-    };
+    let raw_stderr_buf = super::collect_stderr(stderr_handle, HarnessKind::Codex).await;
 
     if let Some(status) = status {
         if !status.success() && !had_fatal {

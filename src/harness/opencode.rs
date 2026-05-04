@@ -30,7 +30,7 @@
 
 #[cfg(test)]
 use super::build_session_key;
-use super::{Harness, HarnessEvent, HarnessKind, SessionStore};
+use super::{Harness, HarnessEvent, HarnessKind, SessionStore, SpawnedSubprocess};
 use crate::chat_adapters::Attachment;
 #[cfg(test)]
 use crate::command::{HarnessExtras, OpencodeExtras};
@@ -39,14 +39,9 @@ use crate::config::OpencodeConfig;
 use crate::socket::events::AmbientEvent;
 use anyhow::Result;
 use async_trait::async_trait;
-use futures_util::FutureExt;
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 #[cfg(test)]
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc};
 
 /// Opencode CLI-subprocess harness.
@@ -198,40 +193,15 @@ impl Harness for OpencodeHarness {
         let run_id_for_task = run_id.clone();
         tokio::spawn(async move {
             let body = run_opencode_inner(binary, args, cwd, event_tx.clone(), sessions.clone());
-            let result: std::result::Result<(), Box<dyn std::any::Any + Send>> =
-                AssertUnwindSafe(body).catch_unwind().await;
-
-            let status = match result {
-                Ok(()) => "ok",
-                Err(panic_info) => {
-                    let msg = super::format_panic_message(HarnessKind::Opencode, &*panic_info);
-                    let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-                    // The panic short-circuited `run_opencode_inner` before
-                    // its own `Done` emission. Send one here so the receiver
-                    // doesn't block forever waiting for a terminal event.
-                    let _ = event_tx
-                        .send(HarnessEvent::Done {
-                            session_id: String::new(),
-                        })
-                        .await;
-                    "error"
-                }
-            };
-
-            if let Some(tx) = ambient_tx {
-                let _ = tx.send(AmbientEvent::HarnessFinished {
-                    harness: HarnessKind::Opencode.name().to_string(),
-                    run_id: run_id_for_task,
-                    status: status.to_string(),
-                });
-            }
-
-            // Clean up any attachment temp files threaded through via `-f`.
-            // The opencode child has already read them by the time we're here
-            // (either it exited normally or panicked — both close the stream).
-            for path in &attachment_paths {
-                let _ = tokio::fs::remove_file(path).await;
-            }
+            super::run_with_panic_guard(
+                HarnessKind::Opencode,
+                run_id_for_task,
+                ambient_tx,
+                &event_tx,
+                &attachment_paths,
+                body,
+            )
+            .await;
         });
 
         Ok(event_rx)
@@ -288,8 +258,8 @@ fn sub_display_name(sub: &OpencodeSubcommand) -> &'static str {
     }
 }
 
-/// Async inner body: spawn child, wait for output, emit Text + Done (or Error + Done).
-/// Bounded by a 30s timeout. Emits Done unconditionally before returning.
+/// Thin wrapper around the shared [`super::run_subcommand`] runner with
+/// opencode-specific config (ANSI strip, custom install hint).
 async fn run_subcommand_inner(
     binary: PathBuf,
     argv: Vec<String>,
@@ -297,133 +267,16 @@ async fn run_subcommand_inner(
     extra_args: Vec<String>,
     event_tx: mpsc::Sender<HarnessEvent>,
 ) {
-    // Determine the display name for error / empty-output messages before moving.
-    let sub_label = sub_display_name(&sub);
-
-    let mut cmd = Command::new(&binary);
-    cmd.args(&argv)
-        .env("NO_COLOR", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "opencode binary not found: {} (set [harness.opencode] binary_path or install opencode on PATH)",
-                    binary.display()
-                )
-            } else {
-                format!("opencode subcommand spawn failed: {}", e)
-            };
-            let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-            let _ = event_tx
-                .send(HarnessEvent::Done {
-                    session_id: String::new(),
-                })
-                .await;
-            return;
-        }
+    let cfg = super::SubcommandConfig {
+        kind: HarnessKind::Opencode,
+        sub_label: sub_display_name(&sub).to_string(),
+        extra_args,
+        strip_ansi: true,
+        max_chars: None,
+        install_hint: "set [harness.opencode] binary_path or install opencode on PATH",
+        sanitize: sanitize_stderr,
     };
-
-    let out =
-        match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
-            .await
-        {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                let _ = event_tx
-                    .send(HarnessEvent::Error(format!(
-                        "opencode {} wait failed: {}",
-                        sub_label, e
-                    )))
-                    .await;
-                let _ = event_tx
-                    .send(HarnessEvent::Done {
-                        session_id: String::new(),
-                    })
-                    .await;
-                return;
-            }
-            Err(_) => {
-                let _ = event_tx
-                    .send(HarnessEvent::Error(format!(
-                        "opencode {} timed out after 30s",
-                        sub_label
-                    )))
-                    .await;
-                let _ = event_tx
-                    .send(HarnessEvent::Done {
-                        session_id: String::new(),
-                    })
-                    .await;
-                return;
-            }
-        };
-
-    if !out.status.success() {
-        // Cap stderr at 64 KiB before parsing to avoid OOM on crash-looping processes.
-        let raw_stderr = if out.stderr.len() > 64 * 1024 {
-            &out.stderr[..64 * 1024]
-        } else {
-            &out.stderr
-        };
-        let stderr_trim = String::from_utf8_lossy(raw_stderr).trim().to_string();
-        tracing::debug!(
-            "opencode {} non-zero exit; raw stderr: {}",
-            sub_label,
-            stderr_trim
-        );
-        let code = out
-            .status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".into());
-        let sanitized = sanitize_stderr(&stderr_trim);
-        let detail = if sanitized.is_empty() {
-            format!(
-                "opencode {} exited with status {} (no stderr)",
-                sub_label, code
-            )
-        } else {
-            format!(
-                "opencode {} exited with status {}: {}",
-                sub_label, code, sanitized
-            )
-        };
-        let _ = event_tx.send(HarnessEvent::Error(detail)).await;
-        let _ = event_tx
-            .send(HarnessEvent::Done {
-                session_id: String::new(),
-            })
-            .await;
-        return;
-    }
-
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stripped = super::strip_ansi(&stdout);
-    let stripped = stripped.trim();
-
-    let message = if stripped.is_empty() {
-        let arg_summary = if extra_args.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", extra_args.join(" "))
-        };
-        format!("opencode {}{}: no results", sub_label, arg_summary)
-    } else {
-        format!("```\n{}\n```", stripped)
-    };
-
-    let _ = event_tx.send(HarnessEvent::Text(message)).await;
-    let _ = event_tx
-        .send(HarnessEvent::Done {
-            session_id: String::new(),
-        })
-        .await;
+    super::run_subcommand(binary, argv, cfg, event_tx).await;
 }
 
 impl OpencodeHarness {
@@ -453,16 +306,15 @@ impl OpencodeHarness {
 
         tokio::spawn(async move {
             let body = run_subcommand_inner(binary, argv, sub, args, event_tx.clone());
-            let result = AssertUnwindSafe(body).catch_unwind().await;
-            if let Err(panic_info) = result {
-                let msg = super::format_panic_message(HarnessKind::Opencode, &*panic_info);
-                let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-                let _ = event_tx
-                    .send(HarnessEvent::Done {
-                        session_id: String::new(),
-                    })
-                    .await;
-            }
+            super::run_with_panic_guard(
+                HarnessKind::Opencode,
+                String::new(),
+                None,
+                &event_tx,
+                &[],
+                body,
+            )
+            .await;
         });
 
         Ok(event_rx)
@@ -489,88 +341,24 @@ async fn run_opencode_inner(
     event_tx: mpsc::Sender<HarnessEvent>,
     _sessions: SessionStore,
 ) {
-    let mut cmd = Command::new(&binary);
-    cmd.args(&args)
-        .current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "opencode binary not found: {} (set [harness.opencode] binary_path or install opencode on PATH)",
-                    binary.display()
-                )
-            } else {
-                format!("opencode spawn failed: {}", e)
-            };
-            let _ = event_tx.send(HarnessEvent::Error(msg)).await;
-            // Always emit a terminal Done so the receiver doesn't hang on
-            // any spawn-time failure path.
-            let _ = event_tx
-                .send(HarnessEvent::Done {
-                    session_id: String::new(),
-                })
-                .await;
-            return;
-        }
-    };
-
-    let stdout = match child.stdout.take() {
+    let SpawnedSubprocess {
+        mut child,
+        stdout_lines: mut reader,
+        stderr_handle,
+    } = match super::spawn_subprocess(
+        &binary,
+        &args,
+        &cwd,
+        HarnessKind::Opencode,
+        "set [harness.opencode] binary_path or install opencode on PATH",
+        &event_tx,
+    )
+    .await
+    {
         Some(s) => s,
-        None => {
-            let _ = event_tx
-                .send(HarnessEvent::Error(
-                    "opencode: stdout pipe missing".to_string(),
-                ))
-                .await;
-            let _ = child.kill().await;
-            // Reap the (now-killed) child so the process-table entry is freed.
-            // `kill_on_drop` only sends SIGKILL — it does not call `wait()`.
-            let _ = child.wait().await;
-            // Always emit a terminal Done so the receiver doesn't hang.
-            let _ = event_tx
-                .send(HarnessEvent::Done {
-                    session_id: String::new(),
-                })
-                .await;
-            return;
-        }
+        None => return,
     };
 
-    // Drain stderr concurrently with stdout so opencode doesn't pipe-deadlock
-    // when its stderr buffer fills (~64 KiB on Linux, ~8 KiB on macOS).
-    //
-    // The buffered portion (first 64 KiB) is captured for sanitization on
-    // non-zero exit. Anything past 64 KiB is forwarded to `tokio::io::sink`
-    // so the child can keep writing without blocking — without the post-cap
-    // drain, opencode could fill the OS pipe buffer past 64 KiB and stall
-    // on its next stderr write, hanging `child.wait()` until the 5-minute
-    // idle timeout fired. (Critic-2 P1.)
-    let stderr_handle: Option<tokio::task::JoinHandle<Vec<u8>>> = child.stderr.take().map(|s| {
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buf: Vec<u8> = Vec::new();
-            let mut s = s;
-            // Capture up to 64 KiB for sanitization.
-            {
-                let mut limited = (&mut s).take(64 * 1024);
-                let _ = limited.read_to_end(&mut buf).await;
-            }
-            // Drain anything past the cap into a sink so the child never
-            // blocks on stderr writes.
-            let mut sink = tokio::io::sink();
-            let _ = tokio::io::copy(&mut s, &mut sink).await;
-            let _ = sink.flush().await;
-            buf
-        })
-    });
-
-    let mut reader = BufReader::new(stdout).lines();
     let mut captured_session_id: Option<String> = None;
     let mut saw_recognized = false;
     let mut saw_unknown = false;
@@ -714,19 +502,7 @@ async fn run_opencode_inner(
         }
     };
 
-    // Always await the stderr-drain handle (even on success paths) so the
-    // spawned task ends cleanly. The buffered stderr is only used on
-    // non-zero-exit paths but the drain task must run to completion to
-    // avoid a leaked tokio task and a half-open pipe.
-    let raw_stderr_buf: Vec<u8> = match stderr_handle {
-        Some(h) => h.await.unwrap_or_else(|e| {
-            // Don't silently swallow drain-task panics; log so a half-open
-            // pipe + missing stderr buffer can be diagnosed.
-            tracing::warn!("opencode stderr drain task failed: {}", e);
-            Vec::new()
-        }),
-        None => Vec::new(),
-    };
+    let raw_stderr_buf = super::collect_stderr(stderr_handle, HarnessKind::Opencode).await;
 
     if let Some(status) = status {
         if !status.success() {
